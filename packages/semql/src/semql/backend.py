@@ -2,22 +2,23 @@
 
 The compiler stays dialect-agnostic for the parts it can: identifier
 resolution, join graph BFS, GROUP BY composition, parameter-name
-allocation, ordering, IR. The strategy owns the rest:
+allocation, ordering. The strategy owns the rest, and emits sqlglot
+AST nodes (not strings):
 
-- ``placeholder(name, dim_type)`` — the bound-param syntax
-  (``%(name)s`` vs ``{name:Type}`` vs ``@name``).
-- ``trunc(granularity, sql_expr)`` — date truncation (``date_trunc``
-  vs ``toStartOfHour`` family).
-- ``emit_contains(field_sql, value, bind)`` — substring search,
+- ``placeholder(name, dim_type)`` — bound-param node
+  (``exp.Placeholder`` typed for the dialect).
+- ``trunc(granularity, expr)`` — date truncation node
+  (``date_trunc`` for PG, ``toStartOf<Hour|Day|Week|Month>`` for CH).
+- ``emit_contains(field, value, bind)`` — substring search,
   including the *value transform* tied to that shape (Postgres bakes
   ``%v%`` into the bound value; ClickHouse passes the raw substring).
 - ``emit_source(cube, catalog, resolve_sql)`` — how a cube becomes a
-  ``FROM`` source. Vanilla cubes emit ``table AS alias``; META cubes
-  materialise as a ``VALUES`` subquery.
+  ``FROM`` source. Vanilla cubes return a ``Table`` node with alias;
+  META cubes return a ``Subquery`` over a ``VALUES`` literal.
 
-The Protocol is structural (``typing.Protocol``) so sqlglot's dialect
-classes — or a downstream Snowflake / BigQuery adapter — can satisfy
-it without importing from this module.
+The Protocol is structural (``typing.Protocol``) so downstream
+Snowflake / BigQuery adapters can satisfy it without importing from
+this module.
 """
 
 from __future__ import annotations
@@ -25,11 +26,15 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any, Protocol, runtime_checkable
 
+import sqlglot
+from sqlglot import exp
+
+from semql.dialect import dialect_for, placeholder_for
 from semql.introspect import build_meta_values
 from semql.model import Backend, Cube
 
-ParamBinder = Callable[[Any, str], str]
-"""Bind ``(value, dim_type)`` and return the placeholder SQL for it."""
+ParamBinder = Callable[[Any, str], exp.Placeholder]
+"""Bind ``(value, dim_type)`` and return an ``exp.Placeholder`` node for it."""
 
 SqlResolver = Callable[[str], str]
 """Resolve ``{alias}`` / ``{schema}`` placeholders in a SQL fragment."""
@@ -39,39 +44,32 @@ SqlResolver = Callable[[str], str]
 class BackendStrategy(Protocol):
     """Structural contract every backend strategy honours.
 
-    Strategies are stateless and pure: each method returns a SQL
-    fragment (and, in ``emit_contains``, may invoke ``bind`` to register
-    a bound parameter). The Protocol form lets third-party adapters
-    satisfy it without inheriting from us — useful for sqlglot dialect
-    classes or out-of-tree Snowflake / BigQuery strategies.
+    Strategies are stateless and pure: each method returns a sqlglot
+    AST node (and, in ``emit_contains``, may invoke ``bind`` to
+    register a bound parameter). The Protocol form lets third-party
+    adapters satisfy it without inheriting from us — useful for
+    out-of-tree Snowflake / BigQuery strategies.
     """
 
     backend: Backend
 
-    def placeholder(self, name: str, dim_type: str) -> str: ...
-    def trunc(self, granularity: str, sql_expr: str) -> str: ...
-    def emit_contains(self, field_sql: str, value: str, bind: ParamBinder) -> str: ...
+    def placeholder(self, name: str, dim_type: str) -> exp.Placeholder: ...
+    def trunc(self, granularity: str, expr: exp.Expression) -> exp.Expression: ...
+    def emit_contains(
+        self, field: exp.Expression, value: str, bind: ParamBinder
+    ) -> exp.Expression: ...
     def emit_source(
         self,
         cube: Cube,
         catalog: dict[str, Cube],
         resolve_sql: SqlResolver,
-    ) -> str: ...
+    ) -> exp.Expression: ...
 
 
 # ---------------------------------------------------------------------------
 # Concrete strategies
 # ---------------------------------------------------------------------------
 
-
-_CH_DIM_TYPE_TO_CH_TYPE: dict[str, str] = {
-    "string": "String",
-    "number": "Float64",
-    "time": "DateTime",
-    "bool": "UInt8",
-    # CH UUIDs are quoted strings on the wire; bind as String.
-    "uuid": "String",
-}
 
 _CH_TRUNC: dict[str, str] = {
     "hour": "toStartOfHour",
@@ -81,29 +79,54 @@ _CH_TRUNC: dict[str, str] = {
 }
 
 
+def _aliased_table(cube: Cube, resolve_sql: SqlResolver) -> exp.Table:
+    """Build a ``Table`` AST node for ``cube`` with its alias attached."""
+    resolved = resolve_sql(cube.table)
+    tbl = exp.to_table(resolved, dialect="postgres")
+    tbl.set("alias", exp.TableAlias(this=exp.to_identifier(cube.alias)))
+    return tbl
+
+
+def _meta_subquery(cube: Cube, catalog: dict[str, Cube]) -> exp.Subquery:
+    """Build a ``Subquery`` AST node over the catalogue snapshot for ``cube``."""
+    body = build_meta_values(cube.name, catalog)
+    sub = sqlglot.parse_one(body, dialect="postgres")
+    if not isinstance(sub, exp.Subquery):
+        sub = exp.Subquery(this=sub)
+    sub.set("alias", exp.TableAlias(this=exp.to_identifier(cube.alias)))
+    return sub
+
+
 class PostgresStrategy:
     """Postgres / DuckDB convention. Placeholders use ``%(name)s``;
-    truncation uses ``date_trunc``; ``contains`` bakes ``%v%`` into
-    the bound value and emits ``ILIKE``."""
+    truncation emits ``date_trunc('<gran>', expr)``; ``contains`` bakes
+    ``%v%`` into the bound value and emits ``ILIKE``."""
 
     backend = Backend.POSTGRES
 
-    def placeholder(self, name: str, dim_type: str) -> str:  # noqa: ARG002
-        return f"%({name})s"
+    def placeholder(self, name: str, dim_type: str) -> exp.Placeholder:
+        return placeholder_for(name, dim_type, Backend.POSTGRES)
 
-    def trunc(self, granularity: str, sql_expr: str) -> str:
-        return f"date_trunc('{granularity}', {sql_expr})"
+    def trunc(self, granularity: str, expr: exp.Expression) -> exp.Expression:
+        # ``exp.Anonymous`` bypasses sqlglot's DATE_TRUNC normalisation so
+        # the emitted SQL stays as lowercase ``date_trunc`` — matches the
+        # existing assertion contract and what production code consumes.
+        return exp.Anonymous(
+            this="date_trunc",
+            expressions=[exp.Literal.string(granularity), expr],
+        )
 
-    def emit_contains(self, field_sql: str, value: str, bind: ParamBinder) -> str:
-        return f"{field_sql} ILIKE {bind(f'%{value}%', 'string')}"
+    def emit_contains(self, field: exp.Expression, value: str, bind: ParamBinder) -> exp.Expression:
+        ph = bind(f"%{value}%", "string")
+        return exp.ILike(this=field, expression=ph)
 
     def emit_source(
         self,
         cube: Cube,
         catalog: dict[str, Cube],  # noqa: ARG002
         resolve_sql: SqlResolver,
-    ) -> str:
-        return f"{resolve_sql(cube.table)} AS {cube.alias}"
+    ) -> exp.Expression:
+        return _aliased_table(cube, resolve_sql)
 
 
 class ClickHouseStrategy:
@@ -114,48 +137,56 @@ class ClickHouseStrategy:
 
     backend = Backend.CLICKHOUSE
 
-    def placeholder(self, name: str, dim_type: str) -> str:
-        ch_type = _CH_DIM_TYPE_TO_CH_TYPE.get(dim_type, "String")
-        return f"{{{name}:{ch_type}}}"
+    def placeholder(self, name: str, dim_type: str) -> exp.Placeholder:
+        return placeholder_for(name, dim_type, Backend.CLICKHOUSE)
 
-    def trunc(self, granularity: str, sql_expr: str) -> str:
-        return f"{_CH_TRUNC[granularity]}({sql_expr})"
+    def trunc(self, granularity: str, expr: exp.Expression) -> exp.Expression:
+        # ``exp.Anonymous`` keeps sqlglot from transpiling
+        # ``toStartOfHour(...)`` into the canonical ``dateTrunc('HOUR', ...)``
+        # form. The emitted SQL preserves the ClickHouse-idiomatic name.
+        return exp.Anonymous(this=_CH_TRUNC[granularity], expressions=[expr])
 
-    def emit_contains(self, field_sql: str, value: str, bind: ParamBinder) -> str:
-        return f"positionCaseInsensitive({field_sql}, {bind(value, 'string')}) > 0"
+    def emit_contains(self, field: exp.Expression, value: str, bind: ParamBinder) -> exp.Expression:
+        ph = bind(value, "string")
+        pos = exp.Anonymous(this="positionCaseInsensitive", expressions=[field, ph])
+        return exp.GT(this=pos, expression=exp.Literal.number(0))
 
     def emit_source(
         self,
         cube: Cube,
         catalog: dict[str, Cube],  # noqa: ARG002
         resolve_sql: SqlResolver,
-    ) -> str:
-        return f"{resolve_sql(cube.table)} AS {cube.alias}"
+    ) -> exp.Expression:
+        return _aliased_table(cube, resolve_sql)
 
 
 class MetaStrategy:
     """Reflection cubes — materialised as a ``VALUES`` subquery at compile
-    time. Inherits the Postgres parameter and truncation conventions for
-    the (rare) cases the compiler emits a parameter against a META cube."""
+    time. Inherits Postgres parameter and truncation conventions for the
+    (rare) cases the compiler emits one against a META cube."""
 
     backend = Backend.META
 
-    def placeholder(self, name: str, dim_type: str) -> str:  # noqa: ARG002
-        return f"%({name})s"
+    def placeholder(self, name: str, dim_type: str) -> exp.Placeholder:
+        return placeholder_for(name, dim_type, Backend.META)
 
-    def trunc(self, granularity: str, sql_expr: str) -> str:
-        return f"date_trunc('{granularity}', {sql_expr})"
+    def trunc(self, granularity: str, expr: exp.Expression) -> exp.Expression:
+        return exp.Anonymous(
+            this="date_trunc",
+            expressions=[exp.Literal.string(granularity), expr],
+        )
 
-    def emit_contains(self, field_sql: str, value: str, bind: ParamBinder) -> str:
-        return f"{field_sql} ILIKE {bind(f'%{value}%', 'string')}"
+    def emit_contains(self, field: exp.Expression, value: str, bind: ParamBinder) -> exp.Expression:
+        ph = bind(f"%{value}%", "string")
+        return exp.ILike(this=field, expression=ph)
 
     def emit_source(
         self,
         cube: Cube,
         catalog: dict[str, Cube],
         resolve_sql: SqlResolver,  # noqa: ARG002
-    ) -> str:
-        return f"{build_meta_values(cube.name, catalog)} AS {cube.alias}"
+    ) -> exp.Expression:
+        return _meta_subquery(cube, catalog)
 
 
 # ---------------------------------------------------------------------------
@@ -194,6 +225,21 @@ def strategy_for(
     )
 
 
+def render(node: exp.Expression, backend: Backend) -> str:
+    """Render a sqlglot node as the dialect-canonical SQL for ``backend``.
+
+    ``normalize_functions=False`` keeps function names verbatim (so an
+    ``exp.Anonymous(this="date_trunc")`` emits ``date_trunc(...)`` rather
+    than ``DATE_TRUNC(...)``) — the existing assertions and the
+    production code that consumes our SQL both expect the lowercase
+    form."""
+    return node.sql(
+        dialect=dialect_for(backend),
+        pretty=False,
+        normalize_functions=False,
+    )
+
+
 __all__ = [
     "BackendStrategy",
     "ClickHouseStrategy",
@@ -201,5 +247,6 @@ __all__ = [
     "ParamBinder",
     "PostgresStrategy",
     "SqlResolver",
+    "render",
     "strategy_for",
 ]

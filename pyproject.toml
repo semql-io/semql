@@ -32,6 +32,10 @@ pythonVersion = "3.12"
 typeCheckingMode = "strict"
 venvPath = "."
 venv = ".venv"
+# sqlglot's ``Expression`` etc. live in ``sqlglot.expressions`` but the
+# package's ``__all__`` doesn't re-export them. They are public by
+# convention (and by sqlglot's own type stubs), so silence the warning.
+reportPrivateImportUsage = false
 
 [tool.pytest.ini_options]
 addopts = "-q"

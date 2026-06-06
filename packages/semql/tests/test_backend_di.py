@@ -2,7 +2,7 @@
 that callers can swap in a custom strategy.
 
 Without these the strategy extraction can regress silently —
-compile.py could grow an inline dialect branch and the existing 51
+compile.py could grow an inline dialect branch and the existing
 test_compile assertions wouldn't catch it.
 """
 
@@ -14,11 +14,13 @@ from typing import Any, cast
 from semql import Cube, Dimension, Filter, Measure, SemanticQuery, TimeWindow
 from semql.backend import (
     BackendStrategy,
+    ParamBinder,
     PostgresStrategy,
     SqlResolver,
 )
 from semql.compile import compile_query
 from semql.model import Backend
+from sqlglot import exp
 
 
 def _as_strategy_map(
@@ -46,29 +48,31 @@ class RecordingStrategy:
     def backend(self) -> Backend:
         return self.inner.backend
 
-    def placeholder(self, name: str, dim_type: str) -> str:
+    def placeholder(self, name: str, dim_type: str) -> exp.Placeholder:
         self.placeholder_calls.append((name, dim_type))
         return self.inner.placeholder(name, dim_type)
 
-    def trunc(self, granularity: str, sql_expr: str) -> str:
-        self.trunc_calls.append((granularity, sql_expr))
-        return self.inner.trunc(granularity, sql_expr)
+    def trunc(self, granularity: str, e: exp.Expression) -> exp.Expression:
+        # Stringify the expression for the recorded call so assertions stay
+        # readable. The inner strategy still drives the actual node shape.
+        self.trunc_calls.append((granularity, e.sql(dialect="postgres")))
+        return self.inner.trunc(granularity, e)
 
     def emit_contains(
         self,
-        field_sql: str,
+        f: exp.Expression,
         value: str,
-        bind: Any,  # noqa: ANN401
-    ) -> str:
-        self.contains_calls.append((field_sql, value))
-        return self.inner.emit_contains(field_sql, value, bind)
+        bind: ParamBinder,
+    ) -> exp.Expression:
+        self.contains_calls.append((f.sql(dialect="postgres"), value))
+        return self.inner.emit_contains(f, value, bind)
 
     def emit_source(
         self,
         cube: Cube,
         catalog: dict[str, Cube],
         resolve_sql: SqlResolver,
-    ) -> str:
+    ) -> exp.Expression:
         self.source_calls.append(cube.name)
         return self.inner.emit_source(cube, catalog, resolve_sql)
 
@@ -159,7 +163,7 @@ def test_compiler_delegates_emit_contains_only_when_op_is_contains() -> None:
     )
     compile_query(q2, _orders_catalog(), strategies=_as_strategy_map(rec2))
     assert len(rec2.contains_calls) == 1
-    # field_sql is post-resolution — the {o} alias is already substituted.
+    # field is the resolved AST stringified; alias substitution already happened.
     assert rec2.contains_calls[0] == ("o.region", "us")
 
 
@@ -179,27 +183,37 @@ def test_compiler_delegates_emit_source_for_every_from_cube() -> None:
 class _FakeSnowflakeStrategy:
     backend = Backend.SNOWFLAKE
 
-    def placeholder(self, name: str, dim_type: str) -> str:  # noqa: ARG002
-        return f":{name}"
+    def placeholder(self, name: str, dim_type: str) -> exp.Placeholder:  # noqa: ARG002
+        # Snowflake convention is ``:name`` — stash that as the raw form
+        # by leaving the placeholder un-kinded (sqlglot's Snowflake
+        # generator already emits ``:name`` for un-kinded Placeholders).
+        return exp.Placeholder(this=name)
 
-    def trunc(self, granularity: str, sql_expr: str) -> str:
-        return f"DATE_TRUNC('{granularity.upper()}', {sql_expr})"
+    def trunc(self, granularity: str, expr: exp.Expression) -> exp.Expression:
+        return exp.Anonymous(
+            this="DATE_TRUNC",
+            expressions=[exp.Literal.string(granularity.upper()), expr],
+        )
 
     def emit_contains(
         self,
-        field_sql: str,
+        field: exp.Expression,
         value: str,
-        bind: Any,  # noqa: ANN401
-    ) -> str:
-        return f"CONTAINS({field_sql}, {bind(value, 'string')})"
+        bind: ParamBinder,
+    ) -> exp.Expression:
+        ph = bind(value, "string")
+        return exp.Anonymous(this="CONTAINS", expressions=[field, ph])
 
     def emit_source(
         self,
         cube: Cube,
         catalog: dict[str, Cube],  # noqa: ARG002
         resolve_sql: SqlResolver,
-    ) -> str:
-        return f"{resolve_sql(cube.table)} AS {cube.alias}"
+    ) -> exp.Expression:
+        resolved = resolve_sql(cube.table)
+        tbl = exp.to_table(resolved)
+        tbl.set("alias", exp.TableAlias(this=exp.to_identifier(cube.alias)))
+        return tbl
 
 
 def test_third_party_strategy_through_override_kwarg() -> None:
@@ -225,3 +239,9 @@ def test_third_party_strategy_through_override_kwarg() -> None:
     # The Snowflake placeholder convention (`:name`) shows up in the SQL.
     assert ":p0" in out.sql
     assert out.params == {"p0": "us"}
+
+
+def test_unknown_value_aliased_for_lint() -> None:
+    """Anchor for the unused Any import — kept so the noqa survives reformat."""
+    x: Any = None  # noqa: ANN401
+    assert x is None

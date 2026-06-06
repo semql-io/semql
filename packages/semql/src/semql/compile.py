@@ -2,23 +2,28 @@
 
 The compiler has no I/O. It reads the catalogue, resolves identifiers,
 emits a parameterised SQL string + params dict + output column list,
-and raises `CompileError` with a precise message on unknown references,
-unreachable joins, or unsupported shapes.
+and raises ``CompileError`` (or a more specific leaf) on unknown
+references, unreachable joins, or unsupported shapes.
+
+The body composes a sqlglot ``exp.Select`` AST and renders it via the
+target backend's dialect. Per-cube fragments (dim SQL, measure SQL,
+``base_predicate``, ``Join.on``) are parsed by sqlglot under the
+catalogue cube's declared backend; dialect-specific shapes
+(``placeholder``, ``trunc``, ``contains``, ``emit_source``) come from
+the ``BackendStrategy`` and slot into the AST as nodes.
 
 Scope (Phase 1):
 - Single-backend queries (cross-backend rejected).
-- `base_predicate` lifted to the outer WHERE.
-- Parameterised `Filter.values` (positional names `p0`, `p1`, ...);
-  Postgres renders `%(name)s`, ClickHouse renders `{name:Type}`.
+- ``base_predicate`` lifted to the outer WHERE.
+- Parameterised ``Filter.values`` (positional names ``p0``, ``p1``, …).
 - Time-window pre-resolved as ISO strings, exclusive end.
 - Granularity truncation for time dimensions.
-- `ungrouped=True` row listings with a hard 1000-row cap.
-- `having` on measure aliases.
-- `context` dict substitutes `{key}` placeholders in table/SQL strings
-  (e.g. `{"schema": "mydb"}` resolves `{schema}.orders`).
+- ``ungrouped=True`` row listings with a hard 1000-row cap.
+- ``having`` on measure aliases (bare or qualified).
+- ``context`` dict substitutes ``{key}`` placeholders in table/SQL strings.
 
 Out of scope (deferred):
-- `compare` CTE shell (current/prior FULL OUTER JOIN).
+- ``compare`` CTE shell (current/prior FULL OUTER JOIN).
 - Cross-backend merge.
 """
 
@@ -30,8 +35,16 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
+import sqlglot
+from sqlglot import exp
+from sqlglot.errors import ParseError
+
 from semql._resolve import resolve_field as _resolve_field_raw
 from semql.backend import BackendStrategy, strategy_for
+
+# Importing from semql.dialect also registers the ClickHouse placeholder
+# override against the ``clickhouse`` dialect name (side effect on import).
+from semql.dialect import dialect_for
 from semql.errors import (
     CompileError,
     CrossBackendError,
@@ -114,12 +127,13 @@ def _resolve_sql(
     cube_aliases: dict[str, str],
     context: dict[str, str],
 ) -> str:
-    """Resolve `{key}` placeholders in a SQL fragment.
+    """Resolve ``{key}`` placeholders in a SQL fragment.
 
     Priority: cube aliases (both alias and cube name map to alias), then
-    caller-supplied `context`. ClickHouse typed param placeholders like
-    `{p0:String}` are left untouched — the inner regex requires a plain
-    identifier (no `:Type` suffix). Unknown placeholders raise CompileError."""
+    caller-supplied ``context``. ClickHouse typed param placeholders like
+    ``{p0:String}`` are left untouched — the inner regex requires a plain
+    identifier (no ``:Type`` suffix). Unknown placeholders raise
+    ``PlaceholderError``."""
     lookup: dict[str, str] = dict(context)
     for cube_name, alias in cube_aliases.items():
         lookup[alias] = alias
@@ -139,45 +153,54 @@ def _resolve_sql(
 
 
 # ---------------------------------------------------------------------------
-# Aggregation rendering
+# Aggregation — measure agg → sqlglot node
 # ---------------------------------------------------------------------------
 
-_AGG_FN: dict[str, str] = {
-    "sum": "SUM",
-    "count": "COUNT",
-    "count_distinct": "COUNT(DISTINCT {x})",
-    "avg": "AVG",
-    "min": "MIN",
-    "max": "MAX",
+
+def _agg_node(m: Measure, expr_node: exp.Expression) -> exp.Expression:
+    """Wrap an inner expression in the measure's aggregate function."""
+    agg = m.agg
+    if agg == "sum":
+        return exp.Sum(this=expr_node)
+    if agg == "count":
+        return exp.Count(this=expr_node)
+    if agg == "count_distinct":
+        return exp.Count(this=expr_node, distinct=True)
+    if agg == "avg":
+        return exp.Avg(this=expr_node)
+    if agg == "min":
+        return exp.Min(this=expr_node)
+    if agg == "max":
+        return exp.Max(this=expr_node)
+    raise CompileError(f"Unsupported aggregate: {agg!r}")  # pragma: no cover
+
+
+_FILTER_BINOPS: dict[str, type[exp.Expression]] = {
+    "eq": exp.EQ,
+    "neq": exp.NEQ,
+    "gt": exp.GT,
+    "lt": exp.LT,
+    "gte": exp.GTE,
+    "lte": exp.LTE,
 }
 
 
-def _render_agg(m: Measure, sql_expr: str) -> str:
-    template = _AGG_FN[m.agg]
-    if "{x}" in template:
-        return template.replace("{x}", sql_expr)
-    return f"{template}({sql_expr})"
-
-
-# ---------------------------------------------------------------------------
-# Filter rendering — operator shape only. The dialect-specific bits
-# (placeholder syntax, `contains` substring shape) are delegated to the
-# backend strategy.
-# ---------------------------------------------------------------------------
-
-
-def _render_filter(
+def _filter_node(
     f: Filter,
-    field_sql: str,
+    field: exp.Expression,
     field_type: str,
     strategy: BackendStrategy,
-    bind: Callable[[Any, str], str],  # noqa: ANN401 — see compile_query's bind closure
-) -> str:
+    bind: Callable[[Any, str], exp.Placeholder],
+) -> exp.Expression:
+    """Build a predicate node for a Filter.
+
+    Dialect-specific shapes (``contains``) go through the strategy. Type
+    checks raise ``FilterTypeError`` with structured attrs."""
     op = f.op
     if op == "is_null":
-        return f"{field_sql} IS NULL"
+        return exp.Is(this=field, expression=exp.Null())
     if op == "not_null":
-        return f"{field_sql} IS NOT NULL"
+        return exp.Not(this=exp.Is(this=field, expression=exp.Null()))
 
     try:
         f.validate_for_type(field_type)
@@ -190,28 +213,34 @@ def _render_filter(
         ) from exc
 
     if op == "contains":
-        return strategy.emit_contains(field_sql, str(f.values[0]), bind)
+        return strategy.emit_contains(field, str(f.values[0]), bind)
 
-    placeholders = [bind(v, field_type) for v in f.values]
+    placeholders: list[exp.Placeholder] = [bind(v, field_type) for v in f.values]
 
-    if op == "eq":
-        return f"{field_sql} = {placeholders[0]}"
-    if op == "neq":
-        return f"{field_sql} <> {placeholders[0]}"
-    if op == "gt":
-        return f"{field_sql} > {placeholders[0]}"
-    if op == "lt":
-        return f"{field_sql} < {placeholders[0]}"
-    if op == "gte":
-        return f"{field_sql} >= {placeholders[0]}"
-    if op == "lte":
-        return f"{field_sql} <= {placeholders[0]}"
+    if op in _FILTER_BINOPS:
+        return _FILTER_BINOPS[op](this=field, expression=placeholders[0])
+
+    in_args: list[exp.Expression] = list(placeholders)
     if op == "in":
-        return f"{field_sql} IN ({', '.join(placeholders)})"
+        return exp.In(this=field, expressions=in_args)
     if op == "not_in":
-        return f"{field_sql} NOT IN ({', '.join(placeholders)})"
+        return exp.Not(this=exp.In(this=field, expressions=in_args))
 
     raise CompileError(f"Unsupported filter op: {op!r}")  # pragma: no cover
+
+
+def _parse_fragment(sql: str, dialect: str) -> exp.Expression:
+    """Parse a catalogue SQL fragment into a sqlglot AST node.
+
+    Used for dim/measure/time-dimension expressions, ``Join.on``, and
+    ``base_predicate``. Any parse failure surfaces as a ``CompileError``
+    naming the offending fragment so the catalogue author can fix it."""
+    try:
+        return sqlglot.parse_one(sql, dialect=dialect)  # type: ignore[return-value]
+    except ParseError as exc:
+        raise CompileError(
+            f"Could not parse catalogue SQL fragment {sql!r} under dialect {dialect!r}: {exc}"
+        ) from exc
 
 
 # ---------------------------------------------------------------------------
@@ -230,16 +259,18 @@ def compile_query(
 ) -> Compiled:
     """Compile a SemanticQuery to a Compiled bundle.
 
-    `catalog` — dict of cube name → Cube (build from `Catalog.as_dict()`).
-    `context` — optional string substitutions applied to `{key}` placeholders
-        in table names and SQL expressions (e.g. `{"schema": "mydb"}`).
-    `group_by_alias` — when True (default), GROUP BY references the SELECT
-        output alias. Set False to repeat the resolved expression.
-    `having_alias` — when False (default), HAVING repeats the aggregate
+    ``catalog`` — dict of cube name → Cube (build from ``Catalog.as_dict()``).
+    ``context`` — optional string substitutions applied to ``{key}``
+        placeholders in table names and SQL expressions
+        (e.g. ``{"schema": "mydb"}``).
+    ``group_by_alias`` — when True (default), GROUP BY references the
+        SELECT output alias. Set False to repeat the resolved expression.
+    ``having_alias`` — when False (default), HAVING repeats the aggregate
         expression. Set True only when you control the backend.
-    `strategies` — optional per-backend strategy overrides. Pass a
+    ``strategies`` — optional per-backend strategy overrides. Pass a
         ``RecordingStrategy`` for tests; pass a custom Snowflake / BigQuery
-        adapter for out-of-tree backends without touching the global registry."""
+        adapter for out-of-tree backends without touching the global registry.
+    """
     ctx = context or {}
 
     if q.compare is not None:
@@ -348,12 +379,13 @@ def compile_query(
                 cubes_in_from.append(tgt)
             cursor = tgt
 
-    # 4. Build alias map for placeholder substitution + bind/strategy closures.
+    # 4. Aliases, strategy, bind closure.
     cube_aliases: dict[str, str] = {c.name: c.alias for c in cubes_in_from}
     strategy = strategy_for(backend, strategies)
+    dialect = dialect_for(backend)
     params: dict[str, Any] = {}
 
-    def bind(value: Any, dim_type: str) -> str:  # noqa: ANN401 — Filter values are arbitrary literals
+    def bind(value: Any, dim_type: str) -> exp.Placeholder:  # noqa: ANN401
         name = f"p{len(params)}"
         params[name] = value
         return strategy.placeholder(name, dim_type)
@@ -361,32 +393,31 @@ def compile_query(
     def resolve_in_ctx(sql: str) -> str:
         return _resolve_sql(sql, cube_aliases, ctx)
 
-    # 5. Emit FROM + JOINs.
-    from_clause = strategy.emit_source(root, catalog, resolve_in_ctx)
-    join_clauses: list[str] = []
+    def parse(sql: str) -> exp.Expression:
+        return _parse_fragment(resolve_in_ctx(sql), dialect)
+
+    # 5. Compose the Select node — FROM + JOINs.
+    select_node = exp.Select()
+    select_node = select_node.from_(strategy.emit_source(root, catalog, resolve_in_ctx))
     for _, tgt, j in join_edges:
         tgt_strategy = strategy_for(tgt.backend, strategies)
         target_source = tgt_strategy.emit_source(tgt, catalog, resolve_in_ctx)
-        on_sql = _resolve_sql(j.on, cube_aliases, ctx)
-        join_clauses.append(f"LEFT JOIN {target_source} ON {on_sql}")
+        select_node = select_node.join(target_source, on=parse(j.on), join_type="left")
 
-    # 6. Compose SELECT projections.
-    select_items: list[str] = []
+    # 6. SELECT projections (dimensions, time-breakdown, measures).
     columns: list[str] = []
-
     proposed_names: list[str] = []
     proposed_names.extend(d.name for _, d in dim_fields)
     proposed_names.extend(m.name for _, m in measure_fields)
     name_counts = Counter(proposed_names)
     collisions = {n for n, c in name_counts.items() if c > 1}
 
-    def _col(cube: Cube, field_name: str) -> str:
+    def col_name_for(cube: Cube, field_name: str) -> str:
         return f"{cube.name}_{field_name}" if field_name in collisions else field_name
 
     for cube, dim in dim_fields:
-        sql_expr = _resolve_sql(dim.sql, cube_aliases, ctx)
-        col_name = _col(cube, dim.name)
-        select_items.append(f"{sql_expr} AS {col_name}")
+        col_name = col_name_for(cube, dim.name)
+        select_node = select_node.select(exp.alias_(parse(dim.sql), col_name))
         columns.append(col_name)
 
     has_time_breakdown = (
@@ -399,122 +430,117 @@ def compile_query(
         assert time_dim is not None and q.time_dimension is not None
         granularity = q.time_dimension.granularity
         assert granularity is not None
-        sql_expr = _resolve_sql(time_dim.sql, cube_aliases, ctx)
-        sql_expr = strategy.trunc(granularity, sql_expr)
+        trunc_node = strategy.trunc(granularity, parse(time_dim.sql))
         col_name = f"{time_dim.name}_{granularity}"
-        select_items.append(f"{sql_expr} AS {col_name}")
+        select_node = select_node.select(exp.alias_(trunc_node, col_name))
         columns.append(col_name)
 
-    measure_alias_map: dict[str, str] = {}
+    measure_alias_map: dict[str, exp.Expression] = {}
     for cube, m in measure_fields:
-        sql_expr = _resolve_sql(m.sql, cube_aliases, ctx)
-        agg_sql = _render_agg(m, sql_expr)
-        col_name = _col(cube, m.name)
-        select_items.append(f"{agg_sql} AS {col_name}")
+        if m.sql == "*":
+            inner: exp.Expression = exp.Star()
+        else:
+            inner = parse(m.sql)
+        agg_node = _agg_node(m, inner)
+        col_name = col_name_for(cube, m.name)
+        select_node = select_node.select(exp.alias_(agg_node, col_name))
         columns.append(col_name)
-        measure_alias_map[m.name] = agg_sql
+        measure_alias_map[m.name] = agg_node
         if col_name != m.name:
-            measure_alias_map[col_name] = agg_sql
+            measure_alias_map[col_name] = agg_node
 
-    if not select_items:
+    if not columns:
         raise CompileError("Compiled query has no SELECT projections.")
 
-    # 7. WHERE: filters + time window + base_predicates.
-    where_terms: list[str] = []
+    if not q.ungrouped and not measure_fields:
+        select_node.set("distinct", exp.Distinct())
+
+    # 7. WHERE: base_predicates + filters + time window.
+    where_terms: list[exp.Expression] = []
+    for cube in cubes_in_from:
+        if cube.base_predicate and cube.backend is not Backend.META:
+            where_terms.append(parse(cube.base_predicate))
+
     for f, _cube, fld in filter_resolutions:
-        fld_sql = _resolve_sql(fld.sql, cube_aliases, ctx)
+        fld_node = parse(fld.sql)
         if isinstance(fld, Dimension):
             fld_type = fld.type
         elif isinstance(fld, TimeDimension):
             fld_type = "time"
         else:
             fld_type = "string"
-        where_terms.append(_render_filter(f, fld_sql, fld_type, strategy, bind))
+        where_terms.append(_filter_node(f, fld_node, fld_type, strategy, bind))
 
     if q.time_dimension is not None and time_dim is not None:
-        td_sql = _resolve_sql(time_dim.sql, cube_aliases, ctx)
+        td_node_start = parse(time_dim.sql)
+        td_node_end = parse(time_dim.sql)
         where_terms.append(
-            f"{td_sql} >= {bind(q.time_dimension.range[0], 'time')} "
-            f"AND {td_sql} < {bind(q.time_dimension.range[1], 'time')}"
+            exp.GTE(this=td_node_start, expression=bind(q.time_dimension.range[0], "time"))
+        )
+        where_terms.append(
+            exp.LT(this=td_node_end, expression=bind(q.time_dimension.range[1], "time"))
         )
 
-    for cube in cubes_in_from:
-        if cube.base_predicate and cube.backend is not Backend.META:
-            where_terms.insert(0, _resolve_sql(cube.base_predicate, cube_aliases, ctx))
+    if where_terms:
+        select_node = select_node.where(*where_terms)
 
     # 8. GROUP BY.
-    group_by_items: list[str] = []
     if not q.ungrouped and measure_fields:
         for i, (_cube, dim) in enumerate(dim_fields):
             if group_by_alias:
-                group_by_items.append(columns[i])
+                select_node = select_node.group_by(exp.column(columns[i]))
             else:
-                group_by_items.append(_resolve_sql(dim.sql, cube_aliases, ctx))
+                select_node = select_node.group_by(parse(dim.sql))
         if has_time_breakdown:
             assert time_dim is not None and q.time_dimension is not None
             granularity = q.time_dimension.granularity
             assert granularity is not None
             if group_by_alias:
-                group_by_items.append(f"{time_dim.name}_{granularity}")
+                select_node = select_node.group_by(exp.column(f"{time_dim.name}_{granularity}"))
             else:
-                sql_expr = _resolve_sql(time_dim.sql, cube_aliases, ctx)
-                sql_expr = strategy.trunc(granularity, sql_expr)
-                group_by_items.append(sql_expr)
+                select_node = select_node.group_by(strategy.trunc(granularity, parse(time_dim.sql)))
 
-    select_keyword = "SELECT"
-    if not q.ungrouped and not measure_fields:
-        select_keyword = "SELECT DISTINCT"
-
-    # 9. HAVING. Accept either bare (`revenue`) or qualified (`orders.revenue`)
-    # measure references; the qualified form is split on '.' and the short
-    # name looked up in the alias map.
-    having_terms: list[str] = []
+    # 9. HAVING — bare or qualified measure reference.
     for hf in q.having:
         lookup_name = hf.dimension
         if lookup_name not in measure_alias_map and "." in lookup_name:
             lookup_name = lookup_name.rsplit(".", 1)[-1]
-        if lookup_name in measure_alias_map:
-            target = lookup_name if having_alias else measure_alias_map[lookup_name]
-            having_terms.append(_render_filter(hf, target, "number", strategy, bind))
-        else:
+        if lookup_name not in measure_alias_map:
             raise CompileError(
                 f"HAVING references {hf.dimension!r}, which is not a measure in this query."
             )
+        target_node: exp.Expression
+        if having_alias:
+            target_node = exp.column(lookup_name)
+        else:
+            target_node = measure_alias_map[lookup_name].copy()
+        select_node = select_node.having(_filter_node(hf, target_node, "number", strategy, bind))
 
     # 10. ORDER BY.
-    order_items: list[str] = []
     for ref, direction in q.order:
         if ref in measure_alias_map or ref in columns:
-            order_items.append(f"{ref} {direction.upper()}")
-            continue
-        try:
-            cube, fld = _resolve_field(ref, catalog)
-        except CompileError as exc:
-            raise CompileError(
-                f"ORDER BY {ref!r}: must reference an output column or a known cube.field. ({exc})"
-            ) from exc
-        order_items.append(f"{_resolve_sql(fld.sql, cube_aliases, ctx)} {direction.upper()}")
+            order_target: exp.Expression = exp.column(ref)
+        else:
+            try:
+                _, fld = _resolve_field(ref, catalog)
+            except CompileError as exc:
+                raise CompileError(
+                    f"ORDER BY {ref!r}: must reference an output column or "
+                    f"a known cube.field. ({exc})"
+                ) from exc
+            order_target = parse(fld.sql)
+        select_node = select_node.order_by(
+            exp.Ordered(this=order_target, desc=(direction == "desc"))
+        )
 
-    # 11. Assemble.
-    parts: list[str] = [
-        f"{select_keyword} {', '.join(select_items)}",
-        f"FROM {from_clause}",
-    ]
-    parts.extend(join_clauses)
-    if where_terms:
-        parts.append("WHERE " + " AND ".join(where_terms))
-    if group_by_items:
-        parts.append("GROUP BY " + ", ".join(group_by_items))
-    if having_terms:
-        parts.append("HAVING " + " AND ".join(having_terms))
-    if order_items:
-        parts.append("ORDER BY " + ", ".join(order_items))
+    # 11. LIMIT / OFFSET.
     if q.limit is not None:
-        parts.append(f"LIMIT {int(q.limit)}")
+        select_node = select_node.limit(int(q.limit))
     if q.offset is not None and q.offset > 0:
-        parts.append(f"OFFSET {int(q.offset)}")
+        select_node = select_node.offset(int(q.offset))
 
-    return Compiled(backend=backend, sql="\n".join(parts), params=params, columns=columns)
+    sql = select_node.sql(dialect=dialect, pretty=False, normalize_functions=False)
+    return Compiled(backend=backend, sql=sql, params=params, columns=columns)
 
 
 __all__ = [
