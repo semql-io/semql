@@ -26,10 +26,12 @@ from __future__ import annotations
 
 import re
 from collections import Counter
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
 from semql._resolve import resolve_field as _resolve_field_raw
+from semql.backend import BackendStrategy, strategy_for
 from semql.errors import (
     CompileError,
     CrossBackendError,
@@ -40,7 +42,6 @@ from semql.errors import (
     ResolveError,
     UnknownIdentifierError,
 )
-from semql.introspect import build_meta_values
 from semql.model import Backend, Cube, Dimension, Join, Measure, TimeDimension
 from semql.spec import Filter, SemanticQuery
 
@@ -159,49 +160,18 @@ def _render_agg(m: Measure, sql_expr: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Granularity truncation
+# Filter rendering — operator shape only. The dialect-specific bits
+# (placeholder syntax, `contains` substring shape) are delegated to the
+# backend strategy.
 # ---------------------------------------------------------------------------
-
-_TRUNC_CH: dict[str, str] = {
-    "hour": "toStartOfHour",
-    "day": "toStartOfDay",
-    "week": "toStartOfWeek",
-    "month": "toStartOfMonth",
-}
-
-
-def _render_trunc(backend: Backend, granularity: str, sql_expr: str) -> str:
-    if backend is Backend.CLICKHOUSE:
-        return f"{_TRUNC_CH[granularity]}({sql_expr})"
-    return f"date_trunc('{granularity}', {sql_expr})"
-
-
-# ---------------------------------------------------------------------------
-# Parameter rendering
-# ---------------------------------------------------------------------------
-
-
-def _param_placeholder(backend: Backend, name: str, dim_type: str) -> str:
-    if backend in (Backend.POSTGRES, Backend.DUCKDB, Backend.META):
-        return f"%({name})s"
-    if backend is Backend.CLICKHOUSE:
-        ch_type = {
-            "string": "String",
-            "number": "Float64",
-            "time": "DateTime",
-            "bool": "UInt8",
-        }.get(dim_type, "String")
-        return f"{{{name}:{ch_type}}}"
-    # BigQuery / Snowflake / others — named params
-    return f"@{name}"
 
 
 def _render_filter(
     f: Filter,
     field_sql: str,
     field_type: str,
-    backend: Backend,
-    params: dict[str, Any],
+    strategy: BackendStrategy,
+    bind: Callable[[Any, str], str],  # noqa: ANN401 — see compile_query's bind closure
 ) -> str:
     op = f.op
     if op == "is_null":
@@ -219,14 +189,10 @@ def _render_filter(
             value=f.values[0] if f.values else None,
         ) from exc
 
-    placeholders: list[str] = []
-    for v in f.values:
-        name = f"p{len(params)}"
-        bound_value: Any = v
-        if op == "contains" and backend is Backend.POSTGRES and isinstance(v, str):
-            bound_value = f"%{v}%"
-        params[name] = bound_value
-        placeholders.append(_param_placeholder(backend, name, field_type))
+    if op == "contains":
+        return strategy.emit_contains(field_sql, str(f.values[0]), bind)
+
+    placeholders = [bind(v, field_type) for v in f.values]
 
     if op == "eq":
         return f"{field_sql} = {placeholders[0]}"
@@ -240,33 +206,12 @@ def _render_filter(
         return f"{field_sql} >= {placeholders[0]}"
     if op == "lte":
         return f"{field_sql} <= {placeholders[0]}"
-    if op == "contains":
-        if backend is Backend.POSTGRES:
-            return f"{field_sql} ILIKE {placeholders[0]}"
-        return f"positionCaseInsensitive({field_sql}, {placeholders[0]}) > 0"
     if op == "in":
         return f"{field_sql} IN ({', '.join(placeholders)})"
     if op == "not_in":
         return f"{field_sql} NOT IN ({', '.join(placeholders)})"
 
     raise CompileError(f"Unsupported filter op: {op!r}")  # pragma: no cover
-
-
-# ---------------------------------------------------------------------------
-# Cube source emission
-# ---------------------------------------------------------------------------
-
-
-def _emit_cube_source(
-    cube: Cube,
-    cube_aliases: dict[str, str],
-    context: dict[str, str],
-    catalog: dict[str, Cube],
-) -> str:
-    if cube.backend is Backend.META:
-        return f"{build_meta_values(cube.name, catalog)} AS {cube.alias}"
-    table = _resolve_sql(cube.table, cube_aliases, context)
-    return f"{table} AS {cube.alias}"
 
 
 # ---------------------------------------------------------------------------
@@ -281,6 +226,7 @@ def compile_query(
     context: dict[str, str] | None = None,
     group_by_alias: bool = True,
     having_alias: bool = False,
+    strategies: dict[Backend, BackendStrategy] | None = None,
 ) -> Compiled:
     """Compile a SemanticQuery to a Compiled bundle.
 
@@ -290,7 +236,10 @@ def compile_query(
     `group_by_alias` — when True (default), GROUP BY references the SELECT
         output alias. Set False to repeat the resolved expression.
     `having_alias` — when False (default), HAVING repeats the aggregate
-        expression. Set True only when you control the backend."""
+        expression. Set True only when you control the backend.
+    `strategies` — optional per-backend strategy overrides. Pass a
+        ``RecordingStrategy`` for tests; pass a custom Snowflake / BigQuery
+        adapter for out-of-tree backends without touching the global registry."""
     ctx = context or {}
 
     if q.compare is not None:
@@ -399,14 +348,25 @@ def compile_query(
                 cubes_in_from.append(tgt)
             cursor = tgt
 
-    # 4. Build alias map for placeholder substitution.
+    # 4. Build alias map for placeholder substitution + bind/strategy closures.
     cube_aliases: dict[str, str] = {c.name: c.alias for c in cubes_in_from}
+    strategy = strategy_for(backend, strategies)
+    params: dict[str, Any] = {}
+
+    def bind(value: Any, dim_type: str) -> str:  # noqa: ANN401 — Filter values are arbitrary literals
+        name = f"p{len(params)}"
+        params[name] = value
+        return strategy.placeholder(name, dim_type)
+
+    def resolve_in_ctx(sql: str) -> str:
+        return _resolve_sql(sql, cube_aliases, ctx)
 
     # 5. Emit FROM + JOINs.
-    from_clause = _emit_cube_source(root, cube_aliases, ctx, catalog)
+    from_clause = strategy.emit_source(root, catalog, resolve_in_ctx)
     join_clauses: list[str] = []
     for _, tgt, j in join_edges:
-        target_source = _emit_cube_source(tgt, cube_aliases, ctx, catalog)
+        tgt_strategy = strategy_for(tgt.backend, strategies)
+        target_source = tgt_strategy.emit_source(tgt, catalog, resolve_in_ctx)
         on_sql = _resolve_sql(j.on, cube_aliases, ctx)
         join_clauses.append(f"LEFT JOIN {target_source} ON {on_sql}")
 
@@ -440,7 +400,7 @@ def compile_query(
         granularity = q.time_dimension.granularity
         assert granularity is not None
         sql_expr = _resolve_sql(time_dim.sql, cube_aliases, ctx)
-        sql_expr = _render_trunc(backend, granularity, sql_expr)
+        sql_expr = strategy.trunc(granularity, sql_expr)
         col_name = f"{time_dim.name}_{granularity}"
         select_items.append(f"{sql_expr} AS {col_name}")
         columns.append(col_name)
@@ -460,7 +420,6 @@ def compile_query(
         raise CompileError("Compiled query has no SELECT projections.")
 
     # 7. WHERE: filters + time window + base_predicates.
-    params: dict[str, Any] = {}
     where_terms: list[str] = []
     for f, _cube, fld in filter_resolutions:
         fld_sql = _resolve_sql(fld.sql, cube_aliases, ctx)
@@ -470,17 +429,13 @@ def compile_query(
             fld_type = "time"
         else:
             fld_type = "string"
-        where_terms.append(_render_filter(f, fld_sql, fld_type, backend, params))
+        where_terms.append(_render_filter(f, fld_sql, fld_type, strategy, bind))
 
     if q.time_dimension is not None and time_dim is not None:
         td_sql = _resolve_sql(time_dim.sql, cube_aliases, ctx)
-        start_name = f"p{len(params)}"
-        params[start_name] = q.time_dimension.range[0]
-        end_name = f"p{len(params)}"
-        params[end_name] = q.time_dimension.range[1]
         where_terms.append(
-            f"{td_sql} >= {_param_placeholder(backend, start_name, 'time')} "
-            f"AND {td_sql} < {_param_placeholder(backend, end_name, 'time')}"
+            f"{td_sql} >= {bind(q.time_dimension.range[0], 'time')} "
+            f"AND {td_sql} < {bind(q.time_dimension.range[1], 'time')}"
         )
 
     for cube in cubes_in_from:
@@ -503,7 +458,7 @@ def compile_query(
                 group_by_items.append(f"{time_dim.name}_{granularity}")
             else:
                 sql_expr = _resolve_sql(time_dim.sql, cube_aliases, ctx)
-                sql_expr = _render_trunc(backend, granularity, sql_expr)
+                sql_expr = strategy.trunc(granularity, sql_expr)
                 group_by_items.append(sql_expr)
 
     select_keyword = "SELECT"
@@ -520,7 +475,7 @@ def compile_query(
             lookup_name = lookup_name.rsplit(".", 1)[-1]
         if lookup_name in measure_alias_map:
             target = lookup_name if having_alias else measure_alias_map[lookup_name]
-            having_terms.append(_render_filter(hf, target, "number", backend, params))
+            having_terms.append(_render_filter(hf, target, "number", strategy, bind))
         else:
             raise CompileError(
                 f"HAVING references {hf.dimension!r}, which is not a measure in this query."
