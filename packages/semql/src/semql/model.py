@@ -25,7 +25,7 @@ from __future__ import annotations
 from enum import StrEnum
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class Backend(StrEnum):
@@ -42,6 +42,18 @@ DimTypeLiteral = Literal["string", "number", "time", "bool", "uuid"]
 GranularityLiteral = Literal["hour", "day", "week", "month"]
 FormatLiteral = Literal["raw", "integer", "percent", "currency", "duration"]
 ChartTypeLiteral = Literal["pie_chart", "bar_chart", "line_chart", "data_table"]
+
+# Per-cube tenant isolation strategy:
+# - schema       : tenant lives in its own DB schema; the cube's ``table``
+#                  contains ``{tenant_schema}`` and the compile-time
+#                  ``context`` substitutes it.
+# - discriminator: a shared physical table; the compiler wraps the
+#                  source in a subquery with ``WHERE <tenancy_column>
+#                  = bind(tenant_value)`` inside the alias so outer
+#                  ``OR`` predicates can't cross tenants.
+# - none         : no tenant boundary (META reflection cubes, public
+#                  lookups). The compiler emits no tenancy predicate.
+TenancyMode = Literal["schema", "discriminator", "none"]
 
 # k8s-annotation style: opaque string→string map. SemQL never touches
 # the contents — the user owns the namespace and meaning.
@@ -117,6 +129,32 @@ class Cube(BaseModel):
     display_name: str | None = None
     default_chart_type: ChartTypeLiteral | None = None
     metadata: Metadata = Field(default_factory=dict)
+    # Tenant isolation strategy — see the ``TenancyMode`` docstring.
+    # Defaults to ``"schema"`` so existing catalogues that rely on
+    # ``{tenant_schema}`` substitution keep working.
+    tenancy: TenancyMode = "schema"
+    # The column that carries the tenant identifier in DISCRIMINATOR
+    # mode. Required when ``tenancy == "discriminator"``; ignored
+    # otherwise.
+    tenancy_column: str | None = None
+
+    @model_validator(mode="after")
+    def _check_tenancy_consistency(self) -> Cube:
+        if self.tenancy == "discriminator":
+            if not self.tenancy_column:
+                raise ValueError(
+                    f"Cube {self.name!r} declares tenancy='discriminator' but "
+                    "has no tenancy_column — the compiler can't emit a "
+                    "WHERE predicate without a column to filter on."
+                )
+            if "{tenant_schema}" in self.table:
+                raise ValueError(
+                    f"Cube {self.name!r} declares tenancy='discriminator' "
+                    "but its table contains '{tenant_schema}'. The two "
+                    "isolation strategies are mutually exclusive — pick "
+                    "one."
+                )
+        return self
 
     def field_names(self) -> set[str]:
         names: set[str] = set()
@@ -138,5 +176,6 @@ __all__ = [
     "Join",
     "Measure",
     "Metadata",
+    "TenancyMode",
     "TimeDimension",
 ]

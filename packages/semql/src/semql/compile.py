@@ -425,6 +425,39 @@ def compile_query(
     def parse(sql: str) -> exp.Expression:
         return _parse_fragment(resolve_in_ctx(sql), dialect)
 
+    def wrap_for_tenancy(cube: Cube, source: exp.Expression) -> exp.Expression:
+        """Wrap a cube's FROM source in a tenancy-scoped subquery.
+
+        DISCRIMINATOR cubes share a physical table; the wrapper carries
+        ``WHERE <tenancy_column> = <bound_tenant>`` *inside* the alias
+        the outer query sees so a malformed outer ``OR`` predicate
+        can't smuggle in rows from another tenant. SCHEMA / NONE cubes
+        pass through unchanged."""
+        if cube.tenancy != "discriminator":
+            return source
+        if "tenant" not in ctx:
+            raise CompileError(
+                f"Cube {cube.name!r} declares tenancy='discriminator' but "
+                "no 'tenant' value was provided in compile context. "
+                "Pass context={'tenant': <tenant_id>, ...}."
+            )
+        assert cube.tenancy_column is not None
+        inner = (
+            exp.Select()
+            .select(exp.Star())
+            .from_(source)
+            .where(
+                exp.EQ(
+                    this=exp.column(cube.tenancy_column, table=cube.alias),
+                    expression=bind(ctx["tenant"], "string"),
+                )
+            )
+        )
+        return exp.Subquery(
+            this=inner,
+            alias=exp.TableAlias(this=exp.to_identifier(cube.alias)),
+        )
+
     # 5. Column name allocation (collision-prefix shared across compare CTEs).
     proposed_names: list[str] = []
     proposed_names.extend(d.name for _, d in dim_fields)
@@ -458,10 +491,12 @@ def compile_query(
         across the current/prior CTEs in compare mode; only the time
         window bindings differ per call."""
         sel = exp.Select()
-        sel = sel.from_(strategy.emit_source(root, catalog, resolve_in_ctx))
+        sel = sel.from_(wrap_for_tenancy(root, strategy.emit_source(root, catalog, resolve_in_ctx)))
         for _, tgt, j in join_edges:
             tgt_strategy = strategy_for(tgt.backend, strategies)
-            target_source = tgt_strategy.emit_source(tgt, catalog, resolve_in_ctx)
+            target_source = wrap_for_tenancy(
+                tgt, tgt_strategy.emit_source(tgt, catalog, resolve_in_ctx)
+            )
             sel = sel.join(target_source, on=parse(j.on), join_type="left")
 
         for (_cube, dim), col_name in zip(dim_fields, dim_col_names, strict=True):
