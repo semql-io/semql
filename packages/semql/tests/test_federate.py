@@ -253,9 +253,9 @@ def test_refuses_non_distributive_aggregation() -> None:
     assert exc.value.reason.startswith("non_distributive_aggregation")
 
 
-def test_refuses_where_tree() -> None:
-    """The boolean predicate tree can OR/NOT across backends in ways
-    we can't safely partition. Refuse — callers use flat filters."""
+def test_distributive_mode_still_refuses_where_tree() -> None:
+    """Distributive federation refuses the where-tree — raw_rows mode
+    is the path that handles it via CNF splitting."""
     catalog = _federated_catalog()
     from semql.spec import BoolExpr
 
@@ -272,7 +272,7 @@ def test_refuses_where_tree() -> None:
     )
     with pytest.raises(FederationError) as exc:
         compile_federated_query(q, catalog)
-    assert exc.value.reason == "where_tree_in_federated"
+    assert exc.value.reason == "where_tree_in_distributive_federated"
 
 
 def test_refuses_compare_mode() -> None:
@@ -492,9 +492,10 @@ def test_distributive_mode_still_refuses_having() -> None:
     assert exc.value.reason == "having_in_distributive_federated"
 
 
-def test_raw_rows_refuses_ratio_measure() -> None:
-    """Ratio measures are deferred in raw-row mode — the merge would
-    need to recursively expand numerator/denominator into raw cols."""
+def test_raw_rows_supports_ratio_measure() -> None:
+    """Ratio measures expand recursively in raw-row mode: numerator
+    and denominator each get a raw-column projection, and the merge
+    composes ``<num_agg>(num_col) / NULLIF(<den_agg>(den_col), 0)``."""
     orders = _orders().model_copy(
         update={
             "measures": [
@@ -512,12 +513,50 @@ def test_raw_rows_refuses_ratio_measure() -> None:
     )
     catalog = _catalog(orders, _customers())
     q = SemanticQuery(measures=["orders.aov"], dimensions=["customers.region"])
+    plan = compile_federated_query(q, catalog, mode="raw_rows")
+    # Merge SQL recomposes the ratio: SUM(revenue_raw) / NULLIF(COUNT(*), 0).
+    assert "SUM(" in plan.merge.sql.upper()
+    assert "NULLIF" in plan.merge.sql.upper()
+    assert "aov" in plan.columns
+
+
+def test_raw_rows_rejects_nested_ratio_measures() -> None:
+    """A ratio whose numerator or denominator is itself a ratio is
+    refused — the raw-row expander only walks one level deep."""
+    orders = _orders().model_copy(
+        update={
+            "measures": [
+                Measure(name="revenue", sql="{o}.amount", agg="sum"),
+                Measure(name="count", sql="*", agg="count"),
+                Measure(
+                    name="aov",
+                    sql="",
+                    agg="ratio",
+                    numerator="revenue",
+                    denominator="count",
+                ),
+                Measure(
+                    name="aov_of_aov",
+                    sql="",
+                    agg="ratio",
+                    numerator="aov",
+                    denominator="count",
+                ),
+            ]
+        }
+    )
+    catalog = _catalog(orders, _customers())
+    q = SemanticQuery(measures=["orders.aov_of_aov"], dimensions=["customers.region"])
     with pytest.raises(FederationError) as exc:
         compile_federated_query(q, catalog, mode="raw_rows")
-    assert exc.value.reason == "ratio_in_raw_rows"
+    assert exc.value.reason == "nested_ratio_in_raw_rows"
 
 
-def test_raw_rows_refuses_filtered_measure() -> None:
+def test_raw_rows_supports_filtered_measure() -> None:
+    """Filtered measures project ``CASE WHEN <filter> THEN <sql> ELSE NULL END``
+    as the raw column; the merge agg ignores NULLs, so filter
+    semantics compose for SUM / COUNT / AVG / MIN / MAX /
+    COUNT(DISTINCT)."""
     orders = _orders().model_copy(
         update={
             "measures": [
@@ -532,12 +571,42 @@ def test_raw_rows_refuses_filtered_measure() -> None:
     )
     catalog = _catalog(orders, _customers())
     q = SemanticQuery(measures=["orders.paid_revenue"], dimensions=["customers.region"])
-    with pytest.raises(FederationError) as exc:
-        compile_federated_query(q, catalog, mode="raw_rows")
-    assert exc.value.reason == "filtered_measure_in_raw_rows"
+    plan = compile_federated_query(q, catalog, mode="raw_rows")
+    # Primary fragment carries a CASE-WHEN-wrapped raw column.
+    primary = plan.fragments[0]
+    assert "CASE WHEN" in primary.sql.upper()
+    # Merge SUMs the projected (filtered-by-NULL) raw col.
+    assert "SUM(" in plan.merge.sql.upper()
 
 
-def test_raw_rows_refuses_time_dimension() -> None:
+def test_raw_rows_supports_filtered_count_star() -> None:
+    """COUNT(*) FILTER(...) becomes ``CASE WHEN <filter> THEN 1 ELSE NULL END``
+    projected at the fragment and ``COUNT(<col>)`` at merge — counting
+    non-NULL gives the filtered count."""
+    orders = _orders().model_copy(
+        update={
+            "measures": [
+                Measure(
+                    name="paid_count",
+                    sql="*",
+                    agg="count",
+                    filter="{o}.status = 'paid'",
+                )
+            ]
+        }
+    )
+    catalog = _catalog(orders, _customers())
+    q = SemanticQuery(measures=["orders.paid_count"], dimensions=["customers.region"])
+    plan = compile_federated_query(q, catalog, mode="raw_rows")
+    primary = plan.fragments[0]
+    assert "CASE WHEN" in primary.sql.upper()
+    # Filtered COUNT(*) → COUNT(col) at merge (not COUNT(*)).
+    assert "COUNT(F0" in plan.merge.sql.upper().replace('"', "") or "COUNT(f0" in plan.merge.sql
+
+
+def test_raw_rows_supports_time_dimension() -> None:
+    """Raw-row mode projects the raw timestamp at the fragment and
+    buckets via ``date_trunc(grain, col)`` at merge."""
     catalog = _federated_catalog()
     q = SemanticQuery(
         measures=["orders.distinct_customers"],
@@ -548,9 +617,147 @@ def test_raw_rows_refuses_time_dimension() -> None:
             range=("2026-01-01", "2026-02-01"),
         ),
     )
-    with pytest.raises(FederationError) as exc:
-        compile_federated_query(q, catalog, mode="raw_rows")
-    assert exc.value.reason == "time_dimension_in_raw_rows"
+    plan = compile_federated_query(q, catalog, mode="raw_rows")
+    # Time bucket lives in the merge SQL as date_trunc.
+    assert "date_trunc('day'" in plan.merge.sql or "DATE_TRUNC('day'" in plan.merge.sql
+    # Output column name reflects the bucketed grain.
+    assert "created_at_day" in plan.columns
+    # Fragment received the range as fragment-side filters on the raw
+    # timestamp column (so the fragment doesn't pull every row).
+    primary = plan.fragments[0]
+    assert "2026-01-01" in str(primary.params.values()) or "2026-01-01" in primary.sql
+
+
+def test_raw_rows_single_partition_where_routes_to_fragment() -> None:
+    """A where-tree whose leaves all live on one cube routes into
+    that cube's fragment — even when the tree is an OR (which can't
+    be expressed via flat ``filters``)."""
+    from semql.spec import BoolExpr
+
+    catalog = _federated_catalog()
+    q = SemanticQuery(
+        measures=["orders.distinct_customers"],
+        dimensions=["customers.region"],
+        where=BoolExpr(
+            op="or",
+            children=[
+                Filter(dimension="orders.status", op="eq", values=["paid"]),
+                Filter(dimension="orders.status", op="eq", values=["pending"]),
+            ],
+        ),
+    )
+    plan = compile_federated_query(q, catalog, mode="raw_rows")
+    primary = plan.fragments[0]
+    # Both branch values made it into the orders fragment.
+    assert "paid" in str(primary.params.values())
+    assert "pending" in str(primary.params.values())
+    # Merge has no WHERE — the clause stayed inside the fragment.
+    assert " WHERE " not in plan.merge.sql.upper()
+
+
+def test_raw_rows_cross_partition_or_lifted_to_merge() -> None:
+    """An OR clause that spans backends can't push down to either
+    fragment; the merge SQL emits the disjunction after the JOIN."""
+    from semql.spec import BoolExpr
+
+    catalog = _federated_catalog()
+    q = SemanticQuery(
+        measures=["orders.distinct_customers"],
+        dimensions=["customers.region"],
+        where=BoolExpr(
+            op="or",
+            children=[
+                Filter(dimension="orders.status", op="eq", values=["paid"]),
+                Filter(dimension="customers.tier", op="eq", values=["gold"]),
+            ],
+        ),
+    )
+    plan = compile_federated_query(q, catalog, mode="raw_rows")
+    # Both partitions had to project the referenced dim — even though
+    # neither was in the query's dimension list.
+    primary = plan.fragments[0]
+    satellite = plan.fragments[1]
+    assert "status" in primary.columns
+    assert "tier" in satellite.columns
+    # Merge emits the OR predicate over the joined frames.
+    upper = plan.merge.sql.upper()
+    assert " WHERE " in upper
+    assert " OR " in upper
+
+
+def test_raw_rows_cross_partition_and_splits_by_cnf() -> None:
+    """``A AND B`` where A is on one partition and B on another should
+    route A to its partition and B to its partition — neither lives
+    in the merge SQL."""
+    from semql.spec import BoolExpr
+
+    catalog = _federated_catalog()
+    q = SemanticQuery(
+        measures=["orders.distinct_customers"],
+        dimensions=["customers.region"],
+        where=BoolExpr(
+            op="and",
+            children=[
+                Filter(dimension="orders.status", op="eq", values=["paid"]),
+                Filter(dimension="customers.tier", op="eq", values=["gold"]),
+            ],
+        ),
+    )
+    plan = compile_federated_query(q, catalog, mode="raw_rows")
+    primary = plan.fragments[0]
+    satellite = plan.fragments[1]
+    # Each conjunct lives in its own fragment.
+    assert "paid" in str(primary.params.values())
+    assert "gold" in str(satellite.params.values())
+    # Merge stays free of cross-partition predicates.
+    assert " WHERE " not in plan.merge.sql.upper()
+
+
+def test_raw_rows_where_tree_with_not_routes_correctly() -> None:
+    """``NOT(filter)`` on a leaf is preserved through CNF — the
+    fragment-side WHERE keeps the negation."""
+    from semql.spec import BoolExpr
+
+    catalog = _federated_catalog()
+    q = SemanticQuery(
+        measures=["orders.distinct_customers"],
+        dimensions=["customers.region"],
+        where=BoolExpr(
+            op="not",
+            children=[
+                Filter(dimension="orders.status", op="eq", values=["pending"]),
+            ],
+        ),
+    )
+    plan = compile_federated_query(q, catalog, mode="raw_rows")
+    primary = plan.fragments[0]
+    # 'pending' is the filtered-out value; it should still appear as
+    # a bound param on the fragment side.
+    assert "pending" in str(primary.params.values())
+
+
+def test_raw_rows_routes_single_partition_segment() -> None:
+    """A Segment whose predicate references one cube routes to that
+    cube's partition and AND-composes into the fragment's WHERE."""
+    from semql.model import Segment
+
+    orders = _orders().model_copy(
+        update={
+            "segments": [
+                Segment(name="paid", sql="{o}.status = 'paid'"),
+            ]
+        }
+    )
+    catalog = _catalog(orders, _customers())
+    q = SemanticQuery(
+        measures=["orders.distinct_customers"],
+        dimensions=["customers.region"],
+        segments=["orders.paid"],
+    )
+    plan = compile_federated_query(q, catalog, mode="raw_rows")
+    primary = plan.fragments[0]
+    assert "status" in primary.sql.lower()
+    assert "paid" in str(primary.params.values()) or "'paid'" in primary.sql
 
 
 def test_raw_rows_single_backend_path_is_unchanged() -> None:

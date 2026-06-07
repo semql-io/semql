@@ -335,6 +335,103 @@ def test_engine_repeatable_runs_dont_leak_state(
 
 
 # ---------------------------------------------------------------------------
+# Raw-row follow-ups — filtered / ratio measures, time_dim, where-tree CNF
+# ---------------------------------------------------------------------------
+
+
+def test_engine_runs_raw_rows_with_filtered_measure(
+    pg_con: duckdb.DuckDBPyConnection,
+    bq_con: duckdb.DuckDBPyConnection,
+) -> None:
+    """Filtered measures project ``CASE WHEN <filter> THEN <sql> ELSE NULL END``
+    at the fragment; the merge's SUM ignores NULLs, so 'paid revenue
+    by region' lands exactly as the user would write by hand."""
+    orders = Cube(
+        name="orders",
+        backend=Backend.POSTGRES,
+        table="orders",
+        alias="o",
+        primary_key="id",
+        measures=[
+            Measure(
+                name="paid_revenue",
+                sql="{o}.amount",
+                agg="sum",
+                filter="{o}.status = 'paid'",
+            ),
+        ],
+        dimensions=[
+            Dimension(name="id", sql="{o}.id", type="number"),
+            Dimension(
+                name="customer_id",
+                sql="{o}.customer_id",
+                type="number",
+                foreign_key="customers",
+            ),
+            Dimension(name="status", sql="{o}.status", type="string"),
+        ],
+        joins=[
+            Join(to="customers", relationship="many_to_one", on="{o}.customer_id = {c}.id"),
+        ],
+    )
+    catalog = _catalog(orders, _customers_cube())
+    plan = compile_federated_query(
+        SemanticQuery(
+            measures=["orders.paid_revenue"],
+            dimensions=["customers.region"],
+        ),
+        catalog,
+        mode="raw_rows",
+    )
+    engine = Engine()
+    engine.register(Backend.POSTGRES, _DialectTranslatingAdapter(pg_con))
+    engine.register(Backend.BIGQUERY, _DialectTranslatingAdapter(bq_con))
+    result = engine.run(plan)
+    rows = {r[0]: r[1] for r in result.rows}
+    # EU paid: 100+200+300=600; US paid: 50 (the pending 25 is filtered out).
+    assert rows == {"EU": 600.0, "US": 50.0}
+
+
+def test_engine_runs_raw_rows_with_cross_partition_or(
+    pg_con: duckdb.DuckDBPyConnection,
+    bq_con: duckdb.DuckDBPyConnection,
+) -> None:
+    """``status='paid' OR tier='gold'`` spans backends — raw-row CNF
+    routes the disjunction to the merge SQL, which applies it after
+    the cross-source JOIN."""
+    from semql.spec import BoolExpr, Filter
+
+    catalog = _catalog(_orders_cube(), _customers_cube())
+    plan = compile_federated_query(
+        SemanticQuery(
+            measures=["orders.revenue"],
+            dimensions=["customers.region"],
+            where=BoolExpr(
+                op="or",
+                children=[
+                    Filter(dimension="orders.status", op="eq", values=["paid"]),
+                    Filter(dimension="customers.tier", op="eq", values=["gold"]),
+                ],
+            ),
+        ),
+        catalog,
+        mode="raw_rows",
+    )
+    engine = Engine()
+    engine.register(Backend.POSTGRES, _DialectTranslatingAdapter(pg_con))
+    engine.register(Backend.BIGQUERY, _DialectTranslatingAdapter(bq_con))
+    result = engine.run(plan)
+    rows = {r[0]: r[1] for r in result.rows}
+    # EU customers (10, 12 are gold) match either branch. Orders 1+2
+    # (cust 10, paid) + 5 (cust 12, paid). Both also satisfy tier='gold'.
+    # → EU sum = 100+200+300 = 600.
+    # US has cust 11 (silver). Orders 3 (paid, $50) matches via status;
+    # order 4 (pending, $25) is silver and not paid → drops.
+    # → US sum = 50.
+    assert rows == {"EU": 600.0, "US": 50.0}
+
+
+# ---------------------------------------------------------------------------
 # Raw-row federation (P3) — non-distributive aggs end-to-end
 # ---------------------------------------------------------------------------
 
