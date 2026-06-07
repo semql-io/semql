@@ -46,6 +46,7 @@ from semql.prompt import (
     build_router_prompt_fragment,
     render_catalogue_block,
 )
+from semql.safe import is_safe_select
 from semql.spec import (
     CompareWindow,
     Filter,
@@ -96,6 +97,7 @@ __all__ = [
     "build_router_prompt_fragment",
     "compile_query",
     "decide_visualization",
+    "is_safe_select",
     "render_catalogue_block",
     "validate",
 ]
