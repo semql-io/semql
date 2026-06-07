@@ -60,14 +60,33 @@ TenancyMode = Literal["schema", "discriminator", "none"]
 Metadata = dict[str, str]
 
 
-class Measure(BaseModel):
+class BaseField(BaseModel):
+    """Shared supertype for catalogue fields.
+
+    Every named, addressable artefact on a cube — measures, dimensions,
+    time dimensions, segments — carries the same identity / presentation
+    fields: a stable machine ``name``, the underlying ``sql`` fragment
+    (``{alias}``-templated), a human-readable ``description``, an
+    optional ``display_name`` for the prompt fragment, and an opaque
+    ``metadata`` map for caller-owned tags.
+
+    Subclasses add the type-specific surface (``agg`` on Measure,
+    ``type`` on Dimension, ``granularities`` on TimeDimension).
+    ``isinstance(fld, Measure)`` etc. still narrows correctly — the
+    base type is a structural convenience, not a discriminator.
+    """
+
     model_config = ConfigDict(frozen=True)
     name: str
     sql: str
-    agg: AggLiteral
-    unit: str | None = None
     description: str = ""
     display_name: str | None = None
+    metadata: Metadata = Field(default_factory=dict)
+
+
+class Measure(BaseField):
+    agg: AggLiteral
+    unit: str | None = None
     format: FormatLiteral | None = None
     # When True, summing this measure across a coarser time grain
     # yields a wrong answer (the canonical case is ``count_distinct``).
@@ -75,35 +94,22 @@ class Measure(BaseModel):
     # so the planner LLM doesn't naively ask for rollups; compiler
     # refusal lands with the rollup work.
     non_additive: bool = False
-    metadata: Metadata = Field(default_factory=dict)
 
 
-class Dimension(BaseModel):
-    model_config = ConfigDict(frozen=True)
-    name: str
-    sql: str
+class Dimension(BaseField):
     type: DimTypeLiteral
-    description: str = ""
-    display_name: str | None = None
-    metadata: Metadata = Field(default_factory=dict)
 
 
-class TimeDimension(BaseModel):
+class TimeDimension(BaseField):
     """Time dimensions are separated so the compiler can apply
     `granularity` truncation when a query asks for it (hourly/daily/etc.
     rollups). Otherwise they're just dimensions of type `time`."""
 
-    model_config = ConfigDict(frozen=True)
-    name: str
-    sql: str
     type: Literal["time"] = "time"
     granularities: tuple[GranularityLiteral, ...] = ("hour", "day", "week", "month")
-    description: str = ""
-    display_name: str | None = None
-    metadata: Metadata = Field(default_factory=dict)
 
 
-class Segment(BaseModel):
+class Segment(BaseField):
     """A named, reusable predicate over a cube's rows.
 
     Segments centralise business definitions ("active customers",
@@ -115,13 +121,6 @@ class Segment(BaseModel):
     The ``sql`` fragment uses the same ``{alias}`` placeholder
     convention as dimension / measure SQL — ``{o}.status = 'paid'``
     resolves to ``o.status = 'paid'`` at compile time."""
-
-    model_config = ConfigDict(frozen=True)
-    name: str
-    sql: str
-    description: str = ""
-    display_name: str | None = None
-    metadata: Metadata = Field(default_factory=dict)
 
 
 class Join(BaseModel):
@@ -205,6 +204,7 @@ class Cube(BaseModel):
 __all__ = [
     "AggLiteral",
     "Backend",
+    "BaseField",
     "ChartTypeLiteral",
     "Cube",
     "DimTypeLiteral",

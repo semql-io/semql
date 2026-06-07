@@ -31,6 +31,7 @@ from semql.introspect import (
 from semql.model import (
     AggLiteral,
     Backend,
+    BaseField,
     ChartTypeLiteral,
     Cube,
     Dimension,
@@ -62,6 +63,7 @@ from semql.visualize import VizColumn, VizDecision, decide_visualization
 __all__ = [
     "AggLiteral",
     "Backend",
+    "BaseField",
     "BoolExpr",
     "CATALOG_CUBES",
     "CATALOG_DIMENSIONS",
