@@ -754,6 +754,378 @@ def _pick_single_backend(touched: list[Cube]) -> Backend:
     return next(iter(backends))
 
 
+def _emit_compare_query(
+    q: SemanticQuery,
+    *,
+    backend: Backend,
+    dialect: str,
+    params: dict[str, Any],
+    build_inner: Callable[[tuple[str, str]], exp.Select],
+    resolve_in_ctx: Callable[[str], str],
+    touched: list[Cube],
+    dim_fields: list[tuple[Cube, Dimension]],
+    measure_fields: list[tuple[Cube, Measure]],
+    dim_col_names: list[str],
+    measure_col_names: list[str],
+    time_dim: TimeDimension | None,
+    time_col_name: str | None,
+    has_time_breakdown: bool,
+) -> Compiled:
+    """Compose the current/prior FULL OUTER JOIN compare-mode output.
+
+    Two CTEs (``current`` / ``prior``) wrap the same inner select with
+    different time ranges; the outer SELECT COALESCEs the dim columns,
+    projects per-measure ``<col>_current`` / ``<col>_prior`` /
+    ``<col>_delta`` / ``<col>_pct_change``, and joins on every
+    grouping column. ``pct_change`` guards divide-by-zero via
+    ``CASE WHEN prior > 0 THEN ... END``.
+    """
+    assert q.compare is not None and q.time_dimension is not None
+    current_range = q.time_dimension.range
+    if q.compare.mode == "previous_period":
+        cs = datetime.fromisoformat(current_range[0])
+        ce = datetime.fromisoformat(current_range[1])
+        duration = ce - cs
+        prior_range: tuple[str, str] = (
+            (cs - duration).isoformat(),
+            cs.isoformat(),
+        )
+    else:
+        assert q.compare.range is not None
+        prior_range = q.compare.range
+
+    current_inner = build_inner(current_range)
+    prior_inner = build_inner(prior_range)
+
+    outer = exp.Select()
+    outer = outer.with_("current", current_inner)
+    outer = outer.with_("prior", prior_inner)
+
+    outer_columns: list[str] = []
+    for col_name in dim_col_names:
+        outer = outer.select(
+            exp.alias_(
+                exp.Anonymous(
+                    this="COALESCE",
+                    expressions=[
+                        exp.column(col_name, table="current"),
+                        exp.column(col_name, table="prior"),
+                    ],
+                ),
+                col_name,
+            )
+        )
+        outer_columns.append(col_name)
+    if has_time_breakdown:
+        assert time_col_name is not None
+        outer = outer.select(
+            exp.alias_(
+                exp.Anonymous(
+                    this="COALESCE",
+                    expressions=[
+                        exp.column(time_col_name, table="current"),
+                        exp.column(time_col_name, table="prior"),
+                    ],
+                ),
+                time_col_name,
+            )
+        )
+        outer_columns.append(time_col_name)
+
+    for col_name in measure_col_names:
+        cur_ref = exp.column(col_name, table="current")
+        pri_ref = exp.column(col_name, table="prior")
+        cur_col = f"{col_name}_current"
+        pri_col = f"{col_name}_prior"
+        delta_col = f"{col_name}_delta"
+        pct_col = f"{col_name}_pct_change"
+
+        outer = outer.select(exp.alias_(cur_ref.copy(), cur_col))
+        outer = outer.select(exp.alias_(pri_ref.copy(), pri_col))
+
+        # delta: COALESCE both to 0 so the diff is meaningful when one
+        # period is missing the entity.
+        coalesced_cur = exp.Anonymous(
+            this="COALESCE", expressions=[cur_ref.copy(), exp.Literal.number(0)]
+        )
+        coalesced_pri = exp.Anonymous(
+            this="COALESCE", expressions=[pri_ref.copy(), exp.Literal.number(0)]
+        )
+        outer = outer.select(
+            exp.alias_(
+                exp.Sub(this=coalesced_cur, expression=coalesced_pri),
+                delta_col,
+            )
+        )
+
+        # pct_change: divide-by-zero guard. ``exp.Paren`` around the
+        # Sub is load-bearing — sqlglot's renderer doesn't infer
+        # precedence for binary ops, so ``Mul(Sub(a, b), 100)`` would
+        # render as ``a - b * 100`` without the explicit paren.
+        pct_expr = exp.Case(
+            ifs=[
+                exp.If(
+                    this=exp.GT(this=pri_ref.copy(), expression=exp.Literal.number(0)),
+                    true=exp.Div(
+                        this=exp.Mul(
+                            this=exp.Paren(
+                                this=exp.Sub(
+                                    this=cur_ref.copy(),
+                                    expression=pri_ref.copy(),
+                                )
+                            ),
+                            expression=exp.Literal.number(100.0),
+                        ),
+                        expression=pri_ref.copy(),
+                    ),
+                )
+            ],
+            default=exp.Null(),
+        )
+        outer = outer.select(exp.alias_(pct_expr, pct_col))
+
+        outer_columns.extend([cur_col, pri_col, delta_col, pct_col])
+
+    outer = outer.from_(exp.to_table("current"))
+    join_dims = dim_col_names + ([time_col_name] if time_col_name else [])
+    if join_dims:
+        on_expr: exp.Expression | None = None
+        for jd in join_dims:
+            eq = exp.EQ(
+                this=exp.column(jd, table="current"),
+                expression=exp.column(jd, table="prior"),
+            )
+            on_expr = eq if on_expr is None else exp.And(this=on_expr, expression=eq)
+        outer = outer.join(exp.to_table("prior"), on=on_expr, join_type="full outer")
+    else:
+        # No dims, no time bucket — cross product of single rows.
+        outer = outer.join(
+            exp.to_table("prior"),
+            on=exp.Boolean(this=True),
+            join_type="full outer",
+        )
+
+    for ref, direction in q.order:
+        if ref in outer_columns:
+            order_target_node: exp.Expression = exp.column(ref)
+        else:
+            raise CompileError(
+                f"ORDER BY {ref!r}: in compare mode, only the outer "
+                f"output column names are addressable "
+                f"(e.g. {measure_col_names[0]}_delta). Got {ref!r}."
+            )
+        outer = outer.order_by(exp.Ordered(this=order_target_node, desc=(direction == "desc")))
+
+    if q.limit is not None:
+        outer = outer.limit(int(q.limit))
+    if q.offset is not None and q.offset > 0:
+        outer = outer.offset(int(q.offset))
+
+    outer = _apply_with_clause(outer, _collect_hoisted_ctes(touched, resolve_in_ctx), backend)
+    sql = outer.sql(dialect=dialect, pretty=False, normalize_functions=False)
+    cm = _build_column_meta(
+        outer_columns,
+        dim_fields,
+        dim_col_names,
+        measure_fields,
+        measure_col_names,
+        time_dim,
+        time_col_name,
+        is_compare=True,
+    )
+    return Compiled(
+        backend=backend,
+        sql=sql,
+        params=params,
+        columns=outer_columns,
+        column_meta=cm,
+        touched_cube_names=[c.name for c in touched],
+        derived_sources=_collect_derived_sources(touched, resolve_in_ctx),
+    )
+
+
+def _emit_simple_query(
+    q: SemanticQuery,
+    *,
+    catalog: dict[str, Cube],
+    backend: Backend,
+    dialect: str,
+    strategy: BackendStrategy,
+    params: dict[str, Any],
+    bind: Callable[[Any, str], exp.Placeholder],
+    parse: Callable[[str], exp.Expression],
+    build_inner: Callable[[tuple[str, str]], exp.Select],
+    build_measure_expr: Callable[[Cube, Measure], exp.Expression],
+    resolve_in_ctx: Callable[[str], str],
+    having_alias: bool,
+    touched: list[Cube],
+    dim_fields: list[tuple[Cube, Dimension]],
+    measure_fields: list[tuple[Cube, Measure]],
+    dim_col_names: list[str],
+    measure_col_names: list[str],
+    time_dim: TimeDimension | None,
+    time_col_name: str | None,
+    has_time_breakdown: bool,
+) -> Compiled:
+    """Compose the single-SELECT (non-compare) output.
+
+    Builds the inner aggregating SELECT via ``build_inner``, applies
+    ``HAVING`` against a measure alias map, optionally wraps in a
+    time-spine LEFT JOIN for ``fill_nulls_with``, then layers
+    ``ORDER BY`` / ``LIMIT`` / ``OFFSET`` / hoisted CTEs.
+    """
+    assert q.time_dimension is None or time_dim is not None
+    time_range_for_query: tuple[str, str] | None = (
+        q.time_dimension.range if q.time_dimension is not None else None
+    )
+    # If there's no time_dim, build_inner skips the time-window WHERE;
+    # the explicit tuple is only consulted when ``time_dim`` is set.
+    select_node = build_inner(time_range_for_query or ("", ""))
+
+    columns: list[str] = list(dim_col_names)
+    if has_time_breakdown and time_col_name is not None:
+        columns.append(time_col_name)
+    columns.extend(measure_col_names)
+
+    if not columns:
+        raise CompileError("Compiled query has no SELECT projections.")
+
+    # Map every measure ref (bare and qualified) to its agg expression so
+    # HAVING / ORDER BY can address them without re-resolving.
+    measure_alias_map: dict[str, exp.Expression] = {}
+    for (cube_owner, m), col_name in zip(measure_fields, measure_col_names, strict=True):
+        agg_node = build_measure_expr(cube_owner, m)
+        measure_alias_map[m.name] = agg_node
+        if col_name != m.name:
+            measure_alias_map[col_name] = agg_node
+
+    # HAVING — bare or qualified measure reference.
+    for hf in q.having:
+        lookup_name = hf.dimension
+        if lookup_name not in measure_alias_map and "." in lookup_name:
+            lookup_name = lookup_name.rsplit(".", 1)[-1]
+        if lookup_name not in measure_alias_map:
+            raise CompileError(
+                f"HAVING references {hf.dimension!r}, which is not a measure in this query."
+            )
+        target_node: exp.Expression
+        if having_alias:
+            target_node = exp.column(lookup_name)
+        else:
+            target_node = measure_alias_map[lookup_name].copy()
+        select_node = select_node.having(_filter_node(hf, target_node, "number", strategy, bind))
+
+    # Time spine — wrap the aggregation in a CTE and LEFT JOIN a
+    # spine CTE so every bucket in [start, end) gets a row.
+    fill_value: int | None = (
+        q.time_dimension.fill_nulls_with if q.time_dimension is not None else None
+    )
+    if fill_value is not None:
+        if not has_time_breakdown:
+            raise CompileError(
+                "TimeWindow.fill_nulls_with requires a granularity on the "
+                "time_dimension — the spine has nothing to step over otherwise."
+            )
+        if not measure_fields:
+            raise CompileError(
+                "TimeWindow.fill_nulls_with has no effect without measures — "
+                "the COALESCE wraps a measure value, and a query with no "
+                "measures has nothing to fill."
+            )
+        if dim_fields:
+            raise CompileError(
+                "TimeWindow.fill_nulls_with does not yet support non-time "
+                "dimensions (Phase B: spine × dimension cartesian fill). "
+                "Drop the non-time dimensions or run the query without fill."
+            )
+        if q.ungrouped:
+            raise CompileError(
+                "TimeWindow.fill_nulls_with is incompatible with ungrouped=True — "
+                "spine fill aggregates by definition."
+            )
+        assert time_range_for_query is not None
+        assert time_col_name is not None
+        granularity_val = q.time_dimension.granularity if q.time_dimension is not None else None
+        assert granularity_val is not None
+        start_ph = bind(time_range_for_query[0], "time")
+        end_ph = bind(time_range_for_query[1], "time")
+        spine_inner = strategy.emit_time_spine(granularity_val, start_ph, end_ph, time_col_name)
+
+        outer = exp.Select()
+        outer = outer.with_("agg", select_node)
+        outer = outer.with_("spine", spine_inner)
+        outer = outer.select(exp.column(time_col_name, table="spine"))
+        for col_name in measure_col_names:
+            outer = outer.select(
+                exp.alias_(
+                    exp.Anonymous(
+                        this="COALESCE",
+                        expressions=[
+                            exp.column(col_name, table="agg"),
+                            exp.Literal.number(fill_value),
+                        ],
+                    ),
+                    col_name,
+                )
+            )
+        outer = outer.from_(exp.to_table("spine"))
+        outer = outer.join(
+            exp.to_table("agg"),
+            on=exp.EQ(
+                this=exp.column(time_col_name, table="spine"),
+                expression=exp.column(time_col_name, table="agg"),
+            ),
+            join_type="left",
+        )
+        select_node = outer
+
+    # ORDER BY.
+    for ref, direction in q.order:
+        if ref in measure_alias_map or ref in columns:
+            order_target: exp.Expression = exp.column(ref)
+        else:
+            try:
+                _, fld = _resolve_field(ref, catalog)
+            except CompileError as exc:
+                raise CompileError(
+                    f"ORDER BY {ref!r}: must reference an output column or "
+                    f"a known cube.field. ({exc})"
+                ) from exc
+            order_target = parse(fld.sql)
+        select_node = select_node.order_by(
+            exp.Ordered(this=order_target, desc=(direction == "desc"))
+        )
+
+    if q.limit is not None:
+        select_node = select_node.limit(int(q.limit))
+    if q.offset is not None and q.offset > 0:
+        select_node = select_node.offset(int(q.offset))
+
+    select_node = _apply_with_clause(
+        select_node, _collect_hoisted_ctes(touched, resolve_in_ctx), backend
+    )
+    sql = select_node.sql(dialect=dialect, pretty=False, normalize_functions=False)
+    cm = _build_column_meta(
+        columns,
+        dim_fields,
+        dim_col_names,
+        measure_fields,
+        measure_col_names,
+        time_dim,
+        time_col_name,
+        is_compare=False,
+    )
+    return Compiled(
+        backend=backend,
+        sql=sql,
+        params=params,
+        columns=columns,
+        column_meta=cm,
+        touched_cube_names=[c.name for c in touched],
+        derived_sources=_collect_derived_sources(touched, resolve_in_ctx),
+    )
+
+
 def _build_join_graph(
     touched: list[Cube],
     catalog: dict[str, Cube],
@@ -1148,324 +1520,45 @@ def compile_query(
 
         return sel
 
-    # 6. Compare branch — build two CTEs and an outer SELECT.
     if q.compare is not None:
-        assert q.time_dimension is not None
-        current_range = q.time_dimension.range
-        if q.compare.mode == "previous_period":
-            cs = datetime.fromisoformat(current_range[0])
-            ce = datetime.fromisoformat(current_range[1])
-            duration = ce - cs
-            prior_range: tuple[str, str] = ((cs - duration).isoformat(), cs.isoformat())
-        else:
-            assert q.compare.range is not None
-            prior_range = q.compare.range
-
-        current_inner = build_inner(current_range)
-        prior_inner = build_inner(prior_range)
-
-        outer = exp.Select()
-        outer = outer.with_("current", current_inner)
-        outer = outer.with_("prior", prior_inner)
-
-        # Outer column construction: COALESCE'd dims (then time bucket),
-        # then per-measure current/prior/delta/pct_change.
-        outer_columns: list[str] = []
-        for col_name in dim_col_names:
-            outer = outer.select(
-                exp.alias_(
-                    exp.Anonymous(
-                        this="COALESCE",
-                        expressions=[
-                            exp.column(col_name, table="current"),
-                            exp.column(col_name, table="prior"),
-                        ],
-                    ),
-                    col_name,
-                )
-            )
-            outer_columns.append(col_name)
-        if has_time_breakdown:
-            assert time_col_name is not None
-            outer = outer.select(
-                exp.alias_(
-                    exp.Anonymous(
-                        this="COALESCE",
-                        expressions=[
-                            exp.column(time_col_name, table="current"),
-                            exp.column(time_col_name, table="prior"),
-                        ],
-                    ),
-                    time_col_name,
-                )
-            )
-            outer_columns.append(time_col_name)
-
-        for col_name in measure_col_names:
-            cur_ref = exp.column(col_name, table="current")
-            pri_ref = exp.column(col_name, table="prior")
-            cur_col = f"{col_name}_current"
-            pri_col = f"{col_name}_prior"
-            delta_col = f"{col_name}_delta"
-            pct_col = f"{col_name}_pct_change"
-
-            outer = outer.select(exp.alias_(cur_ref.copy(), cur_col))
-            outer = outer.select(exp.alias_(pri_ref.copy(), pri_col))
-
-            # delta: COALESCE both to 0 so the diff is meaningful when
-            # one period is missing the entity.
-            coalesced_cur = exp.Anonymous(
-                this="COALESCE", expressions=[cur_ref.copy(), exp.Literal.number(0)]
-            )
-            coalesced_pri = exp.Anonymous(
-                this="COALESCE", expressions=[pri_ref.copy(), exp.Literal.number(0)]
-            )
-            outer = outer.select(
-                exp.alias_(
-                    exp.Sub(this=coalesced_cur, expression=coalesced_pri),
-                    delta_col,
-                )
-            )
-
-            # pct_change: divide-by-zero guard. CASE WHEN prior > 0 THEN
-            # (current - prior) * 100.0 / prior ELSE NULL END.
-            # ``exp.Paren`` around the Sub is load-bearing — sqlglot's
-            # renderer doesn't infer precedence for binary ops, so
-            # ``Mul(Sub(a, b), 100)`` would render as ``a - b * 100``
-            # (parsed as ``a - (b*100)``) without the explicit paren.
-            pct_expr = exp.Case(
-                ifs=[
-                    exp.If(
-                        this=exp.GT(this=pri_ref.copy(), expression=exp.Literal.number(0)),
-                        true=exp.Div(
-                            this=exp.Mul(
-                                this=exp.Paren(
-                                    this=exp.Sub(
-                                        this=cur_ref.copy(),
-                                        expression=pri_ref.copy(),
-                                    )
-                                ),
-                                expression=exp.Literal.number(100.0),
-                            ),
-                            expression=pri_ref.copy(),
-                        ),
-                    )
-                ],
-                default=exp.Null(),
-            )
-            outer = outer.select(exp.alias_(pct_expr, pct_col))
-
-            outer_columns.extend([cur_col, pri_col, delta_col, pct_col])
-
-        outer = outer.from_(exp.to_table("current"))
-        join_dims = dim_col_names + ([time_col_name] if time_col_name else [])
-        if join_dims:
-            on_expr: exp.Expression | None = None
-            for jd in join_dims:
-                eq = exp.EQ(
-                    this=exp.column(jd, table="current"),
-                    expression=exp.column(jd, table="prior"),
-                )
-                on_expr = eq if on_expr is None else exp.And(this=on_expr, expression=eq)
-            outer = outer.join(exp.to_table("prior"), on=on_expr, join_type="full outer")
-        else:
-            # No dims, no time bucket — cross product of single rows.
-            outer = outer.join(
-                exp.to_table("prior"),
-                on=exp.Boolean(this=True),
-                join_type="full outer",
-            )
-
-        for ref, direction in q.order:
-            if ref in outer_columns:
-                order_target_node: exp.Expression = exp.column(ref)
-            else:
-                raise CompileError(
-                    f"ORDER BY {ref!r}: in compare mode, only the outer "
-                    f"output column names are addressable "
-                    f"(e.g. {measure_col_names[0]}_delta). Got {ref!r}."
-                )
-            outer = outer.order_by(exp.Ordered(this=order_target_node, desc=(direction == "desc")))
-
-        if q.limit is not None:
-            outer = outer.limit(int(q.limit))
-        if q.offset is not None and q.offset > 0:
-            outer = outer.offset(int(q.offset))
-
-        outer = _apply_with_clause(outer, _collect_hoisted_ctes(touched, resolve_in_ctx), backend)
-        sql = outer.sql(dialect=dialect, pretty=False, normalize_functions=False)
-        cm = _build_column_meta(
-            outer_columns,
-            dim_fields,
-            dim_col_names,
-            measure_fields,
-            measure_col_names,
-            time_dim,
-            time_col_name,
-            is_compare=True,
-        )
-        return Compiled(
+        return _emit_compare_query(
+            q,
             backend=backend,
-            sql=sql,
+            dialect=dialect,
             params=params,
-            columns=outer_columns,
-            column_meta=cm,
-            touched_cube_names=[c.name for c in touched],
-            derived_sources=_collect_derived_sources(touched, resolve_in_ctx),
+            build_inner=build_inner,
+            resolve_in_ctx=resolve_in_ctx,
+            touched=touched,
+            dim_fields=dim_fields,
+            measure_fields=measure_fields,
+            dim_col_names=dim_col_names,
+            measure_col_names=measure_col_names,
+            time_dim=time_dim,
+            time_col_name=time_col_name,
+            has_time_breakdown=has_time_breakdown,
         )
 
-    # 7. Non-compare path — single inner Select with order/having/limit
-    # applied directly.
-    assert q.time_dimension is None or time_dim is not None
-    time_range_for_query: tuple[str, str] | None = (
-        q.time_dimension.range if q.time_dimension is not None else None
-    )
-    # If there's no time_dim, build_inner skips the time-window WHERE; the
-    # explicit tuple is only consulted when ``time_dim`` is set.
-    select_node = build_inner(time_range_for_query or ("", ""))
-
-    # Re-derive output columns + measure alias map for HAVING / ORDER BY.
-    columns: list[str] = list(dim_col_names)
-    if has_time_breakdown and time_col_name is not None:
-        columns.append(time_col_name)
-    columns.extend(measure_col_names)
-
-    if not columns:
-        raise CompileError("Compiled query has no SELECT projections.")
-
-    measure_alias_map: dict[str, exp.Expression] = {}
-    for (cube_owner, m), col_name in zip(measure_fields, measure_col_names, strict=True):
-        agg_node = build_measure_expr(cube_owner, m)
-        measure_alias_map[m.name] = agg_node
-        if col_name != m.name:
-            measure_alias_map[col_name] = agg_node
-
-    # 8. HAVING — bare or qualified measure reference.
-    for hf in q.having:
-        lookup_name = hf.dimension
-        if lookup_name not in measure_alias_map and "." in lookup_name:
-            lookup_name = lookup_name.rsplit(".", 1)[-1]
-        if lookup_name not in measure_alias_map:
-            raise CompileError(
-                f"HAVING references {hf.dimension!r}, which is not a measure in this query."
-            )
-        target_node: exp.Expression
-        if having_alias:
-            target_node = exp.column(lookup_name)
-        else:
-            target_node = measure_alias_map[lookup_name].copy()
-        select_node = select_node.having(_filter_node(hf, target_node, "number", strategy, bind))
-
-    # 8b. Time spine — wrap the aggregation in a CTE and LEFT JOIN a
-    # spine CTE so every bucket in [start, end) gets a row. Measure
-    # values fall back to ``fill_nulls_with`` via COALESCE.
-    fill_value: int | None = (
-        q.time_dimension.fill_nulls_with if q.time_dimension is not None else None
-    )
-    if fill_value is not None:
-        if not has_time_breakdown:
-            raise CompileError(
-                "TimeWindow.fill_nulls_with requires a granularity on the "
-                "time_dimension — the spine has nothing to step over otherwise."
-            )
-        if not measure_fields:
-            raise CompileError(
-                "TimeWindow.fill_nulls_with has no effect without measures — "
-                "the COALESCE wraps a measure value, and a query with no "
-                "measures has nothing to fill."
-            )
-        if dim_fields:
-            raise CompileError(
-                "TimeWindow.fill_nulls_with does not yet support non-time "
-                "dimensions (Phase B: spine × dimension cartesian fill). "
-                "Drop the non-time dimensions or run the query without fill."
-            )
-        if q.ungrouped:
-            raise CompileError(
-                "TimeWindow.fill_nulls_with is incompatible with ungrouped=True — "
-                "spine fill aggregates by definition."
-            )
-        assert time_range_for_query is not None
-        assert time_col_name is not None
-        granularity_val = q.time_dimension.granularity if q.time_dimension is not None else None
-        assert granularity_val is not None
-        start_ph = bind(time_range_for_query[0], "time")
-        end_ph = bind(time_range_for_query[1], "time")
-        spine_inner = strategy.emit_time_spine(granularity_val, start_ph, end_ph, time_col_name)
-
-        outer = exp.Select()
-        outer = outer.with_("agg", select_node)
-        outer = outer.with_("spine", spine_inner)
-        outer = outer.select(exp.column(time_col_name, table="spine"))
-        for col_name in measure_col_names:
-            outer = outer.select(
-                exp.alias_(
-                    exp.Anonymous(
-                        this="COALESCE",
-                        expressions=[
-                            exp.column(col_name, table="agg"),
-                            exp.Literal.number(fill_value),
-                        ],
-                    ),
-                    col_name,
-                )
-            )
-        outer = outer.from_(exp.to_table("spine"))
-        outer = outer.join(
-            exp.to_table("agg"),
-            on=exp.EQ(
-                this=exp.column(time_col_name, table="spine"),
-                expression=exp.column(time_col_name, table="agg"),
-            ),
-            join_type="left",
-        )
-        select_node = outer
-
-    # 9. ORDER BY.
-    for ref, direction in q.order:
-        if ref in measure_alias_map or ref in columns:
-            order_target: exp.Expression = exp.column(ref)
-        else:
-            try:
-                _, fld = _resolve_field(ref, catalog)
-            except CompileError as exc:
-                raise CompileError(
-                    f"ORDER BY {ref!r}: must reference an output column or "
-                    f"a known cube.field. ({exc})"
-                ) from exc
-            order_target = parse(fld.sql)
-        select_node = select_node.order_by(
-            exp.Ordered(this=order_target, desc=(direction == "desc"))
-        )
-
-    # 10. LIMIT / OFFSET.
-    if q.limit is not None:
-        select_node = select_node.limit(int(q.limit))
-    if q.offset is not None and q.offset > 0:
-        select_node = select_node.offset(int(q.offset))
-
-    select_node = _apply_with_clause(
-        select_node, _collect_hoisted_ctes(touched, resolve_in_ctx), backend
-    )
-    sql = select_node.sql(dialect=dialect, pretty=False, normalize_functions=False)
-    cm = _build_column_meta(
-        columns,
-        dim_fields,
-        dim_col_names,
-        measure_fields,
-        measure_col_names,
-        time_dim,
-        time_col_name,
-        is_compare=False,
-    )
-    return Compiled(
+    return _emit_simple_query(
+        q,
+        catalog=catalog,
         backend=backend,
-        sql=sql,
+        dialect=dialect,
+        strategy=strategy,
         params=params,
-        columns=columns,
-        column_meta=cm,
-        touched_cube_names=[c.name for c in touched],
-        derived_sources=_collect_derived_sources(touched, resolve_in_ctx),
+        bind=bind,
+        parse=parse,
+        build_inner=build_inner,
+        build_measure_expr=build_measure_expr,
+        resolve_in_ctx=resolve_in_ctx,
+        having_alias=having_alias,
+        touched=touched,
+        dim_fields=dim_fields,
+        measure_fields=measure_fields,
+        dim_col_names=dim_col_names,
+        measure_col_names=measure_col_names,
+        time_dim=time_dim,
+        time_col_name=time_col_name,
+        has_time_breakdown=has_time_breakdown,
     )
 
 
