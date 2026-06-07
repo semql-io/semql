@@ -18,7 +18,8 @@ step, so isolation is preserved.
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+import asyncio
+from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass
 from typing import Any
 
@@ -27,7 +28,7 @@ from semql.compile import ColumnMeta
 from semql.federate import FederatedPlan
 from semql.model import Backend
 
-from semql_engine.adapter import Adapter
+from semql_engine.adapter import Adapter, AdapterResult, AsyncAdapter
 
 
 class EngineError(RuntimeError):
@@ -209,4 +210,132 @@ def _quote(name: str) -> str:
     return f'"{name}"'
 
 
-__all__ = ["Engine", "EngineError", "ExecutionResult"]
+class AsyncEngine:
+    """Async counterpart to :class:`Engine`.
+
+    Runs federated plans by awaiting per-fragment adapters in parallel
+    via :func:`asyncio.gather`, then merging the results in DuckDB.
+    Fragments of a single ``FederatedPlan`` are always independent
+    (they're per-backend sub-queries; the join lives in the merge SQL),
+    so the parallelism is safe for any plan the federation layer
+    produces.
+
+    :meth:`iter_run` adds chunked streaming: the merge cursor's rows
+    are fetched in batches of ``chunk_rows`` so a result set with
+    millions of rows doesn't have to land in memory all at once. The
+    merge itself still runs in DuckDB; that's the right shape for >1
+    fragment because DuckDB owns the join. (A single-fragment streaming
+    fast path that skips DuckDB entirely is documented as a follow-up
+    in the gap-analysis proposal.)
+    """
+
+    def __init__(self, duckdb_connection: Any | None = None) -> None:  # noqa: ANN401
+        self._con: Any = duckdb_connection or duckdb.connect(":memory:")
+        self._adapters: dict[Backend, AsyncAdapter] = {}
+
+    def register(self, backend: Backend, adapter: AsyncAdapter) -> None:
+        """Bind an async adapter to a backend. Replacing an existing
+        registration is allowed."""
+        self._adapters[backend] = adapter
+
+    async def run(self, plan: FederatedPlan) -> ExecutionResult:
+        """Execute a :class:`FederatedPlan` end-to-end on an event loop.
+
+        Fragments are launched concurrently via :func:`asyncio.gather`;
+        a single slow adapter doesn't block the others. Once every
+        fragment has returned, results are materialised into DuckDB and
+        the merge SQL runs to produce the final shape.
+
+        Raises :class:`EngineError` for missing adapters or column
+        mismatches.
+        """
+        self._adapters_present(plan)
+        self._reset_frag_tables(len(plan.fragments))
+
+        results = await asyncio.gather(
+            *(
+                self._adapters[frag.backend].execute(frag.sql, frag.params)
+                for frag in plan.fragments
+            )
+        )
+
+        for i, (fragment, result) in enumerate(zip(plan.fragments, results, strict=True)):
+            self._load_result(i, fragment, result)
+
+        merge_cursor = self._con.execute(plan.merge.sql, dict(plan.merge.params))
+        rows = merge_cursor.fetchall()
+        return ExecutionResult(
+            columns=plan.columns,
+            column_meta=plan.column_meta,
+            rows=rows,
+        )
+
+    async def iter_run(
+        self,
+        plan: FederatedPlan,
+        *,
+        chunk_rows: int = 10_000,
+    ) -> AsyncIterator[list[tuple[Any, ...]]]:
+        """Run ``plan`` and yield merge-cursor rows in chunks of
+        ``chunk_rows``.
+
+        Fragments still materialise into DuckDB up front — the merge
+        join needs them resident — but the final cursor is pulled
+        lazily via ``fetchmany``, so a 10M-row merge doesn't have to
+        land in Python memory all at once.
+
+        Yields a list of row tuples per iteration; an empty list is not
+        emitted (the iterator terminates instead).
+        """
+        if chunk_rows <= 0:
+            raise EngineError(f"iter_run: chunk_rows must be positive, got {chunk_rows!r}.")
+        self._adapters_present(plan)
+        self._reset_frag_tables(len(plan.fragments))
+
+        results = await asyncio.gather(
+            *(
+                self._adapters[frag.backend].execute(frag.sql, frag.params)
+                for frag in plan.fragments
+            )
+        )
+        for i, (fragment, result) in enumerate(zip(plan.fragments, results, strict=True)):
+            self._load_result(i, fragment, result)
+
+        cursor = self._con.execute(plan.merge.sql, dict(plan.merge.params))
+        while True:
+            chunk = await asyncio.to_thread(cursor.fetchmany, chunk_rows)
+            if not chunk:
+                return
+            yield [tuple(row) for row in chunk]
+
+    # ------------------------------------------------------------------
+    # Internals
+    # ------------------------------------------------------------------
+
+    def _adapters_present(self, plan: FederatedPlan) -> None:
+        for frag in plan.fragments:
+            if frag.backend not in self._adapters:
+                raise EngineError(
+                    f"No adapter registered for backend "
+                    f"{frag.backend.value!r}. Call AsyncEngine.register("
+                    f"Backend.{frag.backend.name}, your_adapter) before "
+                    f"running this plan."
+                )
+
+    def _load_result(self, index: int, fragment: Any, result: AdapterResult) -> None:  # noqa: ANN401
+        if set(result.columns) != set(fragment.columns):
+            raise EngineError(
+                f"Fragment {index} (backend {fragment.backend.value!r}) "
+                f"adapter returned columns {result.columns!r} but the "
+                f"fragment declares {fragment.columns!r}. Adapter "
+                f"must preserve the SELECT-list aliases."
+            )
+        materialised: list[tuple[Any, ...]] = [tuple(r) for r in result.rows]
+        # Reuse Engine's loader; signature matches.
+        Engine._load_fragment(self, index, result.columns, materialised)  # type: ignore[arg-type]
+
+    def _reset_frag_tables(self, n: int) -> None:
+        Engine._reset_frag_tables(self, n)  # type: ignore[arg-type]
+
+
+__all__ = ["AsyncEngine", "Engine", "EngineError", "ExecutionResult"]

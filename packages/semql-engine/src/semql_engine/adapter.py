@@ -1,4 +1,4 @@
-"""Adapter protocol for the in-process executor.
+"""Adapter protocols for the in-process executor.
 
 An ``Adapter`` is the glue between a backend's connection and the
 semql executor. Given a ``(sql, params)`` pair, an adapter runs the
@@ -6,16 +6,22 @@ SQL on its backend and yields the result as an :class:`AdapterResult`
 — a typed pair of ``columns: list[str]`` and ``rows: Iterable[Sequence
 [Any]]`` (positional, matching ``columns`` order).
 
-We keep the protocol tiny on purpose. Most backends already speak
-PEP-249 (cursors with ``description`` + ``fetchall``); :class:`DBAPIAdapter`
-wraps them. DuckDB is special-cased only because the executor runs the
-merge step in DuckDB itself; :class:`DuckDBAdapter` reuses an existing
-connection so adapters and the merge engine can share temp tables when
-the user wants.
+Two parallel protocols ship:
+
+- :class:`Adapter` — sync ``execute``. Wired up to :class:`semql_engine.Engine`.
+- :class:`AsyncAdapter` — same shape, ``async def execute``. Wired up
+  to :class:`semql_engine.AsyncEngine`. Production deployments running
+  on asyncio (FastAPI / Litestar / aiohttp) avoid the per-call
+  ``asyncio.to_thread`` boilerplate.
+
+:func:`to_async_adapter` wraps any sync ``Adapter`` so it satisfies the
+async protocol — useful when only a sync driver is available and the
+caller is otherwise async-first.
 """
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
@@ -105,4 +111,70 @@ class DuckDBAdapter:
         return AdapterResult(columns=columns, rows=rows)
 
 
-__all__ = ["Adapter", "AdapterResult", "DBAPIAdapter", "DuckDBAdapter"]
+class AsyncAdapter(Protocol):
+    """Async counterpart of :class:`Adapter`.
+
+    ``execute`` is an awaitable that returns the same
+    :class:`AdapterResult` shape. Implementations should be safe to
+    call concurrently — :class:`semql_engine.AsyncEngine` runs all the
+    fragments of a federated plan in parallel via ``asyncio.gather``.
+    """
+
+    async def execute(
+        self,
+        sql: str,
+        params: Mapping[str, Any],
+    ) -> AdapterResult: ...
+
+
+class _SyncAsAsyncAdapter:
+    """Internal wrapper produced by :func:`to_async_adapter`."""
+
+    def __init__(self, inner: Adapter) -> None:
+        self._inner = inner
+
+    async def execute(self, sql: str, params: Mapping[str, Any]) -> AdapterResult:
+        # ``asyncio.to_thread`` releases the event loop so other
+        # fragments registered on the AsyncEngine can run in parallel
+        # even when this adapter is pure-Python sync.
+        return await asyncio.to_thread(self._inner.execute, sql, params)
+
+
+def to_async_adapter(adapter: Adapter) -> AsyncAdapter:
+    """Wrap a sync :class:`Adapter` so it satisfies :class:`AsyncAdapter`.
+
+    The wrapped adapter dispatches each ``execute`` to a worker thread
+    via ``asyncio.to_thread`` — fragments scheduled on
+    :class:`semql_engine.AsyncEngine` still run concurrently because
+    the event loop is freed up while the thread blocks on I/O. Prefer a
+    native async adapter when the underlying driver supports one; the
+    bridge is the right answer for drivers that only ship sync APIs.
+    """
+    return _SyncAsAsyncAdapter(adapter)
+
+
+class AsyncDuckDBAdapter:
+    """Async DuckDB adapter — wraps an existing ``duckdb.DuckDBPyConnection``.
+
+    DuckDB has no native async API; this adapter dispatches each
+    ``execute`` to a worker thread via ``asyncio.to_thread``. Useful
+    for single-fragment async plans, in-memory test fixtures, and for
+    keeping async-first user code from inheriting a sync ``Engine``.
+    """
+
+    def __init__(self, connection: Any) -> None:  # noqa: ANN401 — duckdb conn
+        self._inner = DuckDBAdapter(connection)
+
+    async def execute(self, sql: str, params: Mapping[str, Any]) -> AdapterResult:
+        return await asyncio.to_thread(self._inner.execute, sql, params)
+
+
+__all__ = [
+    "Adapter",
+    "AdapterResult",
+    "AsyncAdapter",
+    "AsyncDuckDBAdapter",
+    "DBAPIAdapter",
+    "DuckDBAdapter",
+    "to_async_adapter",
+]
