@@ -183,6 +183,12 @@ def _agg_node(m: Measure, expr_node: exp.Expression) -> exp.Expression:
         return exp.Min(this=expr_node)
     if agg == "max":
         return exp.Max(this=expr_node)
+    if agg == "ratio":
+        # Ratio measures are composed in build_inner — _agg_node isn't
+        # the right seam (it sees one expression, ratios need two).
+        raise CompileError(  # pragma: no cover — caller routes around this.
+            f"Measure {m.name!r}: ratio aggregation is computed in build_inner, not _agg_node."
+        )
     raise CompileError(f"Unsupported aggregate: {agg!r}")  # pragma: no cover
 
 
@@ -584,6 +590,72 @@ def compile_query(
         assert granularity is not None
         time_col_name = f"{time_dim.name}_{granularity}"
 
+    def build_measure_expr(cube_owner: Cube, m: Measure) -> exp.Expression:
+        """Compose the SELECT expression for one measure.
+
+        Routes ratio measures to a recursive division over their
+        numerator / denominator (resolved by name on the same cube);
+        everything else flows through ``_agg_node`` with an optional
+        ``FILTER (WHERE ...)`` wrapper for filtered measures.
+
+        Lifted outside ``build_inner`` so the HAVING / ORDER-BY alias
+        map below can reuse the same composition path."""
+        if m.agg == "ratio":
+            assert m.numerator is not None and m.denominator is not None
+            num_m = next(
+                (x for x in cube_owner.measures if x.name == m.numerator),
+                None,
+            )
+            if num_m is None:
+                raise CompileError(
+                    f"Measure {cube_owner.name}.{m.name}: ratio numerator "
+                    f"{m.numerator!r} is not a measure on cube {cube_owner.name!r}."
+                )
+            den_m = next(
+                (x for x in cube_owner.measures if x.name == m.denominator),
+                None,
+            )
+            if den_m is None:
+                raise CompileError(
+                    f"Measure {cube_owner.name}.{m.name}: ratio denominator "
+                    f"{m.denominator!r} is not a measure on cube {cube_owner.name!r}."
+                )
+            if num_m.agg == "ratio" or den_m.agg == "ratio":
+                raise CompileError(
+                    f"Measure {cube_owner.name}.{m.name}: ratio measures "
+                    "cannot reference another ratio measure. Use leaf "
+                    "(sum / count / avg / ...) measures as numerator "
+                    "and denominator."
+                )
+            num_node = build_measure_expr(cube_owner, num_m)
+            den_node = build_measure_expr(cube_owner, den_m)
+            # Div(num, NULLIF(den, 0)) — NULLIF returns NULL on zero
+            # denominator, propagating to a NULL result rather than
+            # raising. Matches the pct_change convention in the
+            # compare path.
+            return exp.Div(
+                this=num_node,
+                expression=exp.Anonymous(
+                    this="NULLIF",
+                    expressions=[den_node, exp.Literal.number(0)],
+                ),
+            )
+
+        if m.sql == "*":
+            inner: exp.Expression = exp.Star()
+        else:
+            inner = parse(m.sql)
+        agg = _agg_node(m, inner)
+        if m.filter:
+            # ``COUNT(*) FILTER (WHERE <pred>)`` — sqlglot renders
+            # natively on PG / CH / DuckDB / BigQuery and transpiles
+            # to ``COUNT(IFF(...))`` on Snowflake.
+            agg = exp.Filter(
+                this=agg,
+                expression=exp.Where(this=parse(m.filter)),
+            )
+        return agg
+
     def build_inner(time_range: tuple[str, str]) -> exp.Select:
         """Build the inner Select used as a query body or compare CTE.
 
@@ -610,21 +682,8 @@ def compile_query(
             trunc_node = strategy.trunc(granularity, parse(time_dim.sql))
             sel = sel.select(exp.alias_(trunc_node, time_col_name))
 
-        for (_cube, m), col_name in zip(measure_fields, measure_col_names, strict=True):
-            if m.sql == "*":
-                inner_expr: exp.Expression = exp.Star()
-            else:
-                inner_expr = parse(m.sql)
-            agg_expr = _agg_node(m, inner_expr)
-            if m.filter:
-                # ``COUNT(*) FILTER (WHERE <pred>)`` — sqlglot renders
-                # natively on PG / CH / DuckDB / BigQuery and transpiles
-                # to ``COUNT(IFF(...))`` on Snowflake.
-                agg_expr = exp.Filter(
-                    this=agg_expr,
-                    expression=exp.Where(this=parse(m.filter)),
-                )
-            sel = sel.select(exp.alias_(agg_expr, col_name))
+        for (cube_owner, m), col_name in zip(measure_fields, measure_col_names, strict=True):
+            sel = sel.select(exp.alias_(build_measure_expr(cube_owner, m), col_name))
 
         if not q.ungrouped and not measure_fields:
             sel.set("distinct", exp.Distinct())
@@ -863,12 +922,8 @@ def compile_query(
         raise CompileError("Compiled query has no SELECT projections.")
 
     measure_alias_map: dict[str, exp.Expression] = {}
-    for (_cube, m), col_name in zip(measure_fields, measure_col_names, strict=True):
-        if m.sql == "*":
-            inner_expr2: exp.Expression = exp.Star()
-        else:
-            inner_expr2 = parse(m.sql)
-        agg_node = _agg_node(m, inner_expr2)
+    for (cube_owner, m), col_name in zip(measure_fields, measure_col_names, strict=True):
+        agg_node = build_measure_expr(cube_owner, m)
         measure_alias_map[m.name] = agg_node
         if col_name != m.name:
             measure_alias_map[col_name] = agg_node

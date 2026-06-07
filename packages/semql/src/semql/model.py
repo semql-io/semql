@@ -37,7 +37,7 @@ class Backend(StrEnum):
     META = "meta"  # reflection over the catalogue itself; see introspect.py
 
 
-AggLiteral = Literal["sum", "count", "count_distinct", "avg", "min", "max"]
+AggLiteral = Literal["sum", "count", "count_distinct", "avg", "min", "max", "ratio"]
 DimTypeLiteral = Literal["string", "number", "time", "bool", "uuid"]
 GranularityLiteral = Literal["hour", "day", "week", "month"]
 FormatLiteral = Literal["raw", "integer", "percent", "currency", "duration"]
@@ -102,6 +102,31 @@ class Measure(BaseField):
     # DuckDB / BigQuery and transpiles to ``COUNT(IFF(...))`` on
     # Snowflake.
     filter: str | None = None
+    # For ``agg='ratio'`` only: the names of two other measures on the
+    # *same cube* whose aggregates compose the ratio. The compiler emits
+    # ``<num_agg> / NULLIF(<den_agg>, 0)``; the ``sql`` field is ignored
+    # for ratio measures (set it to ``""`` by convention). Composes with
+    # filtered measures — a filtered ratio is just a ratio of two
+    # filtered sums.
+    numerator: str | None = None
+    denominator: str | None = None
+
+    @model_validator(mode="after")
+    def _check_ratio_consistency(self) -> Measure:
+        if self.agg == "ratio":
+            if not self.numerator or not self.denominator:
+                raise ValueError(
+                    f"Measure {self.name!r}: agg='ratio' requires both "
+                    "numerator and denominator (names of other measures "
+                    "on the same cube)."
+                )
+        else:
+            if self.numerator is not None or self.denominator is not None:
+                raise ValueError(
+                    f"Measure {self.name!r}: numerator/denominator are "
+                    f"only valid for agg='ratio'; got agg={self.agg!r}."
+                )
+        return self
 
 
 class Dimension(BaseField):
