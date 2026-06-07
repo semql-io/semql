@@ -31,6 +31,7 @@ from collections.abc import Callable
 from typing import Any, Protocol, runtime_checkable
 
 import sqlglot
+from sqlglot import TokenType as _TT
 from sqlglot import exp
 
 from semql.dialect import dialect_for, placeholder_for
@@ -90,10 +91,25 @@ _CH_TRUNC: dict[str, str] = {
 }
 
 
+def _ident(name: str) -> exp.Identifier:
+    """Return an Identifier for ``name``, quoted if the dialect tokenizer
+    would treat it as a keyword (e.g. USING, SELECT, TABLE)."""
+    toks = sqlglot.tokenize(name, dialect="postgres")
+    needs_quote = not toks or toks[0].token_type not in (_TT.VAR, _TT.IDENTIFIER)
+    return exp.to_identifier(name, quoted=needs_quote)
+
+
 def _aliased_table(cube: Cube, resolve_sql: SqlResolver) -> exp.Table:
     """Build a ``Table`` AST node for ``cube`` with its alias attached."""
     resolved = resolve_sql(cube.table)
-    tbl = exp.to_table(resolved, dialect="postgres")
+    # Build the Table node manually rather than via exp.to_table() so that
+    # reserved-word table names (e.g. ``using``) are properly quoted instead
+    # of being emitted as bare keywords.
+    parts = resolved.split(".", 1)
+    if len(parts) == 2:
+        tbl = exp.Table(this=_ident(parts[1]), db=_ident(parts[0]))
+    else:
+        tbl = exp.Table(this=_ident(parts[0]))
     tbl.set("alias", exp.TableAlias(this=exp.to_identifier(cube.alias)))
     return tbl
 

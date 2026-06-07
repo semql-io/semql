@@ -159,6 +159,21 @@ def test_postgres_emit_source_threads_resolver_over_table_name() -> None:
     assert out == "prod.orders AS o"
 
 
+def test_postgres_emit_source_quotes_reserved_word_table_name() -> None:
+    """Table names that are SQL reserved words (e.g. ``using``) must be
+    double-quoted so the generated SQL parses as a valid SELECT."""
+    cube = Cube(
+        name="evt",
+        backend=Backend.POSTGRES,
+        table="using",
+        alias="u",
+        measures=[Measure(name="count", sql="*", agg="count", unit="count")],
+        dimensions=[],
+    )
+    out = render(PostgresStrategy().emit_source(cube, {"evt": cube}, lambda x: x), Backend.POSTGRES)
+    assert out == '"using" AS u'
+
+
 def test_meta_emit_source_materialises_values_literal() -> None:
     """META cubes don't have a backing table; their source is a VALUES
     subquery the strategy builds from the catalog snapshot."""
