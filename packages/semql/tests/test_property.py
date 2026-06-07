@@ -9,10 +9,11 @@ The invariants under test:
 3. ``validate`` agrees with ``compile_query``: when validate returns
    an empty list, compile_query succeeds; when it returns errors,
    compile_query raises something.
+4. Any valid query generated against a random catalog compiles and
+   produces a safe SELECT (random-catalog coverage via strategies.py).
 
-We use a fixed test catalogue and generate query shapes against it.
-Generating random catalogues is a follow-up (would need to invent
-backends, joins, and field SQL that always parses).
+The fixed-catalog tests (1–3) exercise specific query shapes.
+The random-catalog tests (4) exercise arbitrary cube structures.
 """
 
 from __future__ import annotations
@@ -200,3 +201,31 @@ def test_property_validate_agrees_with_compile_on_success(query: SemanticQuery) 
             pass
         else:  # pragma: no cover — surfaces the disagreement if it ever happens
             raise AssertionError(f"validate reported errors but compile succeeded: {errors}")
+
+
+# ---------------------------------------------------------------------------
+# Property 4: random-catalog coverage.
+# ---------------------------------------------------------------------------
+# SQL uses {alias}.{field_name} everywhere so it always parses; no joins or
+# time-dimensions (kept simple so the strategy stays self-contained).
+
+
+from .strategies import catalog_and_query  # noqa: E402
+
+
+@given(pair=catalog_and_query())
+@settings(suppress_health_check=[HealthCheck.too_slow], deadline=None, max_examples=200)
+def test_property_random_catalog_compiles(pair: tuple[Catalog, SemanticQuery]) -> None:
+    catalog, query = pair
+    out = catalog.compile(query)
+    assert is_safe_select(out.sql), f"unsafe SQL from random catalog:\n{out.sql}"
+
+
+@given(pair=catalog_and_query())
+@settings(suppress_health_check=[HealthCheck.too_slow], deadline=None, max_examples=100)
+def test_property_random_catalog_deterministic(pair: tuple[Catalog, SemanticQuery]) -> None:
+    catalog, query = pair
+    a = catalog.compile(query)
+    b = catalog.compile(query)
+    assert a.sql == b.sql
+    assert a.params == b.params
