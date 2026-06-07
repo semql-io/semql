@@ -66,6 +66,7 @@ from semql.model import (
     AuthContext,
     Backend,
     Cube,
+    DerivedTable,
     Dimension,
     FormatLiteral,
     Join,
@@ -120,6 +121,31 @@ class Compiled:
     # Lets downstream tools (visualiser, MCP envelope) avoid re-running
     # the resolver against the catalogue for cube-level facts.
     touched_cube_names: list[str] = dc_field(default_factory=lambda: [])
+    # Resolved SQL of every ``DerivedTable`` source the query touched,
+    # in first-mention order matching ``touched_cube_names``. Surfaces
+    # the *second* place raw SQL legitimately enters the catalogue
+    # (the first is the outer ``sql``) so callers running
+    # :func:`semql.safe.is_safe_select` or dialect snapshots see every
+    # raw fragment, not just the compiler-generated SELECT. Plain-table
+    # cubes contribute nothing here.
+    derived_sources: list[str] = dc_field(default_factory=lambda: [])
+
+
+def _collect_derived_sources(
+    touched: list[Cube],
+    resolve_sql: Callable[[str], str],
+) -> list[str]:
+    """Materialize the resolved SQL of every ``DerivedTable`` source the
+    query touched. Plain-table cubes contribute nothing.
+
+    Order matches ``touched`` (first-mention) so callers can correlate
+    each entry with the parallel ``touched_cube_names`` list."""
+    out: list[str] = []
+    for cube in touched:
+        src = cube.resolved_source
+        if isinstance(src, DerivedTable):
+            out.append(resolve_sql(src.sql))
+    return out
 
 
 def _resolve_field(
@@ -1131,6 +1157,7 @@ def compile_query(
             columns=outer_columns,
             column_meta=cm,
             touched_cube_names=[c.name for c in touched],
+            derived_sources=_collect_derived_sources(touched, resolve_in_ctx),
         )
 
     # 7. Non-compare path — single inner Select with order/having/limit
@@ -1281,6 +1308,7 @@ def compile_query(
         columns=columns,
         column_meta=cm,
         touched_cube_names=[c.name for c in touched],
+        derived_sources=_collect_derived_sources(touched, resolve_in_ctx),
     )
 
 

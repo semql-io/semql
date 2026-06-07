@@ -36,7 +36,7 @@ from sqlglot import exp
 
 from semql.dialect import dialect_for, placeholder_for
 from semql.introspect import build_meta_values
-from semql.model import Backend, Cube
+from semql.model import Backend, Cube, DerivedTable, TableRef
 
 ParamBinder = Callable[[Any, str], exp.Placeholder]
 """Bind ``(value, dim_type)`` and return an ``exp.Placeholder`` node for it."""
@@ -99,9 +99,22 @@ def _ident(name: str) -> exp.Identifier:
     return exp.to_identifier(name, quoted=needs_quote)
 
 
-def _aliased_table(cube: Cube, resolve_sql: SqlResolver) -> exp.Table:
+def _aliased_source(cube: Cube, resolve_sql: SqlResolver) -> exp.Expression:
+    """Build the aliased FROM source for ``cube``.
+
+    Dispatches on ``cube.resolved_source``: plain-table cubes return a
+    ``Table`` node (``schema.tbl AS alias``); derived-table cubes return a
+    ``Subquery`` wrapping the resolved SQL (``(<sql>) AS alias``). Both
+    flow through the same ``resolve_sql`` placeholder substitution."""
+    src = cube.resolved_source
+    if isinstance(src, DerivedTable):
+        return _aliased_derived(cube, src, resolve_sql)
+    return _aliased_table(cube, src, resolve_sql)
+
+
+def _aliased_table(cube: Cube, src: TableRef, resolve_sql: SqlResolver) -> exp.Table:
     """Build a ``Table`` AST node for ``cube`` with its alias attached."""
-    resolved = resolve_sql(cube.table)
+    resolved = resolve_sql(src.table)
     # Build the Table node manually rather than via exp.to_table() so that
     # reserved-word table names (e.g. ``using``) are properly quoted instead
     # of being emitted as bare keywords.
@@ -112,6 +125,21 @@ def _aliased_table(cube: Cube, resolve_sql: SqlResolver) -> exp.Table:
         tbl = exp.Table(this=_ident(parts[0]))
     tbl.set("alias", exp.TableAlias(this=exp.to_identifier(cube.alias)))
     return tbl
+
+
+def _aliased_derived(cube: Cube, src: DerivedTable, resolve_sql: SqlResolver) -> exp.Subquery:
+    """Build a ``Subquery`` AST node over ``src.sql`` aliased to ``cube.alias``.
+
+    The derived SQL goes through the same placeholder substitution as
+    plain-table sources (``{tenant_schema}`` / ``{key}``). Parsing uses
+    the cube's own dialect so backend-specific shapes (ClickHouse ARRAY
+    JOIN, BigQuery UNNEST, etc.) survive the round-trip."""
+    resolved = resolve_sql(src.sql)
+    parsed = sqlglot.parse_one(resolved, dialect=dialect_for(cube.backend))
+    if not isinstance(parsed, exp.Subquery):
+        parsed = exp.Subquery(this=parsed)
+    parsed.set("alias", exp.TableAlias(this=exp.to_identifier(cube.alias)))
+    return parsed
 
 
 def _meta_subquery(cube: Cube, catalog: dict[str, Cube]) -> exp.Subquery:
@@ -155,7 +183,7 @@ class _StdSqlStrategy:
         catalog: dict[str, Cube],  # noqa: ARG002
         resolve_sql: SqlResolver,
     ) -> exp.Expression:
-        return _aliased_table(cube, resolve_sql)
+        return _aliased_source(cube, resolve_sql)
 
     def emit_time_spine(
         self,
@@ -322,7 +350,7 @@ class ClickHouseStrategy:
         catalog: dict[str, Cube],  # noqa: ARG002
         resolve_sql: SqlResolver,
     ) -> exp.Expression:
-        return _aliased_table(cube, resolve_sql)
+        return _aliased_source(cube, resolve_sql)
 
     def emit_time_spine(
         self,

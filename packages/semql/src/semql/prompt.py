@@ -13,7 +13,42 @@ system prompt alongside role description, data-source context, etc.
 from __future__ import annotations
 
 from semql.introspect import PolicyFn, iter_cubes
-from semql.model import AuthContext, Cube, View
+from semql.model import AuthContext, Cube, Lookup, ResolutionContext, View
+
+
+def _render_lookup_line(dim_ref: str, lookup: Lookup, ctx: ResolutionContext | None) -> str | None:
+    """Render the one-line lookup hint that follows a Dimension entry.
+
+    Inlines values up to ``max_inline``; beyond that emits a tool-hint
+    pointing at ``resolve_<dim>`` so the planner narrows via lookup
+    instead of stuffing a huge list into the prompt. Returns ``None``
+    when the lookup contributes nothing (dynamic with no context)."""
+    from semql.lookups import materialize  # local import: avoid module cycle at import time
+
+    materialized = materialize(lookup, ctx)
+    cube_name, dim_name = dim_ref.split(".", 1)
+    if materialized is None:
+        # Dynamic lookup with no context — surface the tool hint anyway
+        # so the planner knows resolution is available.
+        return (
+            f"    Lookup: values resolved at runtime; use "
+            f"`resolve_{cube_name}_{dim_name}(query)` to look up canonical ids."
+        )
+    values, labels = materialized
+    if len(values) <= lookup.max_inline:
+        if labels:
+            rendered = ", ".join(
+                f"`{v}` ({labels[v]})" if v in labels else f"`{v}`" for v in values
+            )
+        else:
+            rendered = ", ".join(f"`{v}`" for v in values)
+        return f"    Lookup ({len(values)} values): {rendered}"
+    # Over the inline cap — surface count + a tool hint.
+    sample = ", ".join(f"`{v}`" for v in values[: max(1, lookup.max_inline // 5)])
+    return (
+        f"    Lookup ({len(values)} values; sample: {sample}, …): use "
+        f"`resolve_{cube_name}_{dim_name}(query)` to narrow to a canonical id."
+    )
 
 
 def render_catalogue_block(
@@ -22,6 +57,8 @@ def render_catalogue_block(
     only_exposed: bool = True,
     viewer: AuthContext | None = None,
     policy: PolicyFn | None = None,
+    lookups: dict[str, Lookup] | None = None,
+    ctx: ResolutionContext | None = None,
 ) -> str:
     # ``include_meta=True`` here is deliberate: META reflection cubes
     # historically appeared in the planner fragment when callers opted
@@ -49,8 +86,9 @@ def render_catalogue_block(
         "semantic path."
     )
     lines.append("")
+    lookups_by_dim = dict(lookups or {})
     for cube in cubes:
-        lines.extend(_render_cube(cube))
+        lines.extend(_render_cube(cube, lookups_by_dim, ctx))
         lines.append("")
     return "\n".join(lines).rstrip() + "\n"
 
@@ -64,7 +102,11 @@ def _human(display_name: str | None) -> str:
     return f" (human: {display_name})" if display_name else ""
 
 
-def _render_cube(cube: Cube) -> list[str]:
+def _render_cube(
+    cube: Cube,
+    lookups: dict[str, Lookup],
+    ctx: ResolutionContext | None,
+) -> list[str]:
     header = f"### {cube.name} ({cube.backend.value}){_human(cube.display_name)}"
     out: list[str] = [header]
     if cube.description:
@@ -101,6 +143,12 @@ def _render_cube(cube: Cube) -> list[str]:
             desc = f" — {d.description}" if d.description else ""
             human = _human(d.display_name)
             out.append(f"  - `{cube.name}.{d.name}` `type={d.type}`{human}{desc}")
+            dim_ref = f"{cube.name}.{d.name}"
+            lk = lookups.get(dim_ref)
+            if lk is not None:
+                lookup_line = _render_lookup_line(dim_ref, lk, ctx)
+                if lookup_line is not None:
+                    out.append(lookup_line)
 
     if cube.time_dimensions:
         out.append("")
@@ -236,6 +284,8 @@ def build_planner_prompt_fragment(
     views: dict[str, View] | None = None,
     viewer: AuthContext | None = None,
     policy: PolicyFn | None = None,
+    lookups: dict[str, Lookup] | None = None,
+    ctx: ResolutionContext | None = None,
 ) -> str:
     """Compose the semantic-layer fragment of a planner's system prompt.
 
@@ -246,11 +296,20 @@ def build_planner_prompt_fragment(
     ``viewer`` + ``policy`` (when set) shrink the catalogue block to
     only the cubes the viewer is authorised to see — keeps the planner
     from suggesting a query it can't run.
+
+    ``lookups`` + ``ctx`` inline dimension-value catalogues underneath
+    their dimensions. Dynamic ``Lookup`` loaders fire here (the only
+    I/O path in the prompt builder).
     """
     parts: list[str] = [
         _SPEC_CONTRACT,
         render_catalogue_block(
-            catalog, only_exposed=only_exposed, viewer=viewer, policy=policy
+            catalog,
+            only_exposed=only_exposed,
+            viewer=viewer,
+            policy=policy,
+            lookups=lookups,
+            ctx=ctx,
         ).rstrip(),
     ]
     if views:
@@ -391,6 +450,8 @@ def build_query_generator_prompt_fragment(
     views: dict[str, View] | None = None,
     viewer: AuthContext | None = None,
     policy: PolicyFn | None = None,
+    lookups: dict[str, Lookup] | None = None,
+    ctx: ResolutionContext | None = None,
 ) -> str:
     """Fragment for the second stage of the prompt pipeline.
 
@@ -405,16 +466,24 @@ def build_query_generator_prompt_fragment(
     """
     scoped_catalog: dict[str, Cube] = catalog
     scoped_views: dict[str, View] | None = views
+    scoped_lookups: dict[str, Lookup] | None = lookups
     if scope_to is not None:
         wanted = set(scope_to)
         scoped_catalog = {n: c for n, c in catalog.items() if n in wanted}
         if views is not None:
             scoped_views = {n: v for n, v in views.items() if n in wanted}
+        if lookups is not None:
+            scoped_lookups = {d: lk for d, lk in lookups.items() if d.split(".", 1)[0] in wanted}
 
     parts: list[str] = [
         _SPEC_CONTRACT,
         render_catalogue_block(
-            scoped_catalog, only_exposed=only_exposed, viewer=viewer, policy=policy
+            scoped_catalog,
+            only_exposed=only_exposed,
+            viewer=viewer,
+            policy=policy,
+            lookups=scoped_lookups,
+            ctx=ctx,
         ).rstrip(),
     ]
     if scoped_views:

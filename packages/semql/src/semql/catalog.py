@@ -20,7 +20,16 @@ from collections.abc import Iterator
 from typing import TYPE_CHECKING, TypeVar
 
 from semql.introspect import META_CUBES, PolicyFn, ScopeFn
-from semql.model import AuthContext, BaseField, Cube, Join, View
+from semql.model import (
+    AuthContext,
+    BaseField,
+    Cube,
+    Dimension,
+    Join,
+    Lookup,
+    ResolutionContext,
+    View,
+)
 from semql.units import DEFAULT_REGISTRY, Registry
 
 _T = TypeVar("_T", bound=BaseField)
@@ -39,6 +48,7 @@ class Catalog:
         cubes: list[Cube],
         *,
         views: list[View] | None = None,
+        lookups: list[Lookup] | None = None,
         policy: PolicyFn | None = None,
         scope_fns: dict[str, ScopeFn] | None = None,
         unit_registry: Registry | None = None,
@@ -187,6 +197,45 @@ class Catalog:
             for fld in (*cube.measures, *cube.dimensions):
                 self._check_unit_pair(cube, fld)
 
+        # Lookups: dimension-value catalogues addressable by qualified
+        # ``cube.dim``. Each Lookup's dimension must resolve to a real
+        # ``string``-typed Dimension on a real cube — typo or type
+        # mismatches surface here instead of at prompt-render time.
+        lookup_list: list[Lookup] = list(lookups or [])
+        seen_lookup_dims: set[str] = set()
+        for lk in lookup_list:
+            if lk.dimension in seen_lookup_dims:
+                raise ValueError(
+                    f"Catalog has duplicate Lookup for dimension "
+                    f"{lk.dimension!r}. Each ``cube.dim`` may have at "
+                    "most one Lookup."
+                )
+            seen_lookup_dims.add(lk.dimension)
+            cube_name, dim_name = lk.dimension.split(".", 1)
+            if cube_name not in self._by_name:
+                raise ValueError(
+                    f"Lookup({lk.dimension!r}): cube {cube_name!r} is "
+                    f"not in the catalog. Known cubes: "
+                    f"{sorted(self._by_name)}."
+                )
+            target_cube = self._by_name[cube_name]
+            target_dim: Dimension | None = next(
+                (d for d in target_cube.dimensions if d.name == dim_name), None
+            )
+            if target_dim is None:
+                raise ValueError(
+                    f"Lookup({lk.dimension!r}): cube {cube_name!r} has "
+                    f"no dimension named {dim_name!r}. Known dimensions: "
+                    f"{sorted(d.name for d in target_cube.dimensions)}."
+                )
+            if target_dim.type != "string":
+                raise ValueError(
+                    f"Lookup({lk.dimension!r}): only string-typed "
+                    f"dimensions are eligible — {dim_name!r} is type="
+                    f"{target_dim.type!r}."
+                )
+        self.lookups: dict[str, Lookup] = {lk.dimension: lk for lk in lookup_list}
+
         self._scope_fns: dict[str, ScopeFn] = dict(scope_fns or {})
         for c in merged:
             if c.scope is not None and c.scope not in self._scope_fns:
@@ -281,12 +330,19 @@ class Catalog:
         only_exposed: bool = True,
         include_introspection: bool = False,
         viewer: AuthContext | None = None,
+        ctx: ResolutionContext | None = None,
     ) -> str:
         """Render the planner prompt fragment for this catalog. Thin
         wrapper around ``semql.prompt.build_planner_prompt_fragment``.
 
         When ``viewer`` is provided, the catalogue block shrinks to the
-        cubes the viewer is allowed to see."""
+        cubes the viewer is allowed to see.
+
+        ``ctx`` is the resolution context for dimension-value lookups —
+        any registered :class:`Lookup` with a loader fires here. Static
+        lookups inline regardless of ``ctx``; dynamic lookups skip
+        inlining when ``ctx`` is ``None`` and surface a tool hint
+        instead."""
         from semql.prompt import build_planner_prompt_fragment
 
         return build_planner_prompt_fragment(
@@ -296,6 +352,8 @@ class Catalog:
             views=self.views,
             viewer=viewer,
             policy=self._policy,
+            lookups=self.lookups,
+            ctx=ctx,
         )
 
     def __iter__(self) -> Iterator[Cube]:

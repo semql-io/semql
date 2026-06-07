@@ -69,9 +69,17 @@ def _render_cube(cube: object) -> list[str]:  # cube: Cube
         out.append("")
 
     # The "facts" block — every catalogue-level setting on one card.
+    from semql.model import DerivedTable as _DT
+
+    src = cube.resolved_source
+    source_line = (
+        f"- **Source:** derived (`{_DT.__name__}`)"
+        if isinstance(src, _DT)
+        else f"- **Table:** `{src.table}`"
+    )
     facts: list[str] = [
         f"- **Backend:** `{cube.backend.value}`",
-        f"- **Table:** `{cube.table}`",
+        source_line,
         f"- **Alias:** `{cube.alias}`",
     ]
     if cube.base_predicate:

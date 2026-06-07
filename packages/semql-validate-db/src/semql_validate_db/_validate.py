@@ -26,7 +26,7 @@ from typing import Literal, Protocol
 
 from semql.catalog import Catalog
 from semql.introspect import iter_cubes, iter_fields, iter_joins
-from semql.model import Cube, Dimension, Join, Measure, TimeDimension
+from semql.model import Cube, DerivedTable, Dimension, Join, Measure, TimeDimension
 
 DbValidationCode = Literal[
     "missing_table",
@@ -120,6 +120,18 @@ def _cube_lookup(cube: Cube, context: dict[str, str]) -> dict[str, str]:
     }
 
 
+def _from_clause(cube: Cube, lookup: dict[str, str]) -> str:
+    """The ``FROM`` clause body for ``cube`` — ``<tbl> AS <alias>`` for a
+    plain-table cube, ``(<derived sql>) AS <alias>`` for a derived-table
+    cube. Placeholder substitution applies inside both."""
+    src = cube.resolved_source
+    if isinstance(src, DerivedTable):
+        body = _resolve_placeholders(src.sql, lookup)
+        return f"({body}) AS {cube.alias}"
+    body = _resolve_placeholders(src.table, lookup)
+    return f"{body} AS {cube.alias}"
+
+
 def _validate_required_filters(cube: Cube) -> list[DbValidationError]:
     """Static check: every ``required_filters`` entry must name a real
     dimension on the cube.
@@ -157,10 +169,14 @@ def _validate_cube(
     run reports the whole picture for the cube."""
     errors: list[DbValidationError] = []
     lookup = _cube_lookup(cube, context)
-    table = _resolve_placeholders(cube.table, lookup)
-    alias = cube.alias
+    from_clause = _from_clause(cube, lookup)
+    source_label = (
+        "(derived)"
+        if isinstance(cube.resolved_source, DerivedTable)
+        else from_clause.split(" AS ", 1)[0]
+    )
 
-    ok, detail = _probe(connection, f"SELECT * FROM {table} AS {alias} LIMIT 0")
+    ok, detail = _probe(connection, f"SELECT * FROM {from_clause} LIMIT 0")
     if not ok:
         errors.append(
             DbValidationError(
@@ -168,9 +184,9 @@ def _validate_cube(
                 cube=cube.name,
                 field=None,
                 message=(
-                    f"Cube {cube.name!r}: table {table!r} did not respond to a "
-                    "trivial SELECT — likely missing, renamed, or "
-                    "inaccessible to the connection's role."
+                    f"Cube {cube.name!r}: source {source_label!r} did not "
+                    "respond to a trivial SELECT — likely missing, renamed, "
+                    "or inaccessible to the connection's role."
                 ),
                 detail=detail,
             )
@@ -200,7 +216,7 @@ def _validate_cube(
             # base_predicate semantics. No fragment-as-SELECT probe.
             continue
         fragment = _resolve_placeholders(field.sql, lookup)
-        ok, detail = _probe(connection, f"SELECT {fragment} FROM {table} AS {alias} LIMIT 0")
+        ok, detail = _probe(connection, f"SELECT {fragment} FROM {from_clause} LIMIT 0")
         if not ok:
             errors.append(
                 DbValidationError(
@@ -219,7 +235,7 @@ def _validate_cube(
         predicate = _resolve_placeholders(cube.base_predicate, lookup)
         ok, detail = _probe(
             connection,
-            f"SELECT 1 FROM {table} AS {alias} WHERE {predicate} LIMIT 0",
+            f"SELECT 1 FROM {from_clause} WHERE {predicate} LIMIT 0",
         )
         if not ok:
             errors.append(
@@ -252,14 +268,11 @@ def _validate_join(
     surface here under ``join_predicate_invalid``."""
     src_lookup = _cube_lookup(source, context)
     tgt_lookup = _cube_lookup(target, context)
-    src_table = _resolve_placeholders(source.table, src_lookup)
-    tgt_table = _resolve_placeholders(target.table, tgt_lookup)
+    src_from = _from_clause(source, src_lookup)
+    tgt_from = _from_clause(target, tgt_lookup)
     on_clause = _resolve_placeholders(join.on, {**src_lookup, **tgt_lookup})
 
-    sql = (
-        f"SELECT 1 FROM {src_table} AS {source.alias} "
-        f"LEFT JOIN {tgt_table} AS {target.alias} ON {on_clause} LIMIT 0"
-    )
+    sql = f"SELECT 1 FROM {src_from} LEFT JOIN {tgt_from} ON {on_clause} LIMIT 0"
     ok, detail = _probe(connection, sql)
     if ok:
         return []

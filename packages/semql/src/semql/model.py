@@ -22,6 +22,7 @@ anything the platform shouldn't know about. Round-trips through
 
 from __future__ import annotations
 
+from collections.abc import Callable, Mapping, Sequence
 from enum import StrEnum
 from typing import Literal
 
@@ -191,10 +192,56 @@ class Join(BaseModel):
     metadata: Metadata = Field(default_factory=dict)
 
 
+class TableRef(BaseModel):
+    """A plain ``[schema.]table`` reference.
+
+    Identical in meaning to the legacy ``Cube.table`` shorthand; goes
+    through the same ``{alias}`` / ``{tenant_schema}`` / context
+    substitution convention at compile time. Exists so ``Cube.source``
+    can be a discriminated union with :class:`DerivedTable`."""
+
+    model_config = ConfigDict(frozen=True)
+    table: str
+
+
+class DerivedTable(BaseModel):
+    """A cube whose physical source is a SQL expression, not a table.
+
+    Emitted as ``(<sql>) AS <alias>`` inside the cube's isolation
+    subquery — so ``tenancy`` / ``security_sql`` / ``scope`` wrappers
+    apply over the derived rows the same way they apply over a real
+    table.
+
+    ``sql`` uses the same placeholder convention as ``Cube.table``:
+    ``{tenant_schema}`` for schema-tenancy substitution and ``{key}``
+    for compile-context substitution.
+
+    DerivedTable is the second place raw SQL legitimately enters the
+    catalogue (the first is ``Measure.sql``). The compiler surfaces the
+    resolved SQL on :attr:`semql.compile.Compiled.derived_sources` so
+    static checks (``is_safe_select``, dialect snapshots) cover every
+    raw fragment, not just the outer SELECT."""
+
+    model_config = ConfigDict(frozen=True)
+    sql: str
+
+
+CubeSource = TableRef | DerivedTable
+
+
 class Cube(BaseModel):
     name: str
     backend: Backend
-    table: str
+    # Shorthand for a plain-table source: ``Cube(table="schema.t", ...)``
+    # is equivalent to ``Cube(source=TableRef(table="schema.t"), ...)``.
+    # Exactly one of ``table`` / ``source`` must be specified; mixing a
+    # non-empty ``table`` with a ``DerivedTable`` source raises.
+    table: str = ""
+    # Explicit source spec. Set this (instead of ``table``) when the cube's
+    # physical rows come from a SQL expression rather than a real table —
+    # e.g. a layered CTE preamble that surfaces derived columns the cube
+    # then exposes as dimensions / measures. See :class:`DerivedTable`.
+    source: CubeSource | None = None
     alias: str
     base_predicate: str | None = None
     measures: list[Measure] = []
@@ -286,6 +333,36 @@ class Cube(BaseModel):
         return self
 
     @model_validator(mode="after")
+    def _check_source_consistency(self) -> Cube:
+        """Exactly one source declaration: ``table`` (shorthand) or
+        ``source`` (explicit). Setting both is OK only when ``source`` is
+        a ``TableRef`` whose ``table`` matches; mixing a ``table`` value
+        with a ``DerivedTable`` is rejected."""
+        has_table = bool(self.table)
+        has_source = self.source is not None
+        if not has_table and not has_source:
+            raise ValueError(
+                f"Cube {self.name!r}: must declare either ``table=`` "
+                "(plain table reference) or ``source=DerivedTable(sql=...)`` "
+                "(derived source)."
+            )
+        if has_table and has_source:
+            if isinstance(self.source, TableRef):
+                if self.source.table != self.table:
+                    raise ValueError(
+                        f"Cube {self.name!r}: ``table={self.table!r}`` "
+                        "disagrees with ``source=TableRef(table="
+                        f"{self.source.table!r})``. Specify only one."
+                    )
+            else:
+                raise ValueError(
+                    f"Cube {self.name!r}: cannot set both ``table`` and "
+                    "``source=DerivedTable(...)``. Drop ``table`` when "
+                    "using a derived source."
+                )
+        return self
+
+    @model_validator(mode="after")
     def _check_tenancy_consistency(self) -> Cube:
         if self.tenancy == "discriminator":
             if not self.tenancy_column:
@@ -294,14 +371,36 @@ class Cube(BaseModel):
                     "has no tenancy_column — the compiler can't emit a "
                     "WHERE predicate without a column to filter on."
                 )
+            # ``{tenant_schema}`` is the schema-tenancy substitution marker —
+            # it has no meaning under discriminator tenancy. Check every
+            # place a source SQL can live.
+            offenders: list[str] = []
             if "{tenant_schema}" in self.table:
+                offenders.append("table")
+            if isinstance(self.source, TableRef) and "{tenant_schema}" in self.source.table:
+                offenders.append("source.table")
+            if isinstance(self.source, DerivedTable) and "{tenant_schema}" in self.source.sql:
+                offenders.append("source.sql")
+            if offenders:
                 raise ValueError(
                     f"Cube {self.name!r} declares tenancy='discriminator' "
-                    "but its table contains '{tenant_schema}'. The two "
-                    "isolation strategies are mutually exclusive — pick "
-                    "one."
+                    f"but ``{offenders[0]}`` contains '{{tenant_schema}}'. "
+                    "The two isolation strategies are mutually exclusive "
+                    "— pick one."
                 )
         return self
+
+    @property
+    def resolved_source(self) -> CubeSource:
+        """Canonical source spec.
+
+        Returns ``self.source`` when explicitly set, otherwise wraps
+        ``self.table`` in a :class:`TableRef`. Use this from the compiler
+        / backend strategy so the ``table`` / ``source`` shorthand
+        distinction stays a model concern."""
+        if self.source is not None:
+            return self.source
+        return TableRef(table=self.table)
 
     def field_names(self) -> set[str]:
         names: set[str] = set()
@@ -356,6 +455,88 @@ class AuthContext(BaseModel):
     metadata: Metadata = Field(default_factory=dict)
 
 
+class ResolutionContext(BaseModel):
+    """The context handed to :class:`Lookup` loaders.
+
+    Loaders are pure functions of this context — same input, same
+    output — so callers can cache responses keyed by it. ``viewer``
+    flows from ``Catalog.prompt(viewer=...)``; ``context`` mirrors the
+    compile-time substitution dict (typically ``{"tenant_schema":
+    ..., "tenant": ...}``)."""
+
+    model_config = ConfigDict(frozen=True)
+    viewer: AuthContext | None = None
+    context: dict[str, str] = Field(default_factory=dict)
+
+
+LookupValues = Sequence[str] | Mapping[str, str]
+"""Loader return type — either a flat list of canonical values, or a
+``{value: human label}`` mapping for value→label rendering."""
+
+LookupLoader = Callable[[ResolutionContext], LookupValues]
+"""A function from :class:`ResolutionContext` to lookup values. Fires
+when ``Catalog.prompt(...)`` renders a dynamic ``Lookup`` — never from
+the compiler."""
+
+
+class Lookup(BaseModel):
+    """A finite set of valid values for a string dimension.
+
+    Surfaces dimension values to the planner so "Show me sales in EMEA"
+    binds to a concrete predicate without the LLM having to guess. Two
+    flavours:
+
+    - **Static**: ``values=("EMEA", "APAC", "NA")``. Values live in the
+      catalogue.
+    - **Dynamic**: ``loader=lambda ctx: db.fetch_regions(...)``. The
+      loader fires when ``Catalog.prompt(...)`` renders the catalogue
+      block, so the rendered values can vary per viewer / tenant.
+
+    ``max_inline`` caps how many values are inlined into the prompt.
+    Beyond it the rendered catalogue tells the planner to call a
+    ``resolve_<dim>`` tool (or :func:`semql.lookups.resolve`) instead.
+
+    Loaders are an I/O entry point — they live in
+    ``Catalog.prompt(...)``, never in ``Catalog.compile(...)``. The
+    compiler stays sans-io."""
+
+    model_config = ConfigDict(frozen=True, arbitrary_types_allowed=True)
+    # Qualified ``cube.dim`` reference. The dimension must exist and
+    # have type ``"string"``; validation runs at ``Catalog`` construction.
+    dimension: str
+    # Static value set. ``None`` means "use the loader". Tuples (not
+    # lists) so the Lookup hashes cleanly and stays immutable.
+    values: tuple[str, ...] | None = None
+    # Optional human label per value. ``("EMEA",)`` + ``{"EMEA": "Europe,
+    # Middle East & Africa"}`` renders both the canonical id and the label.
+    # Loader-backed lookups can return a Mapping to populate this dynamically.
+    labels: dict[str, str] | None = None
+    loader: LookupLoader | None = None
+    max_inline: int = 50
+    description: str = ""
+
+    @model_validator(mode="after")
+    def _check_source(self) -> Lookup:
+        has_values = self.values is not None
+        has_loader = self.loader is not None
+        if not has_values and not has_loader:
+            raise ValueError(
+                f"Lookup({self.dimension!r}): must declare either "
+                "``values=`` (static) or ``loader=`` (dynamic)."
+            )
+        if has_values and has_loader:
+            raise ValueError(
+                f"Lookup({self.dimension!r}): ``values`` and ``loader`` are mutually exclusive."
+            )
+        if "." not in self.dimension or self.dimension.count(".") != 1:
+            raise ValueError(
+                f"Lookup.dimension {self.dimension!r} must be qualified as ``cube.dim``."
+            )
+        if self.max_inline < 0:
+            raise ValueError(f"Lookup({self.dimension!r}): max_inline must be >= 0.")
+        return self
+
+
 class View(BaseModel):
     """A curated catalogue facade.
 
@@ -407,15 +588,22 @@ __all__ = [
     "BaseField",
     "ChartTypeLiteral",
     "Cube",
+    "CubeSource",
+    "DerivedTable",
     "DimTypeLiteral",
     "Dimension",
     "FormatLiteral",
     "GranularityLiteral",
     "Join",
+    "Lookup",
+    "LookupLoader",
+    "LookupValues",
     "Measure",
     "Metadata",
+    "ResolutionContext",
     "ScopePredicate",
     "Segment",
+    "TableRef",
     "TenancyMode",
     "TimeDimension",
     "View",
