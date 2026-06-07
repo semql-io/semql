@@ -126,12 +126,33 @@ print(catalog.prompt(viewer=viewer))   # planner-facing fragment, viewer-filtere
 
 Catalog cubes the viewer can't see vanish from the rendered prompt.
 
-## Skills (for Claude Code / Cursor)
+## Skills
 
-- `skills/semql-requirement-discovery.md` — interview a developer
-  about analytics intent, emit a structured requirements doc.
-- `skills/semql-cube.md` — author Cube definitions from that doc
-  (or directly).
+Two skills ship in the repo, both following the
+[vercel-labs/skills](https://github.com/vercel-labs/skills) convention
+(`skills/<name>/SKILL.md` with YAML frontmatter + tool-agnostic
+markdown body):
+
+- `skills/semql-requirement-discovery/SKILL.md` — interview a
+  developer about analytics intent, emit a structured requirements
+  doc.
+- `skills/semql-cube/SKILL.md` — author Cube definitions from that
+  doc (or directly).
+
+The skills work across any agent that consumes the vercel-labs
+skill format — Claude Code, Codex CLI, Cursor, Gemini CLI, Copilot,
+and others. Use the vercel-labs CLI to install them into your
+agent's expected directory:
+
+```sh
+npx skills install <agent-name>
+```
+
+The skill bodies are deliberately tool-agnostic: they say *what* to
+elicit ("ask the user which roles are restricted"), not *how* to
+ask (the runtime's question-asking mechanism — Claude Code's
+`AskUserQuestion`, a numbered CLI prompt, etc. — varies and is
+called out where the skill needs it).
 
 ## Status
 

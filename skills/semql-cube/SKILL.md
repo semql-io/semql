@@ -163,7 +163,62 @@ Dimension(name="duration_seconds", sql="{o}.duration_sec",
           type="number", unit="seconds", format="duration")
 ```
 
-## Step 5: joins
+## Step 5: presentation hints (closed enums)
+
+Visualisation hints live on three slots:
+
+- `Cube.default_chart_type` — the cube's preferred default.
+- `Measure.format` and `Dimension.format` — per-field rendering hint.
+- `Measure.unit` and `Dimension.unit` — free-form label that pairs
+  with `format` (`unit="USD"` with `format="currency"`).
+
+### Supported chart types — use these names exactly
+
+| `ChartTypeLiteral` | When                                       |
+|--------------------|--------------------------------------------|
+| `line_chart`       | time series with `granularity`             |
+| `bar_chart`        | categorical comparison                     |
+| `pie_chart`        | share of whole — small N only              |
+| `data_table`       | fallback, row listings, multi-measure detail |
+
+`semql.visualize.decide_visualization` picks the chart type
+automatically from the query shape + row count. `default_chart_type`
+is the override the cube author baked in. Leave it `None` unless
+the cube's natural shape genuinely differs from the auto-decision
+(META cubes pin `data_table`, for example).
+
+### Supported formats — use these names exactly
+
+| `FormatLiteral` | Use for                                    |
+|-----------------|--------------------------------------------|
+| `currency`      | money (`unit="USD"` etc.)                  |
+| `percent`       | already a rate (`0.12` = 12%)              |
+| `integer`       | counts, IDs                                |
+| `duration`      | seconds / minutes / hours                  |
+| `raw`           | fallback — equivalent to leaving it `None` |
+
+### Don't invent viz
+
+If the requirements doc says "forecast," "pivot," "sparkline," or
+"heatmap" — flag it. SemQL doesn't render those. Pick a supported
+substitute (`line_chart` for forecast-as-trendline,
+`data_table` for pivot, etc.) and note the trade-off in the cube's
+`description`. **Never add a chart-type name outside `ChartTypeLiteral`.**
+The Pydantic validator rejects it; users hit a 500 if you ship that.
+
+### Only override when defaults are wrong
+
+`format=None` is correct for most fields. Set it when:
+- A numeric measure's name doesn't reveal its unit
+  (`avg_processing_time_seconds` → `format=duration`).
+- A rate-style measure stored as a fraction needs the percent
+  rendering (`conversion_rate` → `format=percent`).
+- Currency / multi-currency catalogues need the explicit hint.
+
+Setting it for every field bloats the prompt and gives the LLM
+duplicate context. Skip when the name + dim type already say it.
+
+## Step 6: joins
 
 A `Join` is a directed edge. The BFS finds a path; multiple edges
 compose.
@@ -184,7 +239,7 @@ Prefer `Dimension.foreign_key="<other_cube>"` on the FK column — the
 Catalog auto-derives the `many_to_one` Join from the FK to the
 target's `primary_key`. Explicit `Join` with the same target wins.
 
-## Step 6: reusable predicates and required filters
+## Step 7: reusable predicates and required filters
 
 ```python
 from semql import Segment
@@ -202,7 +257,7 @@ orders = Cube(
 A query then references `segments=["orders.paid"]` to AND-compose the
 predicate without re-deriving it.
 
-## Step 7: drill paths + extends
+## Step 8: drill paths + extends
 
 ```python
 orders = Cube(
@@ -218,7 +273,7 @@ named parent's measures / dimensions / time_dimensions / segments
 into this cube — child redeclarations win, new items append. Cycles
 raise at Catalog construction.
 
-## Step 8: views — curated facades
+## Step 9: views — curated facades
 
 ```python
 from semql import View
@@ -240,7 +295,7 @@ for common question shapes) and join disambiguation. Reference
 fields as `view.local_name`; the compiler rewrites to the underlying
 cube field and preserves the view-local alias in the output column.
 
-## Step 9: tenancy + RLS + scope
+## Step 10: tenancy + RLS + scope
 
 Three predicates can wrap a cube's FROM source, all AND-composed
 *inside* the alias subquery (so an outer `OR` can't bypass any of
@@ -289,7 +344,7 @@ calls it with `(cube, viewer)` and AND-injects the returned
 `ScopePredicate` inside the alias subquery — same protection as
 tenancy / security_sql.
 
-## Step 10: cube-level authorisation
+## Step 11: cube-level authorisation
 
 ```python
 Cube(
@@ -304,7 +359,7 @@ intersect the viewer's roles disappear from `iter_cubes` /
 prompt fragments / MCP tool registration, and the compiler refuses
 queries that touch them (loud `CompileError`, not silent filtering).
 
-## Step 11: assemble the Catalog
+## Step 12: assemble the Catalog
 
 ```python
 from semql import AuthContext, Catalog, ScopePredicate
@@ -338,7 +393,7 @@ unknown `Join.to` targets, missing `primary_key` on
 `foreign_key` targets, unregistered `Cube.scope` names — all raise
 loudly here so the compiler can trust the wiring later.
 
-## Step 12: query (with viewer)
+## Step 13: query (with viewer)
 
 ```python
 from semql import AuthContext, Filter, SemanticQuery, TimeWindow
@@ -375,7 +430,7 @@ print(compiled.sql, compiled.params)
 - For OR / NOT, use `where=BoolExpr(op="or", children=[...])`.
 - Compare windows: `compare=CompareWindow(mode="previous_period")`.
 
-## Step 13: surface to LLMs — the four-role pipeline
+## Step 14: surface to LLMs — the four-role pipeline
 
 Four fragment builders, each paired with a typed Pydantic output the
 LLM emits. Splice the fragment into the role's system prompt; parse

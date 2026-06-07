@@ -41,6 +41,7 @@ The doc lists **intent-level** facts only:
 - The questions users will ask.
 - The entities those questions imply.
 - Which entities relate to which.
+- How answers should land (chart / format hints from a closed enum).
 - Who's allowed to see what (in business terms).
 
 It does **not** list:
@@ -57,15 +58,19 @@ hand off.
 
 Either or both:
 
-1. **PRD documents** — paths or URLs the user names. Read with the
-   `Read` tool. Cite specific sections in your follow-up questions
+1. **PRD documents** — paths or URLs the user names. Read them with
+   whatever file-reading affordance the runtime gives you (Claude
+   Code: `Read` tool; Codex / Gemini CLI: file-read; Copilot: paste
+   into context). Cite specific sections in your follow-up questions
    so the user sees you're grounded ("section 3.2 mentions
    transactions; should that be a separate cube from orders?").
 2. **Interview answers** — when the PRD is silent on an intent
-   question, ask. Use `AskUserQuestion` for closed choices; open
-   prose for the rest.
+   question, ask. Prefer a structured-choice mechanism when the
+   runtime supports it (Claude Code: `AskUserQuestion`; CLI tools:
+   numbered options the user picks via input). Fall back to plain
+   prose questions otherwise.
 
-## The interview — five domain-level passes
+## The interview — six domain-level passes
 
 ### 1. Domain and audience
 
@@ -123,7 +128,48 @@ a `Join` with a predicate.
 Capture in the doc:
 - For each entity: who they relate to and how (1:1, 1:N, N:1).
 
-### 5. Authorisation — at the policy level
+### 5. Presentation hints
+
+For each entity (and each major measure / dimension on it), ask how
+the answer should *land in front of the user*. Stay at the
+intent level — chart-type names from the supported enum, format
+names from the supported enum. Do NOT propose anything outside
+these; SemQL won't render it.
+
+**Supported chart types** (use these names exactly):
+- `line_chart` — time series with granularity.
+- `bar_chart` — categorical comparison.
+- `pie_chart` — share of whole (small N only — flag if the entity
+  has many categories).
+- `data_table` — fallback / row listings / multi-measure detail.
+
+**Supported formats** (for measures and presentation-hinted dimensions):
+- `currency` — money. Pair with a unit like "USD" if multi-currency.
+- `percent` — already a rate (0.12 = 12%).
+- `integer` — counts, IDs.
+- `duration` — seconds / minutes / hours; let the renderer humanise.
+- `raw` — fallback.
+
+Capture in the doc:
+- **Default chart per entity** — `line_chart` / `bar_chart` / `pie_chart` /
+  `data_table`, or "no default" if the questions span shapes.
+- **Per-measure format** — only when not obvious from the name
+  (`revenue` is clearly currency; `count_distinct_users` doesn't
+  need a hint). Skip when defaults are fine.
+- **Per-dimension format hint** — only for non-obvious ones
+  (`duration_seconds` benefits from `format=duration`; `region`
+  doesn't need a hint).
+
+If the user says "we want a forecast / pivot / sparkline / heatmap"
+— flag it. SemQL doesn't render those today. Either pick a
+supported substitute or note it as out-of-scope in the open
+questions section. **Don't invent chart-type names** to placate the
+user.
+
+When in doubt: data_table renders everything. Charts are upgrades,
+not requirements.
+
+### 6. Authorisation — at the policy level
 
 Capture the **rules** the catalog has to honour, not the
 implementation:
@@ -173,6 +219,10 @@ verbatim so `semql-cube` parses it predictably:
 - **Relates to**:
   - many_to_one → `<other_entity>` ("a <this> belongs to one <other>")
 - **Question references**: questions 1, 3, 5
+- **Default chart**: line_chart | bar_chart | pie_chart | data_table | none
+- **Presentation hints**:
+  - Measure `<name>` → format `currency` | `percent` | `integer` | `duration`
+  - Dimension `<name>` → format `duration` (etc — skip when obvious)
 
 ### <next_entity>
 ...
@@ -225,8 +275,10 @@ to `semql-cube`.
 - Don't propose SQL, joins-as-predicates, or ScopeFn names. Those
   belong in `semql-cube`.
 - Don't write Python in this skill. Output is the markdown doc.
-- One bundle of related questions at a time. Use `AskUserQuestion`
-  for closed choices (4 options max).
+- One bundle of related questions at a time. Use the runtime's
+  structured-choice mechanism for closed questions when available
+  (Claude Code: `AskUserQuestion`; CLI tools: a numbered prompt the
+  user picks via input). Cap at four options per question.
 
 ## Common pitfalls
 

@@ -19,8 +19,8 @@ scripts/
   check_api_break.py  # griffe-driven public-surface diff
 .github/workflows/    # CI (lint, types, tests, breakage, build)
 skills/
-  semql-requirement-discovery.md  # interview → requirements doc
-  semql-cube.md                   # requirements doc → Cube definitions
+  semql-requirement-discovery/SKILL.md  # interview → requirements doc
+  semql-cube/SKILL.md                   # requirements doc → Cube definitions
 docs/notes/           # source material (gitignored)
 docs/api/             # generated API reference (gitignored)
 PHILOSOPHY.md         # design invariants — read this before changing scope
