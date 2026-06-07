@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from semql.catalog import Catalog
 from semql.compile import MAX_UNGROUPED_ROWS, Compiled, compile_query
+from semql.docs import render_catalog_markdown
 from semql.errors import (
     CompileError,
     CrossBackendError,
@@ -104,6 +105,7 @@ __all__ = [
     "compile_query",
     "decide_visualization",
     "is_safe_select",
+    "render_catalog_markdown",
     "render_catalogue_block",
     "validate",
 ]

@@ -131,6 +131,13 @@ class Measure(BaseField):
 
 class Dimension(BaseField):
     type: DimTypeLiteral
+    # Presentation hints — mirror ``Measure.unit`` / ``Measure.format``.
+    # The compiler ignores both; downstream visualisers (charts, tables)
+    # use them to format the rendered value. Example: a duration_seconds
+    # dimension might set ``unit="seconds"``, ``format="duration"`` so a
+    # tabular cell renders as "1h 23m" instead of "4980".
+    unit: str | None = None
+    format: FormatLiteral | None = None
 
 
 class TimeDimension(BaseField):
