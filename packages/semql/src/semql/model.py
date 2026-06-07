@@ -38,7 +38,23 @@ class Backend(StrEnum):
     META = "meta"  # reflection over the catalogue itself; see introspect.py
 
 
-AggLiteral = Literal["sum", "count", "count_distinct", "avg", "min", "max", "ratio"]
+AggLiteral = Literal[
+    "sum",
+    "count",
+    "count_distinct",
+    "avg",
+    "min",
+    "max",
+    "ratio",
+    # Quantile aggregations — non-distributive. ``median`` is the q=0.5
+    # case; ``p75`` / ``p90`` / ``p95`` cover the long-tail diagnostic
+    # cases. Pair with ``non_additive=True`` so callers don't naively
+    # sum a median across grains.
+    "median",
+    "p75",
+    "p90",
+    "p95",
+]
 DimTypeLiteral = Literal["string", "number", "time", "bool", "uuid"]
 GranularityLiteral = Literal["hour", "day", "week", "month"]
 FormatLiteral = Literal["raw", "integer", "percent", "currency", "duration"]

@@ -64,7 +64,7 @@ def test_field_names_dedupes_implicitly() -> None:
 
 def test_measure_rejects_unknown_agg() -> None:
     with pytest.raises(ValidationError):
-        Measure(name="m", sql="x", agg="median")  # type: ignore[arg-type]
+        Measure(name="m", sql="x", agg="quantile_99.999")  # type: ignore[arg-type]
 
 
 def test_dimension_rejects_unknown_type() -> None:

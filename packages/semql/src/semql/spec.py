@@ -128,6 +128,65 @@ class CompareWindow(BaseModel):
     range: tuple[str, str] | None = None
 
 
+InlineDerivedOp = Literal["ratio", "sum", "diff"]
+
+
+class InlineDerived(BaseModel):
+    """Ad-hoc derived measure composed from existing catalog measures.
+
+    Covers the exploratory shape an LLM or human reaches for in chat:
+    "show me ``productive_time + active_time`` per region", or
+    "``revenue / count``", or "``logged_minutes - active_minutes``"
+    — without forcing a catalog change for a one-off composition.
+    Stable named metrics still belong in the catalog as
+    ``Measure(agg="ratio")`` (with their own ``numerator`` /
+    ``denominator``) so every caller picks them up by name.
+
+    ``operands`` are qualified ``"cube.measure"`` refs that the
+    compiler resolves to their existing aggregation (``SUM`` /
+    ``COUNT`` / ``AVG`` / ``COUNT(DISTINCT)`` / etc.). The outer
+    SELECT then composes the named arithmetic operator over those
+    aggregates.
+
+    Op semantics:
+    - ``"ratio"``: exactly two operands; emits
+      ``<num_agg>(num_expr) / NULLIF(<den_agg>(den_expr), 0) AS name``
+      — identical SQL shape to a pre-declared ratio measure.
+    - ``"sum"``: two or more operands; emits
+      ``<a_agg>(a) + <b_agg>(b) + ... AS name``.
+    - ``"diff"``: exactly two operands; emits
+      ``<a_agg>(a) - <b_agg>(b) AS name``.
+
+    Phase A restriction: every operand must resolve to a measure on
+    the same cube. Cross-cube refs raise at compile time with a hint
+    to pre-declare the derivation in the catalog.
+    """
+
+    model_config = ConfigDict(frozen=True)
+    name: str
+    op: InlineDerivedOp
+    operands: list[str]
+
+    @model_validator(mode="after")
+    def _check_arity(self) -> InlineDerived:
+        n = len(self.operands)
+        if self.op == "ratio" and n != 2:
+            raise ValueError(
+                f"InlineDerived({self.name!r}, op='ratio'): requires "
+                f"exactly two operands (numerator, denominator); got {n}."
+            )
+        if self.op == "diff" and n != 2:
+            raise ValueError(
+                f"InlineDerived({self.name!r}, op='diff'): requires "
+                f"exactly two operands (minuend, subtrahend); got {n}."
+            )
+        if self.op == "sum" and n < 2:
+            raise ValueError(
+                f"InlineDerived({self.name!r}, op='sum'): requires at least two operands; got {n}."
+            )
+        return self
+
+
 class SemanticQuery(BaseModel):
     model_config = ConfigDict(frozen=True)
     measures: list[str] = []
@@ -147,6 +206,17 @@ class SemanticQuery(BaseModel):
     offset: Annotated[int, Field(ge=0)] | None = None
     # Row-listing mode (no GROUP BY). Incompatible with `measures`.
     ungrouped: bool = False
+    # Ad-hoc derived measures composed from existing catalog measures
+    # — the exploratory case for ratios / sums / differences that
+    # don't (yet) deserve a catalog entry. See :class:`InlineDerived`.
+    derived_measures: list[InlineDerived] = []
+    # Cube names that should be LEFT joined (rather than INNER joined)
+    # along their declared edge. Pair with ``Filter(dimension=...,
+    # op="is_null")`` to express anti-join / absent-row queries: rows
+    # present in the FROM root but missing in the LEFT-joined cube.
+    # Phase A: the left-joined cube can't be in ``dimensions`` (NULL
+    # group keys are surprising); the compiler raises if it is.
+    left_joins: list[str] = []
 
     @model_validator(mode="after")
     def _check_ungrouped_no_measures(self) -> SemanticQuery:
@@ -206,6 +276,8 @@ __all__ = [
     "CompareWindow",
     "Filter",
     "FilterOp",
+    "InlineDerived",
+    "InlineDerivedOp",
     "SavedQuery",
     "SemanticQuery",
     "TimeWindow",

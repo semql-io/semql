@@ -76,7 +76,7 @@ from semql.model import (
     TimeDimension,
     View,
 )
-from semql.spec import BoolExpr, Filter, SemanticQuery
+from semql.spec import BoolExpr, Filter, InlineDerived, SemanticQuery
 
 MAX_UNGROUPED_ROWS = 1000
 
@@ -308,21 +308,57 @@ def _find_join_path(
     root: str,
     target: str,
     catalog: dict[str, Cube],
-) -> list[Join]:
+    *,
+    bidirectional: bool = False,
+) -> list[tuple[str, Join]]:
+    """BFS for a join path between two cubes.
+
+    Returns a list of ``(next_cube_name, Join)`` pairs — each pair
+    records the cube we land at and the ``Join`` whose ``on`` clause
+    AND-composes into the LEFT JOIN predicate. ``next_cube_name`` is
+    *not always* ``Join.to``: under bidirectional traversal the same
+    edge can be walked in reverse (the spine→facts pattern), in which
+    case ``next_cube_name`` is the source cube of the declared Join.
+    The ``on`` clause is symmetric in alias placeholders, so the
+    direction matters for FROM-clause emission but not for the SQL
+    predicate itself.
+
+    Default is forward-only: only edges declared on ``cube.joins`` get
+    walked, which matches the auto-inferred FK→PK direction the
+    catalog seeds. ``bidirectional=True`` also walks the reverse of
+    every declared edge — needed for spine→facts patterns (anti-join /
+    absent-row queries) where the FK lives on the fact cube but the
+    spine is the FROM root."""
     if root == target:
         return []
     visited: set[str] = {root}
-    queue: list[tuple[str, list[Join]]] = [(root, [])]
+    queue: list[tuple[str, list[tuple[str, Join]]]] = [(root, [])]
     while queue:
         current, path = queue.pop(0)
+        # Forward edges declared on ``current``.
         for j in catalog[current].joins:
             if j.to in visited:
                 continue
-            new_path = path + [j]
+            new_path = path + [(j.to, j)]
             if j.to == target:
                 return new_path
             visited.add(j.to)
             queue.append((j.to, new_path))
+        # Reverse edges: cubes that declare ``Join(to=current, ...)`` —
+        # walked only when bidirectional traversal is explicitly enabled.
+        if bidirectional:
+            for other_name, other_cube in catalog.items():
+                if other_name in visited:
+                    continue
+                for j in other_cube.joins:
+                    if j.to != current:
+                        continue
+                    new_path = path + [(other_name, j)]
+                    if other_name == target:
+                        return new_path
+                    visited.add(other_name)
+                    queue.append((other_name, new_path))
+                    break
     raise JoinPathError(
         f"No join path from cube {root!r} to {target!r}. "
         "Declare a Join in the catalogue or restructure the query.",
@@ -377,6 +413,95 @@ def _resolve_sql(
 # ---------------------------------------------------------------------------
 # Aggregation — measure agg → sqlglot node
 # ---------------------------------------------------------------------------
+
+
+# Percentile aggregation literals → continuous quantile values for the
+# strategy's ``emit_percentile`` hook. ``median`` is the q=0.5 case;
+# the p75 / p90 / p95 covers the long-tail diagnostic shape.
+_PERCENTILE_AGGS: dict[str, float] = {
+    "median": 0.5,
+    "p75": 0.75,
+    "p90": 0.90,
+    "p95": 0.95,
+}
+
+
+def _build_inline_derived_expr(
+    ir: InlineDerived,
+    env: _CompileEnv,
+    already_declared: list[str],
+) -> exp.Expression:
+    """Compose the SELECT expression for one :class:`InlineDerived`.
+
+    Resolves each operand to its catalog measure, runs the measure
+    through ``env.build_measure_expr`` so the measure's own
+    aggregation (``SUM`` / ``COUNT`` / ``AVG`` / ``COUNT(DISTINCT)`` /
+    etc.) wraps it, then combines the aggregates by ``op``:
+
+    - ``ratio``: ``num_agg / NULLIF(den_agg, 0)``.
+    - ``sum``: ``a_agg + b_agg + ...``.
+    - ``diff``: ``a_agg - b_agg``.
+
+    Phase A restriction: every operand must resolve to a measure on
+    the same cube. The first operand's cube is the anchor; subsequent
+    operands referencing a different cube raise.
+    """
+    if ir.name in already_declared:
+        raise CompileError(
+            f"InlineDerived name {ir.name!r} collides with an output "
+            f"column already in the query. Pick a unique name."
+        )
+
+    resolved_operands: list[tuple[Cube, Measure]] = []
+    anchor_cube: Cube | None = None
+    for operand_ref in ir.operands:
+        cube, fld = _resolve_field(operand_ref, env.catalog)
+        if not isinstance(fld, Measure):
+            raise CompileError(
+                f"InlineDerived({ir.name!r}): operand {operand_ref!r} is "
+                f"not a measure on cube {cube.name!r}."
+            )
+        if fld.agg == "ratio":
+            raise CompileError(
+                f"InlineDerived({ir.name!r}): operand {operand_ref!r} is "
+                "itself a ratio measure. Use leaf (sum / count / avg / "
+                "min / max / ...) measures as operands; nested-ratio "
+                "composition is not supported."
+            )
+        if anchor_cube is None:
+            anchor_cube = cube
+        elif cube is not anchor_cube:
+            raise CompileError(
+                f"InlineDerived({ir.name!r}): operand {operand_ref!r} is "
+                f"on cube {cube.name!r}, but earlier operands are on "
+                f"{anchor_cube.name!r}. Phase A requires every operand "
+                "to live on the same cube — pre-declare cross-cube "
+                "derivations in the catalog."
+            )
+        resolved_operands.append((cube, fld))
+
+    nodes = [env.build_measure_expr(cube, m) for cube, m in resolved_operands]
+
+    if ir.op == "ratio":
+        num, den = nodes
+        return exp.Div(
+            this=num,
+            expression=exp.Anonymous(
+                this="NULLIF",
+                expressions=[den, exp.Literal.number(0)],
+            ),
+        )
+    if ir.op == "sum":
+        acc = nodes[0]
+        for n in nodes[1:]:
+            acc = exp.Add(this=acc, expression=n)
+        return acc
+    if ir.op == "diff":
+        left, right = nodes
+        return exp.Sub(this=left, expression=right)
+    raise CompileError(  # pragma: no cover — InlineDerivedOp is closed
+        f"InlineDerived({ir.name!r}): unknown op {ir.op!r}."
+    )
 
 
 def _agg_node(m: Measure, expr_node: exp.Expression) -> exp.Expression:
@@ -814,7 +939,39 @@ class _CompileEnv:
         _check_required_filters(self.touched, q)
 
         self.backend = _pick_single_backend(self.touched)
-        self.cubes_in_from, self.join_edges = _build_join_graph(self.touched, catalog)
+        self.left_join_cubes: set[str] = set(q.left_joins)
+
+        # Anti-join support: cubes named in ``q.left_joins`` get
+        # bidirectional join-graph traversal so spine→facts queries
+        # (FK on the fact side) can reach the fact cube. Validate
+        # each name names a real cube up front; the join-graph BFS
+        # raises later if a name was bogus or unreachable.
+        for name in self.left_join_cubes:
+            if name not in catalog:
+                raise CompileError(
+                    f"left_joins: cube {name!r} is not in the catalog. "
+                    f"Known cubes: {sorted(catalog)}."
+                )
+
+        # Refuse a left-joined cube also appearing in dimensions —
+        # GROUP BY NULL is a confusing silent gotcha for the
+        # anti-join pattern.
+        if self.left_join_cubes:
+            dim_cubes = {c.name for c, _ in resolved.dim_fields}
+            offending = self.left_join_cubes & dim_cubes
+            if offending:
+                raise CompileError(
+                    f"left_joins: cube(s) {sorted(offending)} appear "
+                    "in the query's ``dimensions`` — a LEFT-joined "
+                    "cube's columns are NULL on absent rows, so GROUP "
+                    "BY them gets a confusing NULL bucket. Drop those "
+                    "dimensions and use ``Filter(op='is_null')`` on a "
+                    "left-joined cube's column to express the anti-join."
+                )
+
+        self.cubes_in_from, self.join_edges = _build_join_graph(
+            self.touched, catalog, left_join_cubes=self.left_join_cubes
+        )
         self.root = self.cubes_in_from[0]
 
         self.cube_aliases: dict[str, str] = {c.name: c.alias for c in self.cubes_in_from}
@@ -1005,7 +1162,17 @@ class _CompileEnv:
             inner: exp.Expression = exp.Star()
         else:
             inner = self.parse(m.sql)
-        agg = _agg_node(m, inner)
+
+        # Percentile family routes through the strategy because the
+        # SQL shape varies per dialect (PERCENTILE_CONT WITHIN GROUP
+        # on PG/DuckDB/Snowflake; APPROX_QUANTILES[OFFSET] on BigQuery;
+        # quantile(q)(expr) on ClickHouse). Plain aggs use the
+        # dialect-agnostic exp.Sum / Count / etc. nodes via _agg_node.
+        if m.agg in _PERCENTILE_AGGS:
+            q_val = _PERCENTILE_AGGS[m.agg]
+            agg: exp.Expression = self.strategy.emit_percentile(q_val, inner)
+        else:
+            agg = _agg_node(m, inner)
         if m.filter:
             agg = exp.Filter(
                 this=agg,
@@ -1176,6 +1343,59 @@ class _CompileEnv:
         return _emit_simple_query(self)
 
 
+# Synthetic compare-mode output refs: ``compare.<measure>.<facet>``
+# where ``facet`` is one of ``current`` / ``prior`` / ``delta`` /
+# ``pct_change``. Rewrites to the existing ``<col>_<facet>`` outer
+# column. Lets ``order`` / ``having`` reference compare-mode
+# derivatives without the caller having to know the column-aliasing
+# convention. F3 in the gap analysis.
+_COMPARE_FACETS: tuple[str, ...] = ("current", "prior", "delta", "pct_change")
+
+
+def _resolve_compare_outer_ref(
+    ref: str,
+    outer_columns: list[str],
+    measure_col_names: list[str],
+    *,
+    what: str,
+) -> str:
+    """Translate a compare-mode ``order`` / ``having`` reference into an
+    actual outer-SELECT column name.
+
+    Accepts two shapes:
+    - The raw underscore alias (``revenue_delta``) — must be in
+      ``outer_columns``.
+    - The synthetic ``compare.<measure>.<facet>`` form — rewritten to
+      ``<measure>_<facet>`` after validating ``<measure>`` is a measure
+      in the query and ``<facet>`` is one of the four supported
+      derivatives.
+
+    Raises ``CompileError`` for any other shape so callers don't
+    accidentally smuggle a raw inner-CTE column ref through to the
+    outer SELECT."""
+    if ref in outer_columns:
+        return ref
+    if ref.startswith("compare.") and ref.count(".") == 2:
+        _, measure_name, facet = ref.split(".", 2)
+        if facet not in _COMPARE_FACETS:
+            raise CompileError(
+                f"{what} {ref!r}: unknown compare facet {facet!r}. "
+                f"Supported: {', '.join(_COMPARE_FACETS)}."
+            )
+        if measure_name not in measure_col_names:
+            raise CompileError(
+                f"{what} {ref!r}: measure {measure_name!r} is not in this "
+                f"query's measures. Add it to ``measures`` or pick from "
+                f"{measure_col_names}."
+            )
+        return f"{measure_name}_{facet}"
+    raise CompileError(
+        f"{what} {ref!r}: in compare mode, references must be an outer "
+        f"output column (e.g. {measure_col_names[0]}_delta) or the "
+        f"synthetic compare.<measure>.<facet> form. Got {ref!r}."
+    )
+
+
 def _emit_compare_query(env: _CompileEnv) -> Compiled:
     """Compose the current/prior FULL OUTER JOIN compare-mode output.
 
@@ -1317,15 +1537,19 @@ def _emit_compare_query(env: _CompileEnv) -> Compiled:
         )
 
     for ref, direction in q.order:
-        if ref in outer_columns:
-            order_target_node: exp.Expression = exp.column(ref)
-        else:
-            raise CompileError(
-                f"ORDER BY {ref!r}: in compare mode, only the outer "
-                f"output column names are addressable "
-                f"(e.g. {measure_col_names[0]}_delta). Got {ref!r}."
-            )
-        outer = outer.order_by(exp.Ordered(this=order_target_node, desc=(direction == "desc")))
+        col = _resolve_compare_outer_ref(ref, outer_columns, measure_col_names, what="ORDER BY")
+        outer = outer.order_by(exp.Ordered(this=exp.column(col), desc=(direction == "desc")))
+
+    # HAVING — compare mode supports it against any outer column,
+    # including the synthetic ``compare.<measure>.delta`` form. Most
+    # dialects accept ``HAVING`` without ``GROUP BY`` as a top-level
+    # row filter; the FULL OUTER JOIN's COALESCE'd-dim row identity
+    # makes that exactly the right shape.
+    for hf in q.having:
+        col = _resolve_compare_outer_ref(
+            hf.dimension, outer_columns, measure_col_names, what="HAVING"
+        )
+        outer = outer.having(_filter_node(hf, exp.column(col), "number", env.strategy, env.bind))
 
     if q.limit is not None:
         outer = outer.limit(int(q.limit))
@@ -1393,7 +1617,23 @@ def _emit_simple_query(env: _CompileEnv) -> Compiled:
         if col_name != m.name:
             measure_alias_map[col_name] = agg_node
 
+    # Inline derived measures — ad-hoc ratios / sums / diffs composed
+    # at query time over existing catalog measures. Each gets a fresh
+    # SELECT projection + an alias-map entry so order / having can
+    # address them by the derived measure's ``name``.
+    for ir in q.derived_measures:
+        node = _build_inline_derived_expr(ir, env, columns)
+        select_node = select_node.select(exp.alias_(node, ir.name))
+        columns.append(ir.name)
+        measure_alias_map[ir.name] = node
+
     for hf in q.having:
+        if hf.dimension.startswith("compare."):
+            raise CompileError(
+                f"HAVING {hf.dimension!r}: ``compare.<measure>.<facet>`` "
+                "references are only valid when the query sets "
+                "``compare=CompareWindow(...)``."
+            )
         lookup_name = hf.dimension
         if lookup_name not in measure_alias_map and "." in lookup_name:
             lookup_name = lookup_name.rsplit(".", 1)[-1]
@@ -1475,6 +1715,12 @@ def _emit_simple_query(env: _CompileEnv) -> Compiled:
         select_node = outer
 
     for ref, direction in q.order:
+        if ref.startswith("compare."):
+            raise CompileError(
+                f"ORDER BY {ref!r}: ``compare.<measure>.<facet>`` "
+                "references are only valid when the query sets "
+                "``compare=CompareWindow(...)``."
+            )
         if ref in measure_alias_map or ref in columns:
             order_target: exp.Expression = exp.column(ref)
         else:
@@ -1525,20 +1771,34 @@ def _emit_simple_query(env: _CompileEnv) -> Compiled:
 def _build_join_graph(
     touched: list[Cube],
     catalog: dict[str, Cube],
+    *,
+    left_join_cubes: set[str] | None = None,
 ) -> tuple[list[Cube], list[tuple[Cube, Cube, Join]]]:
     """BFS the catalog's Join edges from the first touched cube to
     every other touched cube. Returns ``(cubes_in_from, join_edges)``
-    in the order the FROM clause + JOINs should be emitted."""
+    in the order the FROM clause + JOINs should be emitted.
+
+    When a target cube is named in ``left_join_cubes``, the BFS walks
+    edges bidirectionally — needed for spine→facts anti-join patterns
+    where the FK lives on the fact cube but the FROM root is the
+    spine. All other targets stay forward-only so normal queries can't
+    accidentally find a surprising reverse path."""
+    left_set: set[str] = left_join_cubes or set()
     root = touched[0]
     join_edges: list[tuple[Cube, Cube, Join]] = []
     cubes_in_from: list[Cube] = [root]
     for c in touched:
         if c is root:
             continue
-        path = _find_join_path(root.name, c.name, catalog)
+        path = _find_join_path(
+            root.name,
+            c.name,
+            catalog,
+            bidirectional=c.name in left_set,
+        )
         cursor = root
-        for j in path:
-            tgt = catalog[j.to]
+        for next_name, j in path:
+            tgt = catalog[next_name]
             if tgt not in cubes_in_from:
                 join_edges.append((cursor, tgt, j))
                 cubes_in_from.append(tgt)

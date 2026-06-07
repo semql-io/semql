@@ -60,6 +60,15 @@ class BackendStrategy(Protocol):
 
     def placeholder(self, name: str, dim_type: str) -> exp.Placeholder: ...
     def trunc(self, granularity: str, expr: exp.Expression) -> exp.Expression: ...
+    def emit_percentile(self, q: float, expr: exp.Expression) -> exp.Expression:
+        """Continuous percentile of ``expr`` at quantile ``q`` (0..1).
+
+        Dialect-specific because the ANSI ``PERCENTILE_CONT(q) WITHIN
+        GROUP (ORDER BY expr)`` shape isn't universal — ClickHouse uses
+        ``quantile(q)(expr)`` and BigQuery uses
+        ``APPROX_QUANTILES(expr, 100)[OFFSET(p)]``."""
+        ...
+
     def emit_contains(
         self, field: exp.Expression, value: str, bind: ParamBinder
     ) -> exp.Expression: ...
@@ -173,6 +182,15 @@ class _StdSqlStrategy:
             expressions=[exp.Literal.string(granularity), expr],
         )
 
+    def emit_percentile(self, q: float, expr: exp.Expression) -> exp.Expression:
+        """``PERCENTILE_CONT(q) WITHIN GROUP (ORDER BY expr)`` — ANSI
+        form, works as-is on Postgres / DuckDB / Snowflake. BigQuery
+        and ClickHouse override this with their own quantile shapes."""
+        return exp.WithinGroup(
+            this=exp.Anonymous(this="PERCENTILE_CONT", expressions=[exp.Literal.number(q)]),
+            expression=exp.Order(expressions=[exp.Ordered(this=expr)]),
+        )
+
     def emit_contains(self, field: exp.Expression, value: str, bind: ParamBinder) -> exp.Expression:
         ph = bind(f"%{value}%", "string")
         return exp.ILike(this=field, expression=ph)
@@ -235,6 +253,22 @@ class BigQueryStrategy(_StdSqlStrategy):
     emit, so case-insensitive contains still works against a column."""
 
     backend = Backend.BIGQUERY
+
+    def emit_percentile(self, q: float, expr: exp.Expression) -> exp.Expression:
+        # BigQuery has no ``PERCENTILE_CONT``. ``APPROX_QUANTILES(expr, 100)``
+        # returns an ordered array of 101 quantile boundaries; ``[OFFSET(p)]``
+        # picks the q-th. Approximate but cheap; documented as such in
+        # ``AggLiteral``'s docstring so callers know the BigQuery branch is
+        # an approximation.
+        offset = int(round(q * 100))
+        quantiles = exp.Anonymous(
+            this="APPROX_QUANTILES",
+            expressions=[expr, exp.Literal.number(100)],
+        )
+        return exp.Bracket(
+            this=quantiles,
+            expressions=[exp.Anonymous(this="OFFSET", expressions=[exp.Literal.number(offset)])],
+        )
 
     def emit_time_spine(
         self,
@@ -339,6 +373,17 @@ class ClickHouseStrategy:
         # form. The emitted SQL preserves the ClickHouse-idiomatic name.
         return exp.Anonymous(this=_CH_TRUNC[granularity], expressions=[expr])
 
+    def emit_percentile(self, q: float, expr: exp.Expression) -> exp.Expression:
+        # ClickHouse's ``quantile(q)(expr)`` is the curried form — the
+        # quantile parameter applies to the function itself, and the
+        # column expression is the only positional argument. sqlglot has
+        # no native node for parametric functions; emit via Anonymous
+        # so the ClickHouse-idiomatic shape survives unmolested.
+        return exp.Anonymous(
+            this=f"quantile({q})",
+            expressions=[expr],
+        )
+
     def emit_contains(self, field: exp.Expression, value: str, bind: ParamBinder) -> exp.Expression:
         ph = bind(value, "string")
         pos = exp.Anonymous(this="positionCaseInsensitive", expressions=[field, ph])
@@ -400,6 +445,16 @@ class MetaStrategy:
         return exp.Anonymous(
             this="date_trunc",
             expressions=[exp.Literal.string(granularity), expr],
+        )
+
+    def emit_percentile(self, q: float, expr: exp.Expression) -> exp.Expression:
+        # META cubes are caller-constructed VALUES tables and don't
+        # carry numeric measures in practice — but satisfy the protocol
+        # with the ANSI shape so a percentile measure on a META cube
+        # doesn't crash the strategy lookup.
+        return exp.WithinGroup(
+            this=exp.Anonymous(this="PERCENTILE_CONT", expressions=[exp.Literal.number(q)]),
+            expression=exp.Order(expressions=[exp.Ordered(this=expr)]),
         )
 
     def emit_contains(self, field: exp.Expression, value: str, bind: ParamBinder) -> exp.Expression:

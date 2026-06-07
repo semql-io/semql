@@ -280,3 +280,87 @@ def test_compare_with_granularity_includes_time_column() -> None:
     out = _cat().compile(q)
     assert "created_at_day" in out.columns
     assert "revenue_current" in out.columns
+
+
+# ---------------------------------------------------------------------------
+# F3 — synthetic ``compare.<measure>.<facet>`` refs in order / having
+# ---------------------------------------------------------------------------
+
+
+def test_compare_order_by_synthetic_delta_ref() -> None:
+    """``compare.revenue.delta`` is the readable form that rewrites to
+    the ``revenue_delta`` outer column."""
+    q = _basic_compare_query().model_copy(update={"order": [("compare.revenue.delta", "desc")]})
+    out = _cat().compile(q)
+    assert "ORDER BY" in out.sql.upper()
+    assert "revenue_delta" in out.sql
+
+
+def test_compare_order_by_synthetic_pct_change_ref() -> None:
+    q = _basic_compare_query().model_copy(update={"order": [("compare.revenue.pct_change", "asc")]})
+    out = _cat().compile(q)
+    assert "revenue_pct_change" in out.sql
+
+
+def test_compare_order_by_synthetic_current_and_prior_refs() -> None:
+    """The synthetic form covers all four compare-derived columns,
+    not just delta."""
+    q = _basic_compare_query().model_copy(
+        update={
+            "order": [
+                ("compare.revenue.current", "desc"),
+                ("compare.revenue.prior", "asc"),
+            ]
+        }
+    )
+    out = _cat().compile(q)
+    assert "revenue_current" in out.sql
+    assert "revenue_prior" in out.sql
+
+
+def test_compare_having_synthetic_delta_ref() -> None:
+    """HAVING now works in compare mode against the synthetic
+    delta column — the high-leverage "show me improvers > N" case."""
+    q = _basic_compare_query().model_copy(
+        update={"having": [Filter(dimension="compare.revenue.delta", op="gt", values=[100])]}
+    )
+    out = _cat().compile(q)
+    assert "HAVING" in out.sql.upper()
+    assert "revenue_delta" in out.sql
+
+
+def test_compare_synthetic_ref_unknown_measure_rejected() -> None:
+    """``compare.<X>.delta`` where X is not in the query's measures
+    raises with a pointer at the actual measure list."""
+    q = _basic_compare_query().model_copy(update={"order": [("compare.nonexistent.delta", "desc")]})
+    with pytest.raises(CompileError, match=r"(?i)not in this query's measures"):
+        _cat().compile(q)
+
+
+def test_compare_synthetic_ref_unknown_facet_rejected() -> None:
+    """``compare.X.<facet>`` where facet isn't current/prior/delta/pct_change."""
+    q = _basic_compare_query().model_copy(update={"order": [("compare.revenue.banana", "desc")]})
+    with pytest.raises(CompileError, match=r"(?i)unknown compare facet"):
+        _cat().compile(q)
+
+
+def test_compare_synthetic_ref_in_order_without_compare_rejected() -> None:
+    """Using the synthetic form when ``compare`` isn't set surfaces a
+    pointed error rather than the cryptic 'unknown cube compare'."""
+    q = SemanticQuery(
+        measures=["orders.revenue"],
+        dimensions=["orders.region"],
+        order=[("compare.revenue.delta", "desc")],
+    )
+    with pytest.raises(CompileError, match=r"(?i)only valid when.*compare"):
+        _cat().compile(q)
+
+
+def test_compare_synthetic_ref_in_having_without_compare_rejected() -> None:
+    q = SemanticQuery(
+        measures=["orders.revenue"],
+        dimensions=["orders.region"],
+        having=[Filter(dimension="compare.revenue.delta", op="gt", values=[100])],
+    )
+    with pytest.raises(CompileError, match=r"(?i)only valid when.*compare"):
+        _cat().compile(q)

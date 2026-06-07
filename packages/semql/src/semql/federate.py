@@ -1386,6 +1386,12 @@ def _raw_agg_expr(agg: str, col: str, frag_alias: str) -> str:
         return f"MIN({ref})"
     if agg == "max":
         return f"MAX({ref})"
+    # Percentile aggs land at merge in DuckDB dialect — DuckDB ships
+    # ``PERCENTILE_CONT(q) WITHIN GROUP (ORDER BY ...)`` natively.
+    _percentile_q = {"median": 0.5, "p75": 0.75, "p90": 0.90, "p95": 0.95}
+    if agg in _percentile_q:
+        q = _percentile_q[agg]
+        return f"PERCENTILE_CONT({q}) WITHIN GROUP (ORDER BY {ref})"
     raise FederationError(
         f"agg={agg!r} is not implemented in raw_rows merge.",
         reason=f"unimplemented_agg_in_raw_rows:{agg}",
