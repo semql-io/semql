@@ -39,6 +39,16 @@ Structure carries the meaning; `str()` carries the message.
 When a field is unknown, name the closest match.
 Short retry loops serve everyone — human or LLM.
 
+## Reflection
+
+The model is queryable through itself.
+The META cubes (`catalog_cubes`, `catalog_measures`, `catalog_dimensions`)
+expose the catalogue via the same compile path a normal query takes —
+one compiler, one prompt contract, one execution shape.
+
+Reflection is a design choice, not an afterthought. The catalogue
+is data; querying data is what the compiler does.
+
 ## The catalog
 
 Python is the native language for cube definitions.

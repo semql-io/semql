@@ -13,6 +13,28 @@ from pydantic import ValidationError
 from semql.spec import CompareWindow, Filter, SemanticQuery, TimeWindow
 
 # ---------------------------------------------------------------------------
+# Value-object invariants: every spec type is frozen.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("instance", "field"),
+    [
+        (SemanticQuery(), "limit"),
+        (Filter(dimension="x.y", op="eq", values=["z"]), "dimension"),
+        (TimeWindow(dimension="x.t", range=("2026-01-01", "2026-02-01")), "dimension"),
+        (CompareWindow(), "mode"),
+    ],
+)
+def test_spec_types_are_frozen(instance: object, field: str) -> None:
+    """Planner specs cross trust boundaries (HTTP, MCP, queues) — mutation
+    downstream is always a bug. Pin the frozen contract so a future
+    refactor doesn't quietly drop it."""
+    with pytest.raises(ValidationError):
+        setattr(instance, field, "renamed")
+
+
+# ---------------------------------------------------------------------------
 # SemanticQuery._check_ungrouped_no_measures — both branches
 # ---------------------------------------------------------------------------
 

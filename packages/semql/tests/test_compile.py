@@ -714,3 +714,56 @@ def test_decide_unknown_column_gets_humanised_label(catalog: dict[str, Cube]) ->
     time_col: VizColumn = next(c for c in viz.columns if c.is_time)
     assert time_col.name == "created_at_week"
     assert time_col.display_name == "Created At"
+
+
+# ---------------------------------------------------------------------------
+# ORDER BY referencing a non-SELECT cube.field — intentional fallthrough.
+# ---------------------------------------------------------------------------
+
+
+def test_order_by_unprojected_cube_field_emits_resolved_expression(
+    catalog: dict[str, Cube],
+) -> None:
+    """ORDER BY can reference any known ``cube.field``, not just the
+    output columns. SQL allows ordering by an expression you didn't
+    SELECT (when there's no GROUP BY conflict), and that's useful for
+    things like ``ORDER BY orders.created_at DESC`` while selecting
+    only the count. The compiler resolves the reference and emits the
+    SQL expression directly."""
+    q = SemanticQuery(
+        measures=["orders.count"],
+        dimensions=["orders.region"],
+        order=[("orders.amount", "desc")],
+    )
+    out = compile_query(q, catalog, context=CONTEXT)
+    assert "ORDER BY" in out.sql.upper()
+    # Resolved expression, not an output-column alias.
+    assert "o.amount" in out.sql
+
+
+def test_order_by_output_column_alias_still_works(
+    catalog: dict[str, Cube],
+) -> None:
+    """The other branch — ORDER BY references an output column alias —
+    keeps working unchanged."""
+    q = SemanticQuery(
+        measures=["orders.revenue"],
+        dimensions=["orders.region"],
+        order=[("revenue", "desc"), ("region", "asc")],
+    )
+    out = compile_query(q, catalog, context=CONTEXT)
+    # sqlglot's PG renderer may add ``NULLS LAST`` to the DESC clause
+    # — match the structure, not the verbatim string.
+    assert "ORDER BY revenue DESC" in out.sql
+    assert "region ASC" in out.sql
+
+
+def test_order_by_unknown_cube_field_rejected(catalog: dict[str, Cube]) -> None:
+    """An unknown identifier still raises — the fallthrough goes
+    through the resolver, which surfaces a precise error."""
+    q = SemanticQuery(
+        measures=["orders.count"],
+        order=[("orders.no_such_field", "asc")],
+    )
+    with pytest.raises(CompileError, match=r"(?i)order by"):
+        compile_query(q, catalog, context=CONTEXT)

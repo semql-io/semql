@@ -11,7 +11,7 @@ import uuid as _uuid
 from datetime import datetime
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 FilterOp = Literal[
     "eq",
@@ -29,12 +29,14 @@ FilterOp = Literal[
 
 
 class TimeWindow(BaseModel):
+    model_config = ConfigDict(frozen=True)
     dimension: str
     granularity: Literal["hour", "day", "week", "month"] | None = None
     range: tuple[str, str]
 
 
 class Filter(BaseModel):
+    model_config = ConfigDict(frozen=True)
     dimension: str
     op: FilterOp
     values: list[str | int | float | bool] = []
@@ -90,14 +92,15 @@ class Filter(BaseModel):
 
 class CompareWindow(BaseModel):
     """`previous_period` derives the prior window from the TimeWindow's
-    range (same duration, immediately prior). `explicit` requires `range`.
-    Compare windows are not yet implemented in the compiler."""
+    range (same duration, immediately prior). `explicit` requires `range`."""
 
+    model_config = ConfigDict(frozen=True)
     mode: Literal["previous_period", "explicit"] = "previous_period"
     range: tuple[str, str] | None = None
 
 
 class SemanticQuery(BaseModel):
+    model_config = ConfigDict(frozen=True)
     measures: list[str] = []
     dimensions: list[str] = []
     time_dimension: TimeWindow | None = None
