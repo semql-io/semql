@@ -198,7 +198,10 @@ def test_strategy_for_accepts_overrides() -> None:
     assert result is fake
 
 
-def test_strategy_for_duckdb_uses_postgres_default() -> None:
-    """The TODO notes this is an open question; pin the current behavior
-    so a future revisit shows up as a test diff, not a silent change."""
-    assert isinstance(strategy_for(Backend.DUCKDB), PostgresStrategy)
+def test_strategy_for_duckdb_uses_dedicated_strategy() -> None:
+    """DuckDB has its own strategy (``$name`` placeholders) — the
+    Postgres-aliased default was a stopgap until the dedicated class
+    landed."""
+    from semql.backend import DuckDBStrategy
+
+    assert isinstance(strategy_for(Backend.DUCKDB), DuckDBStrategy)

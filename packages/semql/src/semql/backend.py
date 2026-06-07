@@ -101,20 +101,22 @@ def _meta_subquery(cube: Cube, catalog: dict[str, Cube]) -> exp.Subquery:
     return sub
 
 
-class PostgresStrategy:
-    """Postgres / DuckDB convention. Placeholders use ``%(name)s``;
-    truncation emits ``date_trunc('<gran>', expr)``; ``contains`` bakes
-    ``%v%`` into the bound value and emits ``ILIKE``."""
+class _StdSqlStrategy:
+    """Shared base for backends whose dialect is handled correctly by
+    sqlglot's stock renderer — Postgres, DuckDB, BigQuery, Snowflake.
 
-    backend = Backend.POSTGRES
+    ``date_trunc`` goes through ``exp.Anonymous`` to keep the lowercase
+    name verbatim. ``ILIKE`` AST gets transpiled per dialect on emit
+    (BigQuery rewrites to ``LOWER(...) LIKE LOWER(...)``; PG / SF / DuckDB
+    keep ``ILIKE`` natively). ``%v%`` always bakes into the bound value —
+    the ``LIKE`` semantics survive the BigQuery transpile."""
+
+    backend: Backend  # set by subclass
 
     def placeholder(self, name: str, dim_type: str) -> exp.Placeholder:
-        return placeholder_for(name, dim_type, Backend.POSTGRES)
+        return placeholder_for(name, dim_type, self.backend)
 
     def trunc(self, granularity: str, expr: exp.Expression) -> exp.Expression:
-        # ``exp.Anonymous`` bypasses sqlglot's DATE_TRUNC normalisation so
-        # the emitted SQL stays as lowercase ``date_trunc`` — matches the
-        # existing assertion contract and what production code consumes.
         return exp.Anonymous(
             this="date_trunc",
             expressions=[exp.Literal.string(granularity), expr],
@@ -131,6 +133,36 @@ class PostgresStrategy:
         resolve_sql: SqlResolver,
     ) -> exp.Expression:
         return _aliased_table(cube, resolve_sql)
+
+
+class PostgresStrategy(_StdSqlStrategy):
+    """Postgres convention. Placeholders render as ``%(name)s``."""
+
+    backend = Backend.POSTGRES
+
+
+class DuckDBStrategy(_StdSqlStrategy):
+    """DuckDB convention. Placeholders render as ``$name`` (the canonical
+    DuckDB named-parameter syntax). Otherwise identical to Postgres —
+    DuckDB shares ``ILIKE``, ``date_trunc``, and the aliased-table FROM
+    shape."""
+
+    backend = Backend.DUCKDB
+
+
+class BigQueryStrategy(_StdSqlStrategy):
+    """BigQuery convention. Placeholders render as ``@name``. sqlglot
+    transpiles the ``ILIKE`` AST to ``LOWER(...) LIKE LOWER(...)`` on
+    emit, so case-insensitive contains still works against a column."""
+
+    backend = Backend.BIGQUERY
+
+
+class SnowflakeStrategy(_StdSqlStrategy):
+    """Snowflake convention. Placeholders render as ``:name``. ``ILIKE``
+    and ``date_trunc`` are native to Snowflake — no transpilation needed."""
+
+    backend = Backend.SNOWFLAKE
 
 
 class ClickHouseStrategy:
@@ -202,9 +234,9 @@ _DEFAULTS: dict[Backend, BackendStrategy] = {
     Backend.POSTGRES: PostgresStrategy(),
     Backend.CLICKHOUSE: ClickHouseStrategy(),
     Backend.META: MetaStrategy(),
-    # DuckDB shares the Postgres placeholder convention; revisit if/when
-    # we add a dedicated DuckDB strategy (current behaviour preserved).
-    Backend.DUCKDB: PostgresStrategy(),
+    Backend.DUCKDB: DuckDBStrategy(),
+    Backend.BIGQUERY: BigQueryStrategy(),
+    Backend.SNOWFLAKE: SnowflakeStrategy(),
 }
 
 
@@ -246,10 +278,13 @@ def render(node: exp.Expression, backend: Backend) -> str:
 
 __all__ = [
     "BackendStrategy",
+    "BigQueryStrategy",
     "ClickHouseStrategy",
+    "DuckDBStrategy",
     "MetaStrategy",
     "ParamBinder",
     "PostgresStrategy",
+    "SnowflakeStrategy",
     "SqlResolver",
     "render",
     "strategy_for",
