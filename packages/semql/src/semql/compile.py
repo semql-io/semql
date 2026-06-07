@@ -1018,9 +1018,27 @@ class _CompileEnv:
 
         Filter values bind via ``self.bind`` so they dedupe across the
         current / prior compare-mode CTEs; only the per-CTE time-window
-        binds differ."""
-        q = self.q
+        binds differ.
+
+        Orchestrates four named stages so each emission concern is a
+        named method a reader can navigate to: FROM clause →
+        projection → WHERE predicates → GROUP BY."""
         sel = exp.Select()
+        sel = self._from_clause_stage(sel)
+        sel = self._projection_stage(sel)
+        sel = self._predicate_stage(sel, time_range)
+        sel = self._group_by_stage(sel)
+        return sel
+
+    # ------------------------------------------------------------------
+    # build_inner stages — each takes/returns the in-progress Select so
+    # snapshot tests can pin per-stage IR if it ever earns its keep.
+    # ------------------------------------------------------------------
+
+    def _from_clause_stage(self, sel: exp.Select) -> exp.Select:
+        """Attach the FROM root + LEFT JOINs across the catalog's join
+        graph. Per-cube isolation subqueries (tenancy / security_sql /
+        scope) wrap each source via ``wrap_for_tenancy``."""
         sel = sel.from_(
             self.wrap_for_tenancy(
                 self.root,
@@ -1033,7 +1051,13 @@ class _CompileEnv:
                 tgt, tgt_strategy.emit_source(tgt, self.catalog, self.resolve_in_ctx)
             )
             sel = sel.join(target_source, on=self.parse(j.on), join_type="left")
+        return sel
 
+    def _projection_stage(self, sel: exp.Select) -> exp.Select:
+        """Emit the SELECT list: dimensions, optional bucketed time
+        dimension, measures. Adds DISTINCT for ungrouped row-listing
+        queries with no measures."""
+        q = self.q
         for (_cube, dim), col_name in zip(self.dim_fields, self.dim_col_names, strict=True):
             sel = sel.select(exp.alias_(self.parse(dim.sql), col_name))
 
@@ -1052,21 +1076,22 @@ class _CompileEnv:
 
         if not q.ungrouped and not self.measure_fields:
             sel.set("distinct", exp.Distinct())
+        return sel
 
+    def _predicate_stage(self, sel: exp.Select, time_range: tuple[str, str]) -> exp.Select:
+        """AND-compose every WHERE-clause source: per-cube
+        ``base_predicate`` (excluding META cubes), flat ``filters``,
+        named segments, the boolean ``where`` tree, and the
+        time-window range bounds."""
+        q = self.q
         where_terms: list[exp.Expression] = []
+
         for cube_w in self.cubes_in_from:
             if cube_w.base_predicate and cube_w.backend is not Backend.META:
                 where_terms.append(self.parse(cube_w.base_predicate))
 
         for f, _cube, fld in self.filter_resolutions:
-            fld_node = self.parse(fld.sql)
-            if isinstance(fld, Dimension):
-                fld_type = fld.type
-            elif isinstance(fld, TimeDimension):
-                fld_type = "time"
-            else:
-                fld_type = "string"
-            where_terms.append(_filter_node(f, fld_node, fld_type, self.strategy, self.bind))
+            where_terms.append(self._filter_term(f, fld))
 
         for _seg_cube, segment in self.segment_resolutions:
             where_terms.append(self.parse(segment.sql))
@@ -1075,14 +1100,7 @@ class _CompileEnv:
 
             def _leaf_to_node(leaf: Filter) -> exp.Expression:
                 _cube, fld = self.where_leaf_resolutions[id(leaf)]
-                fld_node = self.parse(fld.sql)
-                if isinstance(fld, Dimension):
-                    fld_type = fld.type
-                elif isinstance(fld, TimeDimension):
-                    fld_type = "time"
-                else:
-                    fld_type = "string"
-                return _filter_node(leaf, fld_node, fld_type, self.strategy, self.bind)
+                return self._filter_term(leaf, fld)
 
             where_terms.append(_compile_where_tree(q.where, _leaf_to_node))
 
@@ -1102,25 +1120,53 @@ class _CompileEnv:
 
         if where_terms:
             sel = sel.where(*where_terms)
+        return sel
 
-        if not q.ungrouped and self.measure_fields:
-            for i, (_cube, dim) in enumerate(self.dim_fields):
-                if self.group_by_alias:
-                    sel = sel.group_by(exp.column(self.dim_col_names[i]))
-                else:
-                    sel = sel.group_by(self.parse(dim.sql))
-            if self.has_time_breakdown:
-                assert self.time_dim is not None and q.time_dimension is not None
-                granularity = q.time_dimension.granularity
-                assert granularity is not None
-                assert self.time_col_name is not None
-                if self.group_by_alias:
-                    sel = sel.group_by(exp.column(self.time_col_name))
-                else:
-                    sel = sel.group_by(
-                        self.strategy.trunc(granularity, self.parse(self.time_dim.sql))
-                    )
+    def _filter_term(
+        self,
+        f: Filter,
+        fld: Dimension | Measure | TimeDimension,
+    ) -> exp.Expression:
+        """Render one flat-filter / where-tree-leaf into a SQL predicate.
 
+        Shared between ``filters`` and ``where`` so both paths use the
+        same field-type lookup convention (Dimension.type wins; time
+        dims bind as ``time``; measures fall back to ``string`` since
+        the compiler doesn't model their value type)."""
+        fld_node = self.parse(fld.sql)
+        if isinstance(fld, Dimension):
+            fld_type = fld.type
+        elif isinstance(fld, TimeDimension):
+            fld_type = "time"
+        else:
+            fld_type = "string"
+        return _filter_node(f, fld_node, fld_type, self.strategy, self.bind)
+
+    def _group_by_stage(self, sel: exp.Select) -> exp.Select:
+        """Emit GROUP BY when the query has measures and isn't
+        ``ungrouped``. Groups by every projected dimension; the bucket
+        column when a time breakdown is in play. ``group_by_alias``
+        controls whether GROUP BY references the SELECT alias or
+        repeats the resolved expression."""
+        q = self.q
+        if q.ungrouped or not self.measure_fields:
+            return sel
+
+        for i, (_cube, dim) in enumerate(self.dim_fields):
+            if self.group_by_alias:
+                sel = sel.group_by(exp.column(self.dim_col_names[i]))
+            else:
+                sel = sel.group_by(self.parse(dim.sql))
+
+        if self.has_time_breakdown:
+            assert self.time_dim is not None and q.time_dimension is not None
+            granularity = q.time_dimension.granularity
+            assert granularity is not None
+            assert self.time_col_name is not None
+            if self.group_by_alias:
+                sel = sel.group_by(exp.column(self.time_col_name))
+            else:
+                sel = sel.group_by(self.strategy.trunc(granularity, self.parse(self.time_dim.sql)))
         return sel
 
     def emit(self) -> Compiled:
