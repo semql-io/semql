@@ -120,6 +120,20 @@ class PhaseDeferredError(CompileError):
         self.feature = feature
 
 
+class FederationError(CompileError):
+    """Raised when a cross-source query asks for something the v1
+    federated compiler can't honour: a compound or expression join key,
+    a Filter referencing multiple backends, a non-distributive
+    aggregation (``count_distinct`` / ``min`` / ``max`` / ``ratio``),
+    ``compare`` mode, or a boolean ``where`` tree. The in-process
+    executor (``semql_engine.Engine``) can stream raw rows and handle
+    most of these — sans-io callers can't, so we refuse early."""
+
+    def __init__(self, message: str, *, reason: str) -> None:
+        super().__init__(message)
+        self.reason = reason
+
+
 def closest_match(
     name: str,
     candidates: Iterable[str],
@@ -138,6 +152,7 @@ def closest_match(
 __all__ = [
     "CompileError",
     "CrossBackendError",
+    "FederationError",
     "FilterTypeError",
     "JoinPathError",
     "PhaseDeferredError",

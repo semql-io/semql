@@ -11,6 +11,7 @@ resolution-markers = [
 [manifest]
 members = [
     "semql",
+    "semql-engine",
     "semql-erd",
     "semql-mcp",
     "semql-validate-db",
@@ -2027,6 +2028,21 @@ dependencies = [
 requires-dist = [
     { name = "pydantic", specifier = ">=2.13.4" },
     { name = "sqlglot", specifier = ">=30.9.0" },
+]
+
+[[package]]
+name = "semql-engine"
+version = "0.1.0"
+source = { editable = "packages/semql-engine" }
+dependencies = [
+    { name = "duckdb" },
+    { name = "semql" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "duckdb", specifier = ">=1.5.3" },
+    { name = "semql", editable = "packages/semql" },
 ]
 
 [[package]]

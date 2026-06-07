@@ -1,0 +1,38 @@
+[project]
+name = "semql-engine"
+version = "0.1.0"
+description = "In-process executor for semql FederatedPlans — runs per-backend fragments via caller-supplied adapters and merges results in DuckDB."
+readme = "README.md"
+license = "BSD-3-Clause"
+license-files = ["LICENSE"]
+authors = [
+    { name = "Nikhil Pallamreddy", email = "nikhil.pallamreddy+git@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "duckdb>=1.5.3",
+    "semql>=0.1.0,<0.2",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Database",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
+]
+
+[project.urls]
+Homepage = "https://github.com/npalladium/semql"
+Repository = "https://github.com/npalladium/semql"
+Issues = "https://github.com/npalladium/semql/issues"
+
+[build-system]
+requires = ["uv_build>=0.11.19,<0.12.0"]
+build-backend = "uv_build"
+
+[tool.uv.sources]
+semql = { workspace = true, editable = true }

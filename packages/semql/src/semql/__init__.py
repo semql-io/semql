@@ -10,11 +10,12 @@ prompt rendering, etc.).
 from __future__ import annotations
 
 from semql.catalog import Catalog
-from semql.compile import MAX_UNGROUPED_ROWS, Compiled, compile_query
+from semql.compile import MAX_UNGROUPED_ROWS, ColumnMeta, Compiled, compile_query
 from semql.docs import render_catalog_markdown
 from semql.errors import (
     CompileError,
     CrossBackendError,
+    FederationError,
     FilterTypeError,
     JoinPathError,
     PhaseDeferredError,
@@ -23,6 +24,7 @@ from semql.errors import (
     SemQLError,
     UnknownIdentifierError,
 )
+from semql.federate import FederatedPlan, MergePlan, compile_federated_query
 from semql.introspect import (
     CATALOG_CUBES,
     CATALOG_DIMENSIONS,
@@ -80,6 +82,13 @@ from semql.spec import (
     SemanticQuery,
     TimeWindow,
 )
+from semql.units import (
+    DEFAULT_REGISTRY,
+    IncompatibleUnits,
+    Registry,
+    UnitError,
+    UnknownUnit,
+)
 from semql.validate import ValidationError, validate
 from semql.visualize import VizColumn, VizDecision, decide_visualization
 
@@ -94,23 +103,29 @@ __all__ = [
     "CATALOG_MEASURES",
     "Catalog",
     "ChartTypeLiteral",
+    "ColumnMeta",
     "CompareWindow",
     "CompileError",
     "Compiled",
     "CrossBackendError",
     "Cube",
     "DimTypeLiteral",
+    "DEFAULT_REGISTRY",
     "Dimension",
     "DrilldownSuggestion",
     "DrilldownSuggestions",
+    "FederatedPlan",
+    "FederationError",
     "Filter",
     "FilterOp",
     "FilterTypeError",
     "FormatLiteral",
+    "IncompatibleUnits",
     "GranularityLiteral",
     "Join",
     "JoinPathError",
     "MAX_UNGROUPED_ROWS",
+    "MergePlan",
     "META_CUBES",
     "Measure",
     "PhaseDeferredError",
@@ -119,6 +134,7 @@ __all__ = [
     "QueryIntent",
     "QueryPlan",
     "QueryStep",
+    "Registry",
     "ResolveError",
     "ResolvedQuery",
     "RouterDecision",
@@ -129,7 +145,9 @@ __all__ = [
     "SemanticQuery",
     "TimeDimension",
     "TimeWindow",
+    "UnitError",
     "UnknownIdentifierError",
+    "UnknownUnit",
     "ValidationError",
     "View",
     "VizColumn",
@@ -139,6 +157,7 @@ __all__ = [
     "build_presenter_prompt_fragment",
     "build_query_generator_prompt_fragment",
     "build_router_prompt_fragment",
+    "compile_federated_query",
     "compile_query",
     "decide_visualization",
     "is_safe_select",
