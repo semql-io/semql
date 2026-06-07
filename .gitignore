@@ -10,3 +10,5 @@ build/
 .mypy_cache/
 TODOS.org
 docs/notes/
+docs/api/
+.hypothesis/
