@@ -15,6 +15,14 @@ test *args:
 
 check: fmt lint typecheck test
 
+# Mutation testing on semql core. Results saved to .mutmut-cache.
+# Show a summary with `just mutmut-results` after a run completes.
+mutmut:
+    uv run mutmut run
+
+mutmut-results:
+    uv run mutmut results
+
 hooks:
     uv run pre-commit install
 

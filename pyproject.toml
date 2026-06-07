@@ -7,11 +7,13 @@ dev = [
     "griffe>=2.0.2",
     "hypothesis>=6.155.2",
     "mimesis>=19.1.0",
+    "mutmut>=3.6.0",
     "mypy>=2.1.0",
     "pointblank>=0.24.0",
     "pre-commit>=4.6.0",
     "pyright>=1.1.410",
     "pytest>=9.0.3",
+    "pytest-cov>=7.1.0",
     "ruff>=0.15.16",
     "syrupy>=5.3.1",
     "twine>=6.2.0",
@@ -36,5 +38,19 @@ venvPath = "."
 venv = ".venv"
 
 [tool.pytest.ini_options]
-addopts = "-q"
+addopts = "-q --cov=semql --cov-report=term-missing"
 testpaths = ["packages"]
+
+[tool.coverage.run]
+source = ["semql"]
+omit = ["*/tests/*", "*/conftest.py"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false
+fail_under = 0
+
+[tool.mutmut]
+source_paths = ["packages/semql/src/semql/"]
+pytest_add_cli_args_test_selection = ["packages/semql/tests/"]
+pytest_add_cli_args = ["-x", "-q", "--no-cov"]
