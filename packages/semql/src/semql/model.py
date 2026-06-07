@@ -69,6 +69,12 @@ class Measure(BaseModel):
     description: str = ""
     display_name: str | None = None
     format: FormatLiteral | None = None
+    # When True, summing this measure across a coarser time grain
+    # yields a wrong answer (the canonical case is ``count_distinct``).
+    # The flag is declarative for now — surfaced in the prompt fragment
+    # so the planner LLM doesn't naively ask for rollups; compiler
+    # refusal lands with the rollup work.
+    non_additive: bool = False
     metadata: Metadata = Field(default_factory=dict)
 
 

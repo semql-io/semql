@@ -62,7 +62,8 @@ def _render_cube(cube: Cube) -> list[str]:
             unit = f" [{m.unit}]" if m.unit else ""
             desc = f" — {m.description}" if m.description else ""
             human = _human(m.display_name)
-            out.append(f"  - `{cube.name}.{m.name}`{unit} `agg={m.agg}`{human}{desc}")
+            flags = " `non-additive`" if m.non_additive else ""
+            out.append(f"  - `{cube.name}.{m.name}`{unit} `agg={m.agg}`{flags}{human}{desc}")
 
     if cube.dimensions:
         out.append("")

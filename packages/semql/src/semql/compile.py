@@ -174,7 +174,9 @@ def _agg_node(m: Measure, expr_node: exp.Expression) -> exp.Expression:
     if agg == "count":
         return exp.Count(this=expr_node)
     if agg == "count_distinct":
-        return exp.Count(this=expr_node, distinct=True)
+        # sqlglot's exp.Count(..., distinct=True) is ignored on emit;
+        # COUNT(DISTINCT x) requires wrapping the arg in exp.Distinct.
+        return exp.Count(this=exp.Distinct(expressions=[expr_node]))
     if agg == "avg":
         return exp.Avg(this=expr_node)
     if agg == "min":
