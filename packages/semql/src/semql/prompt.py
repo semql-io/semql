@@ -12,7 +12,10 @@ system prompt alongside role description, data-source context, etc.
 
 from __future__ import annotations
 
-from semql.introspect import PolicyFn, iter_cubes
+import hashlib
+from dataclasses import dataclass
+
+from semql.introspect import PolicyFn, iter_cubes, viewer_sees
 from semql.model import AuthContext, Cube, Lookup, ResolutionContext, View
 
 
@@ -51,6 +54,35 @@ def _render_lookup_line(dim_ref: str, lookup: Lookup, ctx: ResolutionContext | N
     )
 
 
+_CATALOGUE_HEADER = (
+    "Cubes you can query via the semantic layer. Reference fields as "
+    "`cube.field`. The compiler emits SQL — never write SQL on the "
+    "semantic path."
+)
+
+
+def _render_cube_block(
+    cubes: list[Cube],
+    lookups_by_dim: dict[str, Lookup],
+    ctx: ResolutionContext | None,
+    *,
+    header: str,
+    preamble: str,
+) -> str:
+    """Render a list of cubes under a header, with optional preamble.
+
+    Returns ``""`` when ``cubes`` is empty so callers can splice the
+    output without checking. The header is included only when there's
+    at least one cube to render — empty blocks stay invisible."""
+    if not cubes:
+        return ""
+    lines: list[str] = [header, preamble, ""]
+    for cube in cubes:
+        lines.extend(_render_cube(cube, lookups_by_dim, ctx))
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
+
+
 def render_catalogue_block(
     catalog: dict[str, Cube],
     *,
@@ -76,21 +108,149 @@ def render_catalogue_block(
             policy=policy,
         )
     )
-    if not cubes:
-        return ""
-
-    lines: list[str] = ["## SEMANTIC CATALOGUE"]
-    lines.append(
-        "Cubes you can query via the semantic layer. Reference fields as "
-        "`cube.field`. The compiler emits SQL — never write SQL on the "
-        "semantic path."
+    return _render_cube_block(
+        cubes,
+        dict(lookups or {}),
+        ctx,
+        header="## SEMANTIC CATALOGUE",
+        preamble=_CATALOGUE_HEADER,
     )
-    lines.append("")
+
+
+# ---------------------------------------------------------------------------
+# Cacheable two-segment rendering (P6)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class CataloguePrompt:
+    """Two-segment rendering of the catalogue for prompt caching.
+
+    ``static`` is identical for every viewer — only cubes with empty
+    ``required_roles`` appear here. Splice it above your Anthropic /
+    Bedrock prompt-cache breakpoint so cache hits land. ``overlay`` is
+    the per-viewer addition: role-gated cubes the viewer holds a role
+    for, preceded by a short visibility note. Splice below the
+    breakpoint.
+
+    ``joined()`` concatenates both for the non-cached case so a
+    consumer can fall back to a single string when caching isn't
+    available."""
+
+    static: str
+    overlay: str
+
+    def joined(self, *, sep: str = "\n\n") -> str:
+        """Concatenate ``static`` + ``overlay`` with ``sep`` between
+        non-empty segments. Suitable for the non-cached emission path."""
+        return sep.join(s.rstrip() for s in (self.static, self.overlay) if s) + (
+            "\n" if (self.static or self.overlay) else ""
+        )
+
+
+def _is_public(cube: Cube) -> bool:
+    """A cube is *publicly visible* when its ``required_roles`` is empty.
+
+    The cacheable layout uses this to gate the static segment: only
+    cubes that don't depend on viewer roles can sit above the cache
+    breakpoint. ``policy`` is orthogonal — when the catalog has a
+    dynamic policy, callers should review whether that policy is
+    viewer-discriminating before trusting the cacheable layout."""
+    return not cube.required_roles
+
+
+def render_catalogue_segments(
+    catalog: dict[str, Cube],
+    *,
+    only_exposed: bool = True,
+    viewer: AuthContext | None = None,
+    policy: PolicyFn | None = None,
+    lookups: dict[str, Lookup] | None = None,
+    ctx: ResolutionContext | None = None,
+) -> CataloguePrompt:
+    """Split the catalogue into a static + per-viewer overlay rendering.
+
+    Static segment: cubes with empty ``required_roles`` (publicly
+    visible). Stable across viewer changes — cache it.
+
+    Overlay segment: cubes the viewer is authorised to see that are
+    *not* in the static set (role-gated cubes the viewer holds a role
+    for). Preceded by a one-line "Cubes visible to you" note so the
+    planner knows which extras showed up.
+
+    The auth invariant — "viewers should not learn names of cubes they
+    cannot access" — is preserved: role-gated cubes only appear when
+    ``viewer_sees`` passes for that viewer, and they live in the
+    overlay segment, never the static one.
+    """
     lookups_by_dim = dict(lookups or {})
-    for cube in cubes:
-        lines.extend(_render_cube(cube, lookups_by_dim, ctx))
-        lines.append("")
-    return "\n".join(lines).rstrip() + "\n"
+    all_cubes = list(
+        iter_cubes(
+            catalog,
+            include_meta=True,
+            only_exposed=only_exposed,
+            viewer=None,  # static segment ignores viewer
+            policy=None,
+        )
+    )
+
+    public_cubes = [c for c in all_cubes if _is_public(c)]
+    static = _render_cube_block(
+        public_cubes,
+        lookups_by_dim,
+        ctx,
+        header="## SEMANTIC CATALOGUE",
+        preamble=_CATALOGUE_HEADER,
+    )
+
+    # Overlay holds the additional cubes this viewer has been authorised
+    # to see beyond the public set. With viewer=None we treat the overlay
+    # as empty — the static segment is the whole prompt.
+    overlay = ""
+    if viewer is not None:
+        overlay_cubes = [
+            c for c in all_cubes if not _is_public(c) and viewer_sees(c, viewer, policy)
+        ]
+        if overlay_cubes:
+            names = ", ".join(f"`{c.name}`" for c in overlay_cubes)
+            overlay = _render_cube_block(
+                overlay_cubes,
+                lookups_by_dim,
+                ctx,
+                header="## CUBES VISIBLE TO YOU",
+                preamble=(
+                    "Role-gated cubes you can access beyond the public "
+                    f"catalogue above: {names}. Reference them the same "
+                    "way (`cube.field`)."
+                ),
+            )
+
+    return CataloguePrompt(static=static, overlay=overlay)
+
+
+def catalogue_prompt_hash(
+    catalog: dict[str, Cube],
+    *,
+    only_exposed: bool = True,
+    lookups: dict[str, Lookup] | None = None,
+    ctx: ResolutionContext | None = None,
+) -> str:
+    """SHA256 hex digest of the static catalogue segment.
+
+    Stable across viewer changes — call this to key your own
+    prompt-fragment cache so a measure rename or new public cube
+    invalidates entries even when the viewer (and overlay) doesn't
+    change. Loader-backed dynamic lookups change the hash when their
+    resolved values change for the given ``ctx``."""
+    segments = render_catalogue_segments(
+        catalog,
+        only_exposed=only_exposed,
+        viewer=None,
+        policy=None,
+        lookups=lookups,
+        ctx=ctx,
+    )
+    return hashlib.sha256(segments.static.encode("utf-8")).hexdigest()
 
 
 def _human(display_name: str | None) -> str:
@@ -318,6 +478,54 @@ def build_planner_prompt_fragment(
     if include_introspection:
         parts.append(_INTROSPECTION)
     return "\n\n".join(parts) + "\n"
+
+
+def build_planner_prompt_segments(
+    catalog: dict[str, Cube],
+    *,
+    only_exposed: bool = True,
+    include_introspection: bool = False,
+    views: dict[str, View] | None = None,
+    viewer: AuthContext | None = None,
+    policy: PolicyFn | None = None,
+    lookups: dict[str, Lookup] | None = None,
+    ctx: ResolutionContext | None = None,
+) -> CataloguePrompt:
+    """Cacheable variant of :func:`build_planner_prompt_fragment`.
+
+    Splits the planner fragment into a static and a per-viewer overlay
+    segment so consumers can route them to two prompt-cache zones
+    (Anthropic ``cache_control: ephemeral`` / Bedrock ``cachePoint``).
+
+    Static = spec contract + public-cube catalogue + views + raw-fallback
+    + optional introspection. Identical across viewers; safe to cache.
+
+    Overlay = role-gated cubes the viewer is authorised to see (plus a
+    short visibility note). Empty when ``viewer is None``.
+
+    Views currently have no per-viewer surface (no ``required_roles``)
+    so they live in the static segment. If view-level auth lands later
+    this contract gains a per-viewer view block in the overlay.
+    """
+    segments = render_catalogue_segments(
+        catalog,
+        only_exposed=only_exposed,
+        viewer=viewer,
+        policy=policy,
+        lookups=lookups,
+        ctx=ctx,
+    )
+
+    static_parts: list[str] = [_SPEC_CONTRACT, segments.static.rstrip()]
+    if views:
+        static_parts.append(_render_view_block(views).rstrip())
+    static_parts.append(_RAW_FALLBACK)
+    if include_introspection:
+        static_parts.append(_INTROSPECTION)
+    static = "\n\n".join(p for p in static_parts if p) + "\n"
+
+    overlay = segments.overlay.rstrip() + "\n" if segments.overlay else ""
+    return CataloguePrompt(static=static, overlay=overlay)
 
 
 _ROUTER_OUTPUT_SCHEMA = """\

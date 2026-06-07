@@ -75,12 +75,16 @@ from semql.plan import (
     RouterPath,
 )
 from semql.prompt import (
+    CataloguePrompt,
     build_drilldown_prompt_fragment,
     build_planner_prompt_fragment,
+    build_planner_prompt_segments,
     build_presenter_prompt_fragment,
     build_query_generator_prompt_fragment,
     build_router_prompt_fragment,
+    catalogue_prompt_hash,
     render_catalogue_block,
+    render_catalogue_segments,
 )
 from semql.safe import is_safe_select
 from semql.spec import (
@@ -111,6 +115,7 @@ __all__ = [
     "CATALOG_DIMENSIONS",
     "CATALOG_MEASURES",
     "Catalog",
+    "CataloguePrompt",
     "ChartTypeLiteral",
     "ColumnMeta",
     "CompareWindow",
@@ -170,9 +175,11 @@ __all__ = [
     "VizDecision",
     "build_drilldown_prompt_fragment",
     "build_planner_prompt_fragment",
+    "build_planner_prompt_segments",
     "build_presenter_prompt_fragment",
     "build_query_generator_prompt_fragment",
     "build_router_prompt_fragment",
+    "catalogue_prompt_hash",
     "compile_federated_query",
     "compile_query",
     "decide_visualization",
@@ -183,6 +190,7 @@ __all__ = [
     "materialize_lookup",
     "render_catalog_markdown",
     "render_catalogue_block",
+    "render_catalogue_segments",
     "resolve_field",
     "resolve_lookup",
     "resolve_query",

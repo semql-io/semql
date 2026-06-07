@@ -36,6 +36,7 @@ _T = TypeVar("_T", bound=BaseField)
 
 if TYPE_CHECKING:
     from semql.compile import Compiled
+    from semql.prompt import CataloguePrompt
     from semql.spec import SemanticQuery
 
 
@@ -352,6 +353,55 @@ class Catalog:
             views=self.views,
             viewer=viewer,
             policy=self._policy,
+            lookups=self.lookups,
+            ctx=ctx,
+        )
+
+    def prompt_segments(
+        self,
+        *,
+        only_exposed: bool = True,
+        include_introspection: bool = False,
+        viewer: AuthContext | None = None,
+        ctx: ResolutionContext | None = None,
+    ) -> CataloguePrompt:
+        """Render the planner prompt as a cacheable two-segment object.
+
+        Splits into a viewer-invariant ``static`` segment (publicly
+        visible cubes + spec contract + raw-fallback) and a per-viewer
+        ``overlay`` (role-gated cubes the viewer can see). Splice the
+        two around your Anthropic / Bedrock prompt-cache breakpoint."""
+        from semql.prompt import build_planner_prompt_segments
+
+        return build_planner_prompt_segments(
+            self._by_name,
+            only_exposed=only_exposed,
+            include_introspection=include_introspection,
+            views=self.views,
+            viewer=viewer,
+            policy=self._policy,
+            lookups=self.lookups,
+            ctx=ctx,
+        )
+
+    def prompt_hash(
+        self,
+        *,
+        only_exposed: bool = True,
+        ctx: ResolutionContext | None = None,
+    ) -> str:
+        """SHA256 hex digest of the static (viewer-invariant) prompt segment.
+
+        Stable across viewer changes — call this to key your own
+        prompt-fragment cache so a catalogue mutation (renamed measure,
+        new public cube, edited lookup) invalidates entries even when
+        the viewer (and overlay) hasn't changed. Loader-backed lookups
+        change the hash when their resolved values change for ``ctx``."""
+        from semql.prompt import catalogue_prompt_hash
+
+        return catalogue_prompt_hash(
+            self._by_name,
+            only_exposed=only_exposed,
             lookups=self.lookups,
             ctx=ctx,
         )
