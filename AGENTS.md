@@ -8,9 +8,10 @@ SemQL itself.
 
 ```
 packages/
-  semql/         # core: model, Cube, Catalog, compile_query, prompt rendering
-  semql-mcp/     # FastMCP-backed MCPServer exposing a Catalog
-  semql-erd/     # graphviz ER-diagram generator for catalogues
+  semql/             # core: model, Cube, Catalog, compile_query, prompt rendering
+  semql-mcp/         # FastMCP-backed MCPServer exposing a Catalog
+  semql-erd/         # graphviz ER-diagram generator for catalogues
+  semql-validate-db/ # pre-deploy drift check (LIMIT 0 probes per cube/join)
 scripts/
   gen_api_docs.py     # griffe → docs/api/*.md
   check_api_break.py  # griffe-driven public-surface diff

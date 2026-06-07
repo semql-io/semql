@@ -76,7 +76,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        package: [semql, semql-mcp, semql-erd]
+        package: [semql, semql-mcp, semql-erd, semql-validate-db]
     steps:
       - uses: actions/checkout@v4
 

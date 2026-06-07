@@ -21,6 +21,7 @@ Organize them in a **catalog**. SemQL handles the rest.
 | `semql` | Core: cube definitions, catalog, SQL generation, prompt rendering |
 | `semql-mcp` | MCP server wrapping a catalog |
 | `semql-erd` | Graphviz ER-diagram generator for catalogues |
+| `semql-validate-db` | Pre-deploy drift check against a live database |
 
 ## Install
 

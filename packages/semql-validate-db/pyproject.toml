@@ -1,0 +1,19 @@
+[project]
+name = "semql-validate-db"
+version = "0.1.0"
+description = "Validate a semql Catalog against a live database — catches missing tables, dropped columns, and broken join predicates before a deploy."
+readme = "README.md"
+authors = [
+    { name = "Nikhil Pallamreddy", email = "nikhil.pallamreddy+git@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "semql",
+]
+
+[build-system]
+requires = ["uv_build>=0.11.19,<0.12.0"]
+build-backend = "uv_build"
+
+[tool.uv.sources]
+semql = { workspace = true, editable = true }
