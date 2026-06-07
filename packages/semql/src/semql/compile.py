@@ -60,7 +60,7 @@ from semql.errors import (
     ResolveError,
     UnknownIdentifierError,
 )
-from semql.model import Backend, Cube, Dimension, Join, Measure, TimeDimension
+from semql.model import Backend, Cube, Dimension, Join, Measure, Segment, TimeDimension
 from semql.spec import Filter, SemanticQuery
 
 MAX_UNGROUPED_ROWS = 1000
@@ -365,6 +365,30 @@ def compile_query(
         if c not in touched:
             touched.append(c)
 
+    # 1c. Resolve segments — reusable named predicates declared on the
+    # cube. ``cube.segment`` syntax matches the rest of the spec; the
+    # predicate's SQL slots into the WHERE clause via ``build_inner``.
+    segment_resolutions: list[tuple[Cube, Segment]] = []
+    for seg_ref in q.segments:
+        if "." not in seg_ref:
+            raise CompileError(
+                f"Segment reference {seg_ref!r} must be qualified as 'cube.segment'."
+            )
+        cube_name, seg_name = seg_ref.rsplit(".", 1)
+        if cube_name not in catalog:
+            raise CompileError(f"Segment reference {seg_ref!r}: unknown cube {cube_name!r}.")
+        cube_obj = catalog[cube_name]
+        match = next((s for s in cube_obj.segments if s.name == seg_name), None)
+        if match is None:
+            known = ", ".join(s.name for s in cube_obj.segments) or "(none)"
+            raise CompileError(
+                f"Segment reference {seg_ref!r}: cube {cube_name!r} has no segment "
+                f"{seg_name!r}. Known segments: {known}."
+            )
+        segment_resolutions.append((cube_obj, match))
+        if cube_obj not in touched:
+            touched.append(cube_obj)
+
     if not touched:
         raise CompileError("Could not determine any cubes from the query.")
 
@@ -568,6 +592,11 @@ def compile_query(
             else:
                 fld_type = "string"
             where_terms.append(_filter_node(f, fld_node, fld_type, strategy, bind))
+
+        # Segment predicates AND-compose with filters. Same resolution
+        # path as ``Join.on`` / ``base_predicate`` SQL fragments.
+        for _seg_cube, segment in segment_resolutions:
+            where_terms.append(parse(segment.sql))
 
         if time_dim is not None:
             where_terms.append(

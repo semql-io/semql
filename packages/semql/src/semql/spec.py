@@ -104,6 +104,9 @@ class SemanticQuery(BaseModel):
     measures: list[str] = []
     dimensions: list[str] = []
     time_dimension: TimeWindow | None = None
+    # Named, pre-defined predicates the planner references by name
+    # (qualified as ``cube.segment``). Compose with ``filters`` via AND.
+    segments: list[str] = []
     filters: list[Filter] = []
     having: list[Filter] = []
     compare: CompareWindow | None = None

@@ -103,6 +103,27 @@ class TimeDimension(BaseModel):
     metadata: Metadata = Field(default_factory=dict)
 
 
+class Segment(BaseModel):
+    """A named, reusable predicate over a cube's rows.
+
+    Segments centralise business definitions ("active customers",
+    "paid orders", "trial-tier accounts") so the planner names the
+    segment instead of re-deriving the predicate. The compiler
+    AND-composes referenced segments into the WHERE clause alongside
+    ``filters``.
+
+    The ``sql`` fragment uses the same ``{alias}`` placeholder
+    convention as dimension / measure SQL — ``{o}.status = 'paid'``
+    resolves to ``o.status = 'paid'`` at compile time."""
+
+    model_config = ConfigDict(frozen=True)
+    name: str
+    sql: str
+    description: str = ""
+    display_name: str | None = None
+    metadata: Metadata = Field(default_factory=dict)
+
+
 class Join(BaseModel):
     """A directed edge from one cube to another.
 
@@ -126,6 +147,10 @@ class Cube(BaseModel):
     dimensions: list[Dimension] = []
     time_dimensions: list[TimeDimension] = []
     joins: list[Join] = []
+    # Named, reusable predicates the planner can reference by name —
+    # centralises business definitions instead of having the LLM
+    # rederive a status / window / role filter every turn.
+    segments: list[Segment] = []
     # Dimensions on this cube that MUST appear in a query's `filters`
     # (any operator, any value) before the compiler will accept the
     # query.
@@ -189,6 +214,7 @@ __all__ = [
     "Join",
     "Measure",
     "Metadata",
+    "Segment",
     "TenancyMode",
     "TimeDimension",
 ]

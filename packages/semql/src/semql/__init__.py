@@ -39,6 +39,7 @@ from semql.model import (
     GranularityLiteral,
     Join,
     Measure,
+    Segment,
     TimeDimension,
 )
 from semql.prompt import (
@@ -85,6 +86,7 @@ __all__ = [
     "PhaseDeferredError",
     "PlaceholderError",
     "ResolveError",
+    "Segment",
     "SemQLError",
     "SemanticQuery",
     "TimeDimension",

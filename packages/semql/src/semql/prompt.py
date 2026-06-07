@@ -82,6 +82,14 @@ def _render_cube(cube: Cube) -> list[str]:
             human = _human(td.display_name)
             out.append(f"  - `{cube.name}.{td.name}` `granularities={grans}`{human}{desc}")
 
+    if cube.segments:
+        out.append("")
+        out.append("**Segments:**")
+        for s in cube.segments:
+            desc = f" — {s.description}" if s.description else ""
+            human = _human(s.display_name)
+            out.append(f"  - `{cube.name}.{s.name}`{human}{desc}")
+
     if cube.joins:
         out.append("")
         out.append("**Joins:**")
