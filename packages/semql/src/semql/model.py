@@ -70,6 +70,20 @@ AggLiteral = Literal[
     "p95",
 ]
 DimTypeLiteral = Literal["string", "number", "time", "bool", "uuid"]
+# Resolved storage type carried on ``ColumnMeta`` so callers (visualisers,
+# tool-schema renderers, downstream tooling) can reason about output
+# columns without re-resolving against the catalog. Distinct from
+# ``DimTypeLiteral`` — adds ``integer`` / ``float`` for measures, where
+# the aggregate determines a tighter type than the raw column.
+StorageType = Literal[
+    "string",
+    "integer",
+    "float",
+    "number",
+    "time",
+    "uuid",
+    "bool",
+]
 GranularityLiteral = Literal["hour", "day", "week", "month"]
 FormatLiteral = Literal["raw", "integer", "percent", "currency", "duration"]
 ChartTypeLiteral = Literal["pie_chart", "bar_chart", "line_chart", "data_table"]
@@ -883,6 +897,7 @@ __all__ = [
     "ScopePredicate",
     "Segment",
     "StabilityLiteral",
+    "StorageType",
     "PhysicalTable",
     "TenancyMode",
     "TimeDimension",

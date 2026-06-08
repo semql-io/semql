@@ -9,7 +9,7 @@ silently-wrong SQL.
 from __future__ import annotations
 
 import pytest
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 from semql.spec import CompareWindow, Filter, SemanticQuery, TimeWindow
 
 # ---------------------------------------------------------------------------
@@ -249,3 +249,70 @@ def test_compare_window_explicit_with_range() -> None:
 def test_compare_window_rejects_unknown_mode() -> None:
     with pytest.raises(ValidationError):
         CompareWindow(mode="rolling")  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# JSON Schema descriptions (S7-R3) — every property the LLM tool-calling
+# layer surfaces must carry a useful description, or the model has to guess
+# what each field means.
+# ---------------------------------------------------------------------------
+
+
+def _missing_descriptions(model_cls: type[BaseModel]) -> list[str]:
+    """Return property names whose JSON Schema entry has no description.
+
+    Walks ``model_json_schema()`` and complains about any property
+    missing a ``description`` key OR carrying an empty string."""
+    schema = model_cls.model_json_schema()
+    properties = schema.get("properties", {})
+    return [
+        name for name, prop in properties.items() if not (prop.get("description") or "").strip()
+    ]
+
+
+@pytest.mark.parametrize(
+    "model_cls",
+    [SemanticQuery, Filter, TimeWindow, CompareWindow],
+)
+def test_spec_schema_property_descriptions_are_set(model_cls: type[BaseModel]) -> None:
+    """Tool-calling frameworks (OpenAI SDK, LangChain, pydantic-ai) hand
+    ``model_json_schema()`` to the LLM verbatim. Missing descriptions
+    force the model to infer field meaning from names alone, which
+    produces malformed filter values."""
+    missing = _missing_descriptions(model_cls)
+    assert not missing, f"{model_cls.__name__} fields without description: {missing}"
+
+
+def test_boolexpr_schema_property_descriptions_are_set() -> None:
+    """BoolExpr is recursive (children include itself), so pydantic
+    emits a $defs entry — walk both top-level and $defs to confirm."""
+    from semql.spec import BoolExpr
+
+    missing = _missing_descriptions(BoolExpr)
+    assert not missing, f"BoolExpr fields without description: {missing}"
+
+
+def test_inline_derived_schema_property_descriptions_are_set() -> None:
+    from semql.spec import InlineDerived
+
+    missing = _missing_descriptions(InlineDerived)
+    assert not missing, f"InlineDerived fields without description: {missing}"
+
+
+def test_spec_schema_descriptions_are_under_120_chars() -> None:
+    """Tool-schema payloads inflate quickly; cap each description so the
+    aggregate stays cache-friendly. 120 chars ≈ one wrapped terminal
+    line — enough for one self-contained sentence, not enough for an
+    essay."""
+    for model_cls in (
+        SemanticQuery,
+        Filter,
+        TimeWindow,
+        CompareWindow,
+    ):
+        props = model_cls.model_json_schema().get("properties", {})
+        for name, prop in props.items():
+            desc = prop.get("description", "")
+            assert len(desc) <= 120, (
+                f"{model_cls.__name__}.{name} description is {len(desc)} chars; cap is 120."
+            )

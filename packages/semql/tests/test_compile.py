@@ -846,3 +846,193 @@ def test_column_meta_compare_mode_marks_pct_change_as_percent(
     # pct_change is dimensionless.
     assert by_name["revenue_pct_change"].format == "percent"
     assert by_name["revenue_pct_change"].unit is None
+
+
+# ---------------------------------------------------------------------------
+# storage_type — tightest resolved type per output column
+# ---------------------------------------------------------------------------
+
+
+def test_column_meta_storage_type_for_dimension(catalog: dict[str, Cube]) -> None:
+    """Dimensions pass their declared ``type`` straight through. Lets a
+    downstream caller (visualiser, MCP server, type-aware UI) know what
+    cell-level rendering each column wants."""
+    q = SemanticQuery(
+        measures=["orders.count"],
+        dimensions=["orders.region", "orders.amount", "orders.is_paid"],
+    )
+    out = compile_query(q, catalog, context=CONTEXT)
+    by_name = {m.name: m for m in out.column_meta}
+    assert by_name["region"].storage_type == "string"
+    assert by_name["amount"].storage_type == "number"
+    assert by_name["is_paid"].storage_type == "bool"
+
+
+def test_column_meta_storage_type_for_measure_count(catalog: dict[str, Cube]) -> None:
+    """``count`` always produces a non-negative integer regardless of the
+    underlying column — tighten the type so the LLM doesn't quote it."""
+    q = SemanticQuery(measures=["orders.count"])
+    out = compile_query(q, catalog, context=CONTEXT)
+    assert out.column_meta[0].storage_type == "integer"
+
+
+def test_column_meta_storage_type_for_measure_sum(catalog: dict[str, Cube]) -> None:
+    """``sum`` is int-or-float depending on the source — we don't parse
+    the SQL to tell, so it stays the generic ``"number"`` literal."""
+    q = SemanticQuery(measures=["orders.revenue"])
+    out = compile_query(q, catalog, context=CONTEXT)
+    assert out.column_meta[0].storage_type == "number"
+
+
+def test_column_meta_storage_type_for_time(catalog: dict[str, Cube]) -> None:
+    q = SemanticQuery(
+        measures=["orders.count"],
+        time_dimension=TimeWindow(
+            dimension="orders.created_at",
+            granularity="day",
+            range=("2026-01-01", "2026-02-01"),
+        ),
+    )
+    out = compile_query(q, catalog, context=CONTEXT)
+    time_col = next(m for m in out.column_meta if m.kind == "time")
+    assert time_col.storage_type == "time"
+
+
+def test_column_meta_storage_type_compare_pct_change_is_float(
+    catalog: dict[str, Cube],
+) -> None:
+    """pct_change is always a ratio — float, regardless of the measure's
+    underlying integer/numeric storage."""
+    q = SemanticQuery(
+        measures=["orders.count"],
+        time_dimension=TimeWindow(
+            dimension="orders.created_at",
+            granularity="day",
+            range=("2026-02-01", "2026-03-01"),
+        ),
+        compare=CompareWindow(mode="previous_period"),
+    )
+    out = compile_query(q, catalog, context=CONTEXT)
+    pct = next(m for m in out.column_meta if m.name.endswith("_pct_change"))
+    assert pct.storage_type == "float"
+
+
+def test_column_meta_storage_type_compare_delta_inherits_measure(
+    catalog: dict[str, Cube],
+) -> None:
+    """current / prior / delta all carry the underlying measure's
+    storage_type (here ``"integer"`` from a count)."""
+    q = SemanticQuery(
+        measures=["orders.count"],
+        time_dimension=TimeWindow(
+            dimension="orders.created_at",
+            granularity="day",
+            range=("2026-02-01", "2026-03-01"),
+        ),
+        compare=CompareWindow(mode="previous_period"),
+    )
+    out = compile_query(q, catalog, context=CONTEXT)
+    by_name = {m.name: m for m in out.column_meta}
+    for suffix in ("_current", "_prior", "_delta"):
+        assert by_name[f"count{suffix}"].storage_type == "integer"
+
+
+# ---------------------------------------------------------------------------
+# FilterTypeError — now surfaces during field resolution, not at SQL emit
+# ---------------------------------------------------------------------------
+
+
+def test_filter_type_error_fires_during_resolution(catalog: dict[str, Cube]) -> None:
+    """A type-mismatched filter (string dim, int value) raises before
+    SQL composition begins — same error class as before, but it now
+    surfaces alongside resolution failures so an LLM planner can fix
+    both classes of problem in one round-trip."""
+    from semql import FilterTypeError
+    from semql.spec import Filter
+
+    q = SemanticQuery(
+        measures=["orders.count"],
+        # 123 is an int; ``region`` is a string dim.
+        filters=[Filter(dimension="orders.region", op="eq", values=[123])],
+    )
+    with pytest.raises(FilterTypeError):
+        compile_query(q, catalog, context=CONTEXT)
+
+
+def test_filter_type_error_in_where_tree(catalog: dict[str, Cube]) -> None:
+    """The relocation covers ``where``-tree leaves the same way it
+    covers the flat ``filters`` list."""
+    from semql import FilterTypeError
+    from semql.spec import BoolExpr, Filter
+
+    q = SemanticQuery(
+        measures=["orders.count"],
+        where=BoolExpr(
+            op="or",
+            children=[
+                Filter(dimension="orders.region", op="eq", values=["us"]),
+                Filter(dimension="orders.amount", op="eq", values=["not-a-number"]),
+            ],
+        ),
+    )
+    with pytest.raises(FilterTypeError):
+        compile_query(q, catalog, context=CONTEXT)
+
+
+# ---------------------------------------------------------------------------
+# Resolution-error accumulation — surface every wrong reference in one shot
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_accumulates_multiple_unknown_fields(catalog: dict[str, Cube]) -> None:
+    """Three wrong references → one CompileError mentioning all three.
+    Saves the LLM planner two retry round-trips versus a serial
+    fail-fast contract."""
+    q = SemanticQuery(
+        measures=["orders.revvenue", "orders.kount"],  # both typos
+        dimensions=["orders.regionn"],
+    )
+    with pytest.raises(CompileError) as exc_info:
+        compile_query(q, catalog, context=CONTEXT)
+    msg = str(exc_info.value)
+    assert "revvenue" in msg
+    assert "kount" in msg
+    assert "regionn" in msg
+
+
+def test_resolve_accumulates_unknown_with_filter_type_mismatch(
+    catalog: dict[str, Cube],
+) -> None:
+    """Mixed bag — one unknown dim plus one type-mismatched filter both
+    surface in the same exception. Combined-mode message lists each."""
+    from semql.spec import Filter
+
+    q = SemanticQuery(
+        measures=["orders.count"],
+        dimensions=["orders.bogus_dim"],
+        filters=[Filter(dimension="orders.region", op="eq", values=[42])],  # int into string dim
+    )
+    with pytest.raises(CompileError) as exc_info:
+        compile_query(q, catalog, context=CONTEXT)
+    msg = str(exc_info.value)
+    assert "bogus_dim" in msg
+    # The type-mismatch message says "non-string value 42" — both must surface.
+    assert "42" in msg
+
+
+def test_resolve_single_error_re_raises_original_class(
+    catalog: dict[str, Cube],
+) -> None:
+    """When only one resolution error fires, the original exception
+    class propagates verbatim — so callers branching on ``FilterTypeError``
+    (UIs that highlight a specific row) still see the typed instance,
+    not a generic ``CompileError`` wrapper."""
+    from semql import FilterTypeError
+    from semql.spec import Filter
+
+    q = SemanticQuery(
+        measures=["orders.count"],
+        filters=[Filter(dimension="orders.region", op="eq", values=[99])],
+    )
+    with pytest.raises(FilterTypeError):
+        compile_query(q, catalog, context=CONTEXT)

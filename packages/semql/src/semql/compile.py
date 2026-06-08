@@ -63,6 +63,7 @@ from semql.errors import (
 )
 from semql.introspect import PolicyFn, ScopeFn, viewer_sees
 from semql.model import (
+    AggLiteral,
     AuthContext,
     Backend,
     Cube,
@@ -73,6 +74,7 @@ from semql.model import (
     Measure,
     ScopePredicate,
     Segment,
+    StorageType,
     TimeDimension,
     View,
 )
@@ -85,6 +87,22 @@ MAX_UNGROUPED_ROWS = 1000
 ColumnKind = Literal["measure", "dimension", "time", "computed"]
 
 
+def _infer_measure_storage_type(agg: AggLiteral) -> StorageType:
+    """Pick the tightest storage type implied by a measure's aggregate.
+
+    ``count`` / ``count_distinct`` always produce non-negative integers.
+    ``avg`` / ``ratio`` / quantiles always produce floats. ``sum`` /
+    ``min`` / ``max`` pass the source column's type through — we'd need
+    to parse the underlying SQL to tell int vs float, so we fall back
+    to the generic ``number`` literal (which still satisfies
+    ``Filter.validate_for_type``)."""
+    if agg in ("count", "count_distinct"):
+        return "integer"
+    if agg in ("avg", "ratio", "median", "p75", "p90", "p95"):
+        return "float"
+    return "number"
+
+
 @dataclass
 class ColumnMeta:
     """Per-output-column type + presentation metadata.
@@ -92,7 +110,10 @@ class ColumnMeta:
     Sits on :class:`CompiledQuery` in the same order as ``columns`` so a
     consumer (dashboard, MCP server, presenter LLM) can render a result
     row without re-resolving against the catalog. ``kind`` tags the
-    column's role; ``unit`` / ``display_unit`` / ``format`` mirror the
+    column's role; ``storage_type`` carries the tightest type the
+    compiler can infer (passed through from ``Dimension.type`` for
+    dimensions, derived from ``agg`` for measures, ``"time"`` for time
+    columns); ``unit`` / ``display_unit`` / ``format`` mirror the
     fields on ``Measure`` / ``Dimension``; ``display_name`` carries the
     human-friendly label (catalog ``display_name`` or a humanised
     fallback) so visualisers don't need to call ``humanize`` themselves.
@@ -109,6 +130,7 @@ class ColumnMeta:
     unit: str | None = None
     display_unit: str | None = None
     format: FormatLiteral | None = None
+    storage_type: StorageType | None = None
 
 
 @dataclass
@@ -249,6 +271,7 @@ def _build_column_meta(
             unit=dim.unit,
             display_unit=dim.display_unit,
             format=dim.format,
+            storage_type=dim.type,
         )
 
     if time_dim is not None and time_col_name is not None:
@@ -259,10 +282,12 @@ def _build_column_meta(
             name=time_col_name,
             kind="time",
             display_name=time_dim.display_name or _humanize(time_dim.name),
+            storage_type="time",
         )
 
     for (_cube, m), col_name in zip(measure_fields, measure_col_names, strict=True):
         m_label = m.display_name or _humanize(col_name)
+        m_storage = _infer_measure_storage_type(m.agg)
         by_name[col_name] = ColumnMeta(
             name=col_name,
             kind="measure",
@@ -270,6 +295,7 @@ def _build_column_meta(
             unit=m.unit,
             display_unit=m.display_unit,
             format=m.format,
+            storage_type=m_storage,
         )
         if is_compare:
             # Compare mode emits four derivatives per measure. The first
@@ -289,6 +315,7 @@ def _build_column_meta(
                     unit=m.unit,
                     display_unit=m.display_unit,
                     format=m.format,
+                    storage_type=m_storage,
                 )
             pct_name = col_name + "_pct_change"
             by_name[pct_name] = ColumnMeta(
@@ -296,6 +323,7 @@ def _build_column_meta(
                 kind="computed",
                 display_name=m_label + " (% change)",
                 format="percent",
+                storage_type="float",
             )
 
     out: list[ColumnMeta] = []
@@ -739,6 +767,36 @@ def _make_view_resolver(
     return _resolve
 
 
+def _validate_filter_against_field(
+    f: Filter,
+    fld: Dimension | Measure | TimeDimension,
+) -> None:
+    """Type-check a filter as soon as its target field resolves.
+
+    Surfaces ``FilterTypeError`` alongside resolution errors — callers
+    see "the dimension exists but the value is wrong type" without
+    having to advance through SQL emission first. Time dimensions go
+    through ``"time"`` (ISO-8601 string) — they live on the resolver's
+    return as ``TimeDimension``, not ``Dimension``."""
+    if isinstance(fld, Dimension):
+        field_type = fld.type
+    elif isinstance(fld, TimeDimension):
+        field_type = "time"
+    else:
+        # Measure: filtered measures are emission-time HAVING shaped;
+        # ``_filter_node`` still validates them as ``"number"`` there.
+        return
+    try:
+        f.validate_for_type(field_type)
+    except ValueError as exc:
+        raise FilterTypeError(
+            str(exc),
+            dimension=f.dimension,
+            op=f.op,
+            value=f.values[0] if f.values else None,
+        ) from exc
+
+
 def _resolve_query_fields(
     q: SemanticQuery,
     catalog: dict[str, Cube],
@@ -747,38 +805,68 @@ def _resolve_query_fields(
     """Resolve every ``cube.field`` reference in ``q`` to its catalog
     entry and collect the ordered set of touched cubes.
 
+    Accumulates per-reference errors and raises a single combined
+    ``CompileError`` listing them all so an LLM planner sees every
+    missing / mistyped field in one round-trip — not the head of a
+    pile that only surfaces on retry. ``FilterTypeError`` is the one
+    structured subclass we re-raise standalone so callers branching on
+    it (UIs that highlight the offending row) still get the typed
+    instance.
+
     Also resolves segment references and where-tree leaves so all
     referenced cubes land in ``touched`` (the join-graph builder
     needs the full set up front)."""
     resolve_with_views = _make_view_resolver(catalog, views_map)
+    diagnostics: list[CompileError] = []
 
     measure_fields: list[tuple[Cube, Measure]] = []
     for ref in q.measures:
-        cube, fld = resolve_with_views(ref)
+        try:
+            cube, fld = resolve_with_views(ref)
+        except CompileError as exc:
+            diagnostics.append(exc)
+            continue
         if not isinstance(fld, Measure):
-            raise CompileError(f"{ref!r} is not a measure on cube {cube.name!r}.")
+            diagnostics.append(CompileError(f"{ref!r} is not a measure on cube {cube.name!r}."))
+            continue
         measure_fields.append((cube, fld))
 
     dim_fields: list[tuple[Cube, Dimension]] = []
     for ref in q.dimensions:
-        cube, fld = resolve_with_views(ref)
+        try:
+            cube, fld = resolve_with_views(ref)
+        except CompileError as exc:
+            diagnostics.append(exc)
+            continue
         if not isinstance(fld, Dimension):
-            raise CompileError(f"{ref!r} is not a dimension on cube {cube.name!r}.")
+            diagnostics.append(CompileError(f"{ref!r} is not a dimension on cube {cube.name!r}."))
+            continue
         dim_fields.append((cube, fld))
 
     time_cube: Cube | None = None
     time_dim: TimeDimension | None = None
     if q.time_dimension is not None:
-        tcube, tfld = resolve_with_views(q.time_dimension.dimension)
-        if not isinstance(tfld, TimeDimension):
-            raise CompileError(f"{q.time_dimension.dimension!r} is not a time dimension.")
-        gran = q.time_dimension.granularity
-        if gran is not None and gran not in tfld.granularities:
-            raise CompileError(
-                f"Granularity {gran!r} not supported on {q.time_dimension.dimension!r}. "
-                f"Allowed: {tfld.granularities}."
+        try:
+            tcube, tfld = resolve_with_views(q.time_dimension.dimension)
+        except CompileError as exc:
+            diagnostics.append(exc)
+            tcube, tfld = None, None
+        if tfld is not None and not isinstance(tfld, TimeDimension):
+            diagnostics.append(
+                CompileError(f"{q.time_dimension.dimension!r} is not a time dimension.")
             )
-        time_cube, time_dim = tcube, tfld
+        elif tfld is not None:
+            gran = q.time_dimension.granularity
+            if gran is not None and gran not in tfld.granularities:
+                diagnostics.append(
+                    CompileError(
+                        f"Granularity {gran!r} not supported on "
+                        f"{q.time_dimension.dimension!r}. "
+                        f"Allowed: {tfld.granularities}."
+                    )
+                )
+            else:
+                time_cube, time_dim = tcube, tfld
 
     touched: list[Cube] = []
     for c, _ in [*measure_fields, *dim_fields]:
@@ -789,7 +877,16 @@ def _resolve_query_fields(
 
     filter_resolutions: list[tuple[Filter, Cube, Dimension | Measure | TimeDimension]] = []
     for f in q.filters:
-        c, fld = resolve_with_views(f.dimension)
+        try:
+            c, fld = resolve_with_views(f.dimension)
+        except CompileError as exc:
+            diagnostics.append(exc)
+            continue
+        try:
+            _validate_filter_against_field(f, fld)
+        except FilterTypeError as exc:
+            diagnostics.append(exc)
+            continue
         filter_resolutions.append((f, c, fld))
         if c not in touched:
             touched.append(c)
@@ -797,7 +894,16 @@ def _resolve_query_fields(
     where_leaves: list[Filter] = _walk_where_leaves(q.where) if q.where is not None else []
     where_leaf_resolutions: dict[int, tuple[Cube, Dimension | Measure | TimeDimension]] = {}
     for leaf in where_leaves:
-        c, fld = resolve_with_views(leaf.dimension)
+        try:
+            c, fld = resolve_with_views(leaf.dimension)
+        except CompileError as exc:
+            diagnostics.append(exc)
+            continue
+        try:
+            _validate_filter_against_field(leaf, fld)
+        except FilterTypeError as exc:
+            diagnostics.append(exc)
+            continue
         where_leaf_resolutions[id(leaf)] = (c, fld)
         if c not in touched:
             touched.append(c)
@@ -805,23 +911,46 @@ def _resolve_query_fields(
     segment_resolutions: list[tuple[Cube, Segment]] = []
     for seg_ref in q.segments:
         if "." not in seg_ref:
-            raise CompileError(
-                f"Segment reference {seg_ref!r} must be qualified as 'cube.segment'."
+            diagnostics.append(
+                CompileError(f"Segment reference {seg_ref!r} must be qualified as 'cube.segment'.")
             )
+            continue
         cube_name, seg_name = seg_ref.rsplit(".", 1)
         if cube_name not in catalog:
-            raise CompileError(f"Segment reference {seg_ref!r}: unknown cube {cube_name!r}.")
+            diagnostics.append(
+                CompileError(f"Segment reference {seg_ref!r}: unknown cube {cube_name!r}.")
+            )
+            continue
         cube_obj = catalog[cube_name]
         match = next((s for s in cube_obj.segments if s.name == seg_name), None)
         if match is None:
             known = ", ".join(s.name for s in cube_obj.segments) or "(none)"
-            raise CompileError(
-                f"Segment reference {seg_ref!r}: cube {cube_name!r} has no segment "
-                f"{seg_name!r}. Known segments: {known}."
+            diagnostics.append(
+                CompileError(
+                    f"Segment reference {seg_ref!r}: cube {cube_name!r} has no segment "
+                    f"{seg_name!r}. Known segments: {known}."
+                )
             )
+            continue
         segment_resolutions.append((cube_obj, match))
         if cube_obj not in touched:
             touched.append(cube_obj)
+
+    if diagnostics:
+        # One CompileError carrying every per-reference problem. A single
+        # exception preserves the existing fail-fast contract for callers
+        # that don't care about the breakdown; the combined message lets
+        # an LLM planner see every wrong reference in one round-trip
+        # rather than discovering them sequentially across retries.
+        # FilterTypeError is the one structured subclass we preserve
+        # standalone — UIs that branch on it (highlight the offending
+        # row) still get the typed instance when it's the only failure.
+        if len(diagnostics) == 1:
+            raise diagnostics[0]
+        lines = [f"  - {exc}" for exc in diagnostics]
+        raise CompileError(
+            f"SemanticQuery has {len(diagnostics)} resolution errors:\n" + "\n".join(lines)
+        )
 
     if not touched:
         raise CompileError("Could not determine any cubes from the query.")

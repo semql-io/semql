@@ -30,22 +30,47 @@ FilterOp = Literal[
 
 class TimeWindow(BaseModel):
     model_config = ConfigDict(frozen=True)
-    dimension: str
-    granularity: Literal["hour", "day", "week", "month"] | None = None
-    range: tuple[str, str]
+    dimension: str = Field(
+        description=(
+            "Qualified time-dimension name (e.g. 'orders.created_at') the window restricts."
+        ),
+    )
+    granularity: Literal["hour", "day", "week", "month"] | None = Field(
+        default=None,
+        description="Bucket size for time GROUP BY; required when fill_nulls_with is set.",
+    )
+    range: tuple[str, str] = Field(
+        description="Inclusive (start, end) ISO-8601 datetime pair bounding the window.",
+    )
     # When set, every measure in the query gets ``COALESCE(measure,
     # fill_nulls_with)`` and the result has one row per truncated time
     # bucket in ``range`` even where the underlying data has gaps.
     # Requires ``granularity``; rejected when the query has any
     # non-time dimensions (cartesian fill = Phase B).
-    fill_nulls_with: int | None = None
+    fill_nulls_with: int | None = Field(
+        default=None,
+        description=(
+            "Constant returned for buckets with no rows; requires granularity, no non-time dims."
+        ),
+    )
 
 
 class Filter(BaseModel):
     model_config = ConfigDict(frozen=True)
-    dimension: str
-    op: FilterOp
-    values: list[str | int | float | bool] = []
+    dimension: str = Field(
+        description="Qualified dimension name (e.g. 'orders.region') the predicate applies to.",
+    )
+    op: FilterOp = Field(
+        description=(
+            "Operator: eq, neq, in, not_in, gt, lt, gte, lte, contains, is_null, not_null."
+        ),
+    )
+    values: list[str | int | float | bool] = Field(
+        default_factory=list,
+        description=(
+            "Predicate arguments — one for scalar ops, many for in/not_in, empty for is_null."
+        ),
+    )
 
     def validate_for_type(self, dim_type: str) -> None:
         """Compile-time type check. Raises ValueError on mismatch; the
@@ -106,8 +131,12 @@ class BoolExpr(BaseModel):
     """
 
     model_config = ConfigDict(frozen=True)
-    op: Literal["and", "or", "not"]
-    children: list[BoolExpr | Filter]
+    op: Literal["and", "or", "not"] = Field(
+        description="Combinator: 'and' / 'or' (>=2 children) or 'not' (exactly one child).",
+    )
+    children: list[BoolExpr | Filter] = Field(
+        description="Sub-expressions: nested BoolExpr nodes or Filter leaves.",
+    )
 
     @model_validator(mode="after")
     def _check_arity(self) -> BoolExpr:
@@ -124,8 +153,16 @@ class CompareWindow(BaseModel):
     range (same duration, immediately prior). `explicit` requires `range`."""
 
     model_config = ConfigDict(frozen=True)
-    mode: Literal["previous_period", "explicit"] = "previous_period"
-    range: tuple[str, str] | None = None
+    mode: Literal["previous_period", "explicit"] = Field(
+        default="previous_period",
+        description=(
+            "'previous_period' derives prior from time_dimension.range; 'explicit' requires range."
+        ),
+    )
+    range: tuple[str, str] | None = Field(
+        default=None,
+        description="Required for mode='explicit'; ignored for 'previous_period'.",
+    )
 
 
 InlineDerivedOp = Literal["ratio", "sum", "diff"]
@@ -163,9 +200,17 @@ class InlineDerived(BaseModel):
     """
 
     model_config = ConfigDict(frozen=True)
-    name: str
-    op: InlineDerivedOp
-    operands: list[str]
+    name: str = Field(
+        description="Output column name for the derived measure.",
+    )
+    op: InlineDerivedOp = Field(
+        description="Composition: 'ratio' (num/den), 'sum' (a+b+...), or 'diff' (a-b).",
+    )
+    operands: list[str] = Field(
+        description=(
+            "Qualified measure refs ('cube.measure'); Phase A requires all on the same cube."
+        ),
+    )
 
     @model_validator(mode="after")
     def _check_arity(self) -> InlineDerived:
@@ -189,34 +234,80 @@ class InlineDerived(BaseModel):
 
 class SemanticQuery(BaseModel):
     model_config = ConfigDict(frozen=True)
-    measures: list[str] = []
-    dimensions: list[str] = []
-    time_dimension: TimeWindow | None = None
-    # Named, pre-defined predicates the planner references by name
-    # (qualified as ``cube.segment``). Compose with ``filters`` via AND.
-    segments: list[str] = []
-    filters: list[Filter] = []
-    # Boolean predicate tree — use when ``filters`` (implicit AND) isn't
-    # expressive enough (OR / NOT). Composes with ``filters`` via AND.
-    where: BoolExpr | None = None
-    having: list[Filter] = []
-    compare: CompareWindow | None = None
-    order: list[tuple[str, Literal["asc", "desc"]]] = []
-    limit: int | None = None
-    offset: Annotated[int, Field(ge=0)] | None = None
-    # Row-listing mode (no GROUP BY). Incompatible with `measures`.
-    ungrouped: bool = False
-    # Ad-hoc derived measures composed from existing catalog measures
-    # — the exploratory case for ratios / sums / differences that
-    # don't (yet) deserve a catalog entry. See :class:`InlineDerived`.
-    derived_measures: list[InlineDerived] = []
-    # Cube names that should be LEFT joined (rather than INNER joined)
-    # along their declared edge. Pair with ``Filter(dimension=...,
-    # op="is_null")`` to express anti-join / absent-row queries: rows
-    # present in the FROM root but missing in the LEFT-joined cube.
-    # Phase A: the left-joined cube can't be in ``dimensions`` (NULL
-    # group keys are surprising); the compiler raises if it is.
-    left_joins: list[str] = []
+    measures: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Qualified measure refs to aggregate (e.g. 'orders.revenue'); each grouped per its agg."
+        ),
+    )
+    dimensions: list[str] = Field(
+        default_factory=list,
+        description="Qualified dimension refs to group by (e.g. 'orders.region').",
+    )
+    time_dimension: TimeWindow | None = Field(
+        default=None,
+        description=(
+            "Time window restricting rows; supplies the time bucket when granularity is set."
+        ),
+    )
+    segments: list[str] = Field(
+        default_factory=list,
+        description=("Named pre-defined predicates as 'cube.segment'; AND-composed with filters."),
+    )
+    filters: list[Filter] = Field(
+        default_factory=list,
+        description="Flat list of predicates; combined with implicit AND.",
+    )
+    where: BoolExpr | None = Field(
+        default=None,
+        description=(
+            "Boolean predicate tree (use for OR / NOT); AND-composed with the filters list."
+        ),
+    )
+    having: list[Filter] = Field(
+        default_factory=list,
+        description=(
+            "Post-aggregation filters on measure values; references a measure also in 'measures'."
+        ),
+    )
+    compare: CompareWindow | None = Field(
+        default=None,
+        description=(
+            "Adds <measure>_current / <measure>_prior / _delta / _pct_change columns per measure."
+        ),
+    )
+    order: list[tuple[str, Literal["asc", "desc"]]] = Field(
+        default_factory=list,
+        description="(field, 'asc'|'desc') pairs; field may be a measure or dimension name.",
+    )
+    limit: int | None = Field(
+        default=None,
+        description=(
+            "Max rows returned; required when ungrouped=True, applied after aggregation otherwise."
+        ),
+    )
+    offset: Annotated[int, Field(ge=0)] | None = Field(
+        default=None,
+        description="Skip this many rows after ordering; pairs with limit for offset pagination.",
+    )
+    ungrouped: bool = Field(
+        default=False,
+        description=(
+            "Row-listing mode (no GROUP BY); incompatible with measures; needs explicit limit."
+        ),
+    )
+    derived_measures: list[InlineDerived] = Field(
+        default_factory=list,
+        description=(
+            "Ad-hoc derived measures (ratio/sum/diff) composed inline from catalog measures."
+        ),
+    )
+    left_joins: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Cubes to LEFT JOIN instead of INNER; pair with op='is_null' for absent-row queries."
+        ),
+    )
 
     @model_validator(mode="after")
     def _check_ungrouped_no_measures(self) -> SemanticQuery:
