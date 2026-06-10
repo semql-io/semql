@@ -134,6 +134,27 @@ class FederationError(CompileError):
         self.reason = reason
 
 
+class AuthError(SemQLError):
+    """Raised by ``TokenVerifier`` implementations on invalid, expired,
+    or otherwise unverifiable bearer tokens.
+
+    Deliberately a ``SemQLError`` (not a ``CompileError``) — token
+    verification is a *transport-layer* concern that runs before the
+    query is even constructed, so it sits outside the resolve/compile
+    subtree. Callers that need a broad catch should use ``SemQLError``;
+    the more specific ``except AuthError:`` is for handlers that want
+    to surface a 401 / re-prompt-for-token UX.
+
+    Carries an optional ``reason`` attribute (e.g. ``"expired"``,
+    ``"bad_signature"``, ``"malformed"``) so callers can branch
+    programmatically without parsing ``str(err)``.
+    """
+
+    def __init__(self, message: str, *, reason: str | None = None) -> None:
+        super().__init__(message)
+        self.reason = reason
+
+
 def closest_match(
     name: str,
     candidates: Iterable[str],
@@ -151,6 +172,7 @@ def closest_match(
 
 __all__ = [
     "CompileError",
+    "AuthError",
     "CrossBackendError",
     "FederationError",
     "FilterTypeError",

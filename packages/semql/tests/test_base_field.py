@@ -62,13 +62,15 @@ def test_subclasses_keep_their_type_specific_fields() -> None:
     assert "agg" in Measure.model_fields
     assert "type" in Dimension.model_fields
     assert "granularities" in TimeDimension.model_fields
-    # Segment is structurally the shared fields only — no extras.
+    # Segment is structurally the shared fields only — no extras,
+    # but A1 added ``required_roles`` to BaseField so it inherits.
     assert set(Segment.model_fields.keys()) == {
         "name",
         "sql",
         "description",
         "display_name",
         "metadata",
+        "required_roles",  # A1
     }
 
 

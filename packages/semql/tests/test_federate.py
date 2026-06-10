@@ -253,9 +253,11 @@ def test_refuses_non_distributive_aggregation() -> None:
     assert exc.value.reason.startswith("non_distributive_aggregation")
 
 
-def test_distributive_mode_still_refuses_where_tree() -> None:
-    """Distributive federation refuses the where-tree — raw_rows mode
-    is the path that handles it via CNF splitting."""
+def test_distributive_mode_lifts_where_tree() -> None:
+    """Distributive federation now lifts the where-tree: per-partition
+    clauses land in the fragment, the cross-partition residual lives
+    in the merge SQL. The raw_rows-only refusal is gone.
+    """
     catalog = _federated_catalog()
     from semql.spec import BoolExpr
 
@@ -270,9 +272,14 @@ def test_distributive_mode_still_refuses_where_tree() -> None:
             ],
         ),
     )
-    with pytest.raises(FederationError) as exc:
-        compile_federated_query(q, catalog)
-    assert exc.value.reason == "where_tree_in_distributive_federated"
+    plan = compile_federated_query(q, catalog)
+    # Both fragments now exist; the where-tree is split.
+    assert len(plan.fragments) == 2
+    frags_sql = "\n".join(f.sql for f in plan.fragments)
+    # orders fragment carries its local piece
+    assert "status" in frags_sql or "paid" in frags_sql
+    # customers fragment carries its local piece
+    assert "tier" in frags_sql or "gold" in frags_sql
 
 
 def test_refuses_compare_mode() -> None:

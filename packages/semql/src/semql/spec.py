@@ -308,6 +308,21 @@ class SemanticQuery(BaseModel):
             "Cubes to LEFT JOIN instead of INNER; pair with op='is_null' for absent-row queries."
         ),
     )
+    # I14 — Output column aliases. Maps the output column name
+    # (alias key) to a qualified field ref (alias value). Useful
+    # when a dashboard needs the same field under two names in one
+    # result. The alias key is the output column name; the alias
+    # value is what the resolver would have returned. Alias keys
+    # must be unique (Pydantic dict semantics), must resolve to a
+    # declared field, and must not collide with existing output
+    # column names (compile error).
+    aliases: dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "Output column aliases; ``{output_name: qualified_ref}``. "
+            "The output column name is the alias key."
+        ),
+    )
 
     @model_validator(mode="after")
     def _check_ungrouped_no_measures(self) -> SemanticQuery:

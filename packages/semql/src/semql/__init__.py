@@ -9,10 +9,12 @@ prompt rendering, etc.).
 
 from __future__ import annotations
 
+from semql.auth import HMACVerifier, JWKSVerifier, TokenVerifier
 from semql.catalog import Catalog
 from semql.compile import MAX_UNGROUPED_ROWS, ColumnMeta, CompiledQuery, compile_query
 from semql.docs import render_catalog_markdown
 from semql.errors import (
+    AuthError,
     CompileError,
     CrossBackendError,
     FederationError,
@@ -48,6 +50,7 @@ from semql.introspect import (
     resolve_query,
     validate_and_resolve,
 )
+from semql.lint import LintFinding, LintReport, lint_catalog
 from semql.logical import (
     Aggregate,
     ColumnRef,
@@ -95,6 +98,7 @@ from semql.model import (
     TimeDimension,
     View,
 )
+from semql.parse import ParseError, ParserDecision, parse_sql_statement
 from semql.plan import (
     DrilldownSuggestion,
     DrilldownSuggestions,
@@ -166,6 +170,7 @@ from semql.visualize import VizColumn, VizDecision, decide_visualization
 __all__ = [
     "AggLiteral",
     "AuthContext",
+    "AuthError",
     "Backend",
     "BaseField",
     "BoolExpr",
@@ -210,6 +215,8 @@ __all__ = [
     "FormatLiteral",
     "FragmentColumn",
     "GlossaryEntry",
+    "HMACVerifier",
+    "JWKSVerifier",
     "HybridRetriever",
     "IncompatibleUnits",
     "InlineDerived",
@@ -222,6 +229,9 @@ __all__ = [
     "LookupLoader",
     "LookupValues",
     "MAX_UNGROUPED_ROWS",
+    "ParserDecision",
+    "ParseError",
+    "parse_sql_statement",
     "MMRWrapper",
     "MergePlan",
     "MergeSpec",
@@ -261,6 +271,7 @@ __all__ = [
     "PhysicalTable",
     "TimeDimension",
     "TimeWindow",
+    "TokenVerifier",
     "ToolDescriptionProjection",
     "UnitError",
     "UnknownIdentifierError",
@@ -288,6 +299,9 @@ __all__ = [
     "filter_tool_descriptions",
     "enrich_result",
     "materialize_lookup",
+    "lint_catalog",
+    "LintFinding",
+    "LintReport",
     "project_tool_descriptions",
     "render_catalog_markdown",
     "render_catalog_block",

@@ -275,10 +275,15 @@ def to_logical_plan(
             )
         )
 
-    # 3. Filters — carry the spec tree, not a SQL string.
-    filters: list[Predicate] = [Predicate(expr=f) for f in query.filters]
+    # 3. Filters — carry the spec tree, not a SQL string. Apply the
+    # CNF pre-pass so every downstream consumer (federation, segment
+    # routing, pushdown) sees a top-level AND of OR-clauses. The
+    # pass is pure: a tree already in CNF is rebuilt equal to itself.
+    from semql.cnf import to_cnf
+
+    filters: list[Predicate] = [Predicate(expr=to_cnf(f)) for f in query.filters]
     if query.where is not None:
-        filters.append(Predicate(expr=query.where))
+        filters.append(Predicate(expr=to_cnf(query.where)))
 
     # 4. Aggregate. ``ungrouped=True`` is row-listing mode — no
     # GROUP BY, no measure aggregation; the emitter still needs the

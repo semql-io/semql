@@ -46,7 +46,7 @@ def split(qualified: str) -> tuple[str, str]:
 def resolve_field(
     qualified: str,
     catalog: dict[str, Cube],
-) -> tuple[Cube, Measure | Dimension | TimeDimension]:
+) -> tuple[Cube, Measure | Dimension | TimeDimension | Segment]:
     cube_name, field_name = split(qualified)
     if cube_name not in catalog:
         hint = closest_match(cube_name, catalog.keys())
@@ -63,11 +63,14 @@ def resolve_field(
         if m.name == field_name:
             return cube, m
     for d in cube.dimensions:
-        if d.name == field_name:
+        if d.name == field_name or field_name in d.aliases:
             return cube, d
     for td in cube.time_dimensions:
         if td.name == field_name:
             return cube, td
+    for seg in cube.segments:
+        if seg.name == field_name:
+            return cube, seg
     hint = closest_match(field_name, cube.field_names())
     known = ", ".join(sorted(cube.field_names()))
     suffix = f" Did you mean {hint!r}?" if hint else ""
@@ -120,8 +123,8 @@ class _ResolvedFields:
     dim_fields: list[tuple[Cube, Dimension]]
     time_cube: Cube | None
     time_dim: TimeDimension | None
-    filter_resolutions: list[tuple[Filter, Cube, Dimension | Measure | TimeDimension]]
-    where_leaf_resolutions: dict[int, tuple[Cube, Dimension | Measure | TimeDimension]]
+    filter_resolutions: list[tuple[Filter, Cube, Dimension | Measure | TimeDimension | Segment]]
+    where_leaf_resolutions: dict[int, tuple[Cube, Dimension | Measure | TimeDimension | Segment]]
     segment_resolutions: list[tuple[Cube, Segment]]
     touched: list[Cube]
 
@@ -136,7 +139,9 @@ def walk_where_leaves(expr: BoolExpr | Filter) -> list[Filter]:
     return leaves
 
 
-def _filter_field_type(fld: Dimension | Measure | TimeDimension) -> str | None:
+def _filter_field_type(
+    fld: Dimension | Measure | TimeDimension | Segment,
+) -> str | None:
     """Return the dim_type to pass to `Filter.validate_for_type`, or
     `None` if the field type doesn't participate in filter-value
     typing (Measure on a `having` path is checked separately at the
@@ -151,7 +156,7 @@ def _filter_field_type(fld: Dimension | Measure | TimeDimension) -> str | None:
 def _make_view_resolver(
     catalog: dict[str, Cube],
     views_map: dict[str, View],
-) -> Callable[[str], tuple[Cube, Measure | Dimension | TimeDimension]]:
+) -> Callable[[str], tuple[Cube, Measure | Dimension | TimeDimension | Segment]]:
     """Build the per-call view-aware resolver.
 
     Rewrites `view.local_name` references to the underlying
@@ -161,7 +166,7 @@ def _make_view_resolver(
 
     def _resolve(
         qualified: str,
-    ) -> tuple[Cube, Measure | Dimension | TimeDimension]:
+    ) -> tuple[Cube, Measure | Dimension | TimeDimension | Segment]:
         if "." in qualified:
             prefix, local = qualified.split(".", 1)
             if prefix in views_map:
@@ -308,7 +313,9 @@ def walk_query_fields(
     if time_cube is not None and time_cube not in touched:
         touched.append(time_cube)
 
-    filter_resolutions: list[tuple[Filter, Cube, Dimension | Measure | TimeDimension]] = []
+    filter_resolutions: list[
+        tuple[Filter, Cube, Dimension | Measure | TimeDimension | Segment]
+    ] = []
     for f in q.filters:
         try:
             c, fld = resolve_with_views(f.dimension)
@@ -342,7 +349,9 @@ def walk_query_fields(
             touched.append(c)
 
     where_leaves: list[Filter] = walk_where_leaves(q.where) if q.where is not None else []
-    where_leaf_resolutions: dict[int, tuple[Cube, Dimension | Measure | TimeDimension]] = {}
+    where_leaf_resolutions: dict[
+        int, tuple[Cube, Dimension | Measure | TimeDimension | Segment]
+    ] = {}
     for leaf in where_leaves:
         try:
             c, fld = resolve_with_views(leaf.dimension)

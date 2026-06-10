@@ -31,6 +31,7 @@ from semql.model import (
     Join,
     Measure,
     ScopePredicate,
+    Segment,
     TimeDimension,
     View,
 )
@@ -320,7 +321,7 @@ def resolve_field(
     catalog: object,
     *,
     views: Mapping[str, View] | None = None,
-) -> tuple[Cube, Measure | Dimension | TimeDimension]:
+) -> tuple[Cube, Measure | Dimension | TimeDimension | Segment]:
     """Resolve a ``cube.field`` (or ``view.field``) reference.
 
     Mirrors the compiler's resolution path so tools share one definition

@@ -128,6 +128,39 @@ class BaseField(BaseModel):
     description: str = ""
     display_name: str | None = None
     metadata: Metadata = Field(default_factory=dict)
+    # A1 — Field-level visibility. ANY-match semantics: a viewer with
+    # at least one of the listed roles passes; an empty list means
+    # the field is open to all viewers who can see the cube. Compiled
+    # errors for missing roles are indistinguishable from "field
+    # doesn't exist" so callers can't infer the field exists.
+    required_roles: list[str] = Field(default_factory=list)
+
+    @property
+    def kind(self) -> str:
+        """Structural field-type tag, the SemQL equivalent of GraphQL ``__typename``.
+
+        I15: ``"measure"`` / ``"dimension"`` / ``"time"`` / ``"segment"``.
+        Lets consumers (MCP tool factory, planner, evaluator) branch on
+        field type without importing the concrete ``Measure`` /
+        ``Dimension`` / ``TimeDimension`` / ``Segment`` subclasses. Pairs
+        with ``ColumnMeta.kind`` on ``CompiledQuery`` which uses the same
+        vocabulary for output columns. Implemented as a property so it
+        survives ``model_copy`` (the underlying class is unchanged).
+        """
+        from semql.model import Dimension, Measure, Segment, TimeDimension
+
+        if isinstance(self, Measure):
+            return "measure"
+        if isinstance(self, TimeDimension):
+            return "time"
+        if isinstance(self, Segment):
+            return "segment"
+        if isinstance(self, Dimension):
+            return "dimension"
+        raise TypeError(
+            f"Unknown BaseField subclass: {type(self).__name__}; "
+            "extend BaseField.kind to add support."
+        )
 
 
 class Measure(BaseField):
@@ -164,6 +197,14 @@ class Measure(BaseField):
     # filtered sums.
     numerator: str | None = None
     denominator: str | None = None
+    # A1 — Field-level masking. ``mask_roles`` names roles for which
+    # the field compiles but the SQL is substituted by a constant
+    # instead of the real expression. ``mask_value``: ``None`` → NULL,
+    # a string → a SQL literal (``'REDACTED'``, ``'0'``, etc.). The
+    # constructor enforces ``mask_roles ⊆ required_roles`` — you
+    # can't mask a role that can't even see the field.
+    mask_roles: list[str] = Field(default_factory=list)
+    mask_value: str | None = None
 
     @model_validator(mode="after")
     def _check_ratio_consistency(self) -> Measure:
@@ -180,6 +221,17 @@ class Measure(BaseField):
                     f"Measure {self.name!r}: numerator/denominator are "
                     f"only valid for agg='ratio'; got agg={self.agg!r}."
                 )
+        return self
+
+    @model_validator(mode="after")
+    def _check_mask_subset(self) -> Measure:
+        if self.mask_roles and not set(self.mask_roles).issubset(set(self.required_roles)):
+            raise ValueError(
+                f"Measure {self.name!r}: mask_roles={self.mask_roles!r} "
+                f"is not a subset of required_roles={self.required_roles!r}. "
+                "A field that masks a role that can't even access the field "
+                "is a configuration error."
+            )
         return self
 
 
@@ -199,6 +251,28 @@ class Dimension(BaseField):
     # FK to the named cube's PK — saving the catalog author the
     # repetition. An explicit Join with the same ``to`` wins.
     foreign_key: str | None = None
+    # A1 — Field-level masking. Same shape as Measure.mask_*.
+    mask_roles: list[str] = Field(default_factory=list)
+    mask_value: str | None = None
+    # I7 — Input aliases. An LLM might emit ``territory`` /
+    # ``zone`` / ``area`` when the catalog names the dimension
+    # ``region``. The resolver accepts any alias as a synonym for
+    # the canonical name; the prompt renders the canonical name
+    # only (no alias listing — the planner learns the canonical).
+    # The field-hide / mask gates (A1) apply on the canonical
+    # field; an alias is a synonym, not a separate auth surface.
+    aliases: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _check_mask_subset(self) -> Dimension:
+        if self.mask_roles and not set(self.mask_roles).issubset(set(self.required_roles)):
+            raise ValueError(
+                f"Dimension {self.name!r}: mask_roles={self.mask_roles!r} "
+                f"is not a subset of required_roles={self.required_roles!r}. "
+                "A field that masks a role that can't even access the field "
+                "is a configuration error."
+            )
+        return self
 
 
 class TimeDimension(BaseField):

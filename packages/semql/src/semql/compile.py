@@ -79,6 +79,7 @@ from semql.model import (
     FormatLiteral,
     Measure,
     ScopePredicate,
+    Segment,
     StorageType,
     TimeDimension,
     View,
@@ -136,6 +137,38 @@ class ColumnMeta:
     display_unit: str | None = None
     format: FormatLiteral | None = None
     storage_type: StorageType | None = None
+    # A1 — True when the column's SQL was substituted by a mask
+    # constant (NULL or ``mask_value``) rather than the real field
+    # expression. Downstream renderers (chart, table) use this to
+    # suppress cell rendering or show a lock icon.
+    masked: bool = False
+
+    def model_dump(self) -> dict[str, Any]:
+        """JSON-safe dict view of this ColumnMeta (I9 round-trip helper)."""
+        return {
+            "name": self.name,
+            "kind": self.kind,
+            "display_name": self.display_name,
+            "unit": self.unit,
+            "display_unit": self.display_unit,
+            "format": self.format,
+            "storage_type": self.storage_type,
+            "masked": self.masked,
+        }
+
+    @classmethod
+    def model_validate(cls, data: dict[str, Any]) -> ColumnMeta:
+        """Reconstruct a ColumnMeta from a ``model_dump()`` payload."""
+        return cls(
+            name=data["name"],
+            kind=data["kind"],
+            display_name=data.get("display_name", ""),
+            unit=data.get("unit"),
+            display_unit=data.get("display_unit"),
+            format=data.get("format"),
+            storage_type=data.get("storage_type"),
+            masked=data.get("masked", False),
+        )
 
 
 @dataclass
@@ -161,6 +194,48 @@ class CompiledQuery:
     # rollup routing fired. ``None`` means the query went to the base
     # tables. See :mod:`semql.rollup` for the matching rules.
     applied_rollup: str | None = None
+
+    def model_dump(self) -> dict[str, Any]:
+        """JSON-safe dict view of this CompiledQuery (I9 round-trip helper).
+
+        Stable across versions for the same query + catalog. The shape
+        matches Pydantic's ``BaseModel.model_dump`` so callers writing
+        tool-call payloads / eval-loop fixtures can swap to a plain dict
+        without changing the call site.
+        """
+        return {
+            "backend": self.backend.value,
+            "sql": self.sql,
+            "params": dict(self.params),
+            "columns": list(self.columns),
+            "column_meta": [m.model_dump() for m in self.column_meta],
+            "touched_cube_names": list(self.touched_cube_names),
+            "derived_sources": list(self.derived_sources),
+            "applied_rollup": self.applied_rollup,
+        }
+
+    @classmethod
+    def model_validate(cls, data: dict[str, Any]) -> CompiledQuery:
+        """Reconstruct a CompiledQuery from a ``model_dump()`` payload.
+
+        Pairs with :meth:`model_dump` for I9 — the round-trip is
+        byte-stable: ``CompiledQuery.model_validate(cq.model_dump())``
+        equals ``cq`` field-for-field.
+        """
+        backend = data["backend"]
+        if isinstance(backend, str):
+            backend = Backend(backend)
+        column_meta = [ColumnMeta.model_validate(m) for m in data.get("column_meta", [])]
+        return cls(
+            backend=backend,
+            sql=data["sql"],
+            params=dict(data.get("params", {})),
+            columns=list(data.get("columns", [])),
+            column_meta=column_meta,
+            touched_cube_names=list(data.get("touched_cube_names", [])),
+            derived_sources=list(data.get("derived_sources", [])),
+            applied_rollup=data.get("applied_rollup"),
+        )
 
 
 def _collect_derived_sources(
@@ -233,7 +308,7 @@ def _apply_with_clause(
 def _resolve_field(
     qualified: str,
     catalog: dict[str, Cube],
-) -> tuple[Cube, Measure | Dimension | TimeDimension]:
+) -> tuple[Cube, Measure | Dimension | TimeDimension | Segment]:
     try:
         return _resolve_field_raw(qualified, catalog)
     except CompileError:
@@ -244,6 +319,45 @@ def _resolve_field(
 
 def _humanize(name: str) -> str:
     return name.replace("_", " ").title()
+
+
+def _apply_mask_metadata(
+    column_meta: list[ColumnMeta],
+    env: _CompileEnv,
+) -> list[ColumnMeta]:
+    """A1 — flip ``ColumnMeta.masked`` for every field the viewer has
+    a mask role on. Returns a new list; ``ColumnMeta`` is frozen, so
+    we rebuild each masked entry.
+    """
+    if env.viewer is None:
+        return column_meta
+    masked_pairs: set[tuple[str, str]] = set()  # (col_name, kind)
+    for (_cube, dim), col_name in zip(env.dim_fields, env.dim_col_names, strict=True):
+        if env.field_is_masked(dim):
+            masked_pairs.add((col_name, "dimension"))
+    for (_cube, m), col_name in zip(env.measure_fields, env.measure_col_names, strict=True):
+        if env.field_is_masked(m):
+            masked_pairs.add((col_name, "measure"))
+    if not masked_pairs:
+        return column_meta
+    out: list[ColumnMeta] = []
+    for cm in column_meta:
+        if (cm.name, cm.kind) in masked_pairs:
+            out.append(
+                ColumnMeta(
+                    name=cm.name,
+                    kind=cm.kind,
+                    display_name=cm.display_name,
+                    unit=cm.unit,
+                    display_unit=cm.display_unit,
+                    format=cm.format,
+                    storage_type=cm.storage_type,
+                    masked=True,
+                )
+            )
+        else:
+            out.append(cm)
+    return out
 
 
 def _build_column_meta(
@@ -699,6 +813,126 @@ def _check_viewer_authorization(
         )
 
 
+def _check_field_visibility(
+    q: SemanticQuery,
+    catalog: dict[str, Cube],
+    viewer: AuthContext | None,
+) -> None:
+    """A1 — Field hide gate. Refuse queries that touch a field the
+    viewer's roles don't intersect with ``field.required_roles``.
+
+    The error message is indistinguishable from "field doesn't exist"
+    so callers can't infer the field exists from the error shape.
+    Empty ``required_roles`` is open to all viewers who can see the
+    cube; ``viewer=None`` (unauthed path) bypasses the gate so
+    catalog-level tooling keeps working.
+    """
+    if viewer is None:
+        return
+
+    def _sees(field_required: list[str]) -> bool:
+        if not field_required:
+            return True
+        return any(r in viewer.roles for r in field_required)
+
+    # Walk every ref: measures, dimensions, time_dimension, segments,
+    # filters (dimension), where-tree leaves, having (dimension), order.
+    refs: list[str] = []
+    refs.extend(q.measures)
+    refs.extend(q.dimensions)
+    if q.time_dimension is not None:
+        refs.append(q.time_dimension.dimension)
+    refs.extend(q.segments)
+    for f in q.filters:
+        refs.append(f.dimension)
+    if q.where is not None:
+        refs.extend(_walk_where_dims(q.where))
+    for hf in q.having:
+        refs.append(hf.dimension)
+    for ref, _direction in q.order:
+        refs.append(ref)
+    for ir in q.derived_measures:
+        # InlineDerived operands are qualified ``cube.measure`` refs
+        # (or unqualified names that resolve to the touched cubes).
+        # Push them through the same field-visibility gate so a
+        # viewer without the operand's required role can't probe
+        # through a derived measure.
+        for op in ir.operands:
+            if "." in op:
+                refs.append(op)
+
+    for ref in refs:
+        cube_name, _, field_name = ref.partition(".")
+        if not cube_name or not field_name:
+            continue
+        cube = catalog.get(cube_name)
+        if cube is None:
+            continue
+        field = _find_field(cube, field_name)
+        if field is None:
+            continue
+        if not _sees(field.required_roles):
+            # Indistinguishable from "field doesn't exist".
+            hint = _closest_match(
+                field_name, [f.name for f in cube.measures + cube.dimensions + cube.time_dimensions]
+            )
+            known = sorted(f.name for f in cube.measures + cube.dimensions + cube.time_dimensions)
+            suffix = f" Did you mean {hint!r}?" if hint else ""
+            raise UnknownIdentifierError(
+                f"Unknown field {field_name!r} on cube {cube_name!r}. "
+                f"Known fields: {known}.{suffix}",
+                kind="field",
+                name=field_name,
+                cube=cube_name,
+                hint=hint,
+            )
+
+
+def _walk_where_dims(node: BoolExpr | Filter) -> list[str]:
+    """Walk a BoolExpr / Filter tree and collect every ``Filter.dimension`` ref."""
+    from semql.spec import BoolExpr, Filter
+
+    out: list[str] = []
+    if isinstance(node, Filter):
+        out.append(node.dimension)
+    elif isinstance(node, BoolExpr):  # pyright: ignore[reportUnnecessaryIsInstance] — defensive
+        for c in node.children:
+            out.extend(_walk_where_dims(c))
+    return out
+
+
+def _find_field(
+    cube: Cube, field_name: str
+) -> Measure | Dimension | TimeDimension | Segment | None:
+    """Return the field on ``cube`` matching ``field_name``, or None."""
+    for m in cube.measures:
+        if m.name == field_name:
+            return m
+    for d in cube.dimensions:
+        if d.name == field_name:
+            return d
+    for td in cube.time_dimensions:
+        if td.name == field_name:
+            return td
+    for s in cube.segments:
+        if s.name == field_name:
+            return s
+    return None
+
+
+def _closest_match(name: str, candidates: list[str]) -> str | None:
+    """Tiny typo-tolerance for the field-hide gate (no info leak — we
+    only suggest names from the visible set)."""
+    if not candidates:
+        return None
+    name_lower = name.lower()
+    # Prefix match first (the most common case).
+    for c in candidates:
+        if c.lower().startswith(name_lower[:3]):
+            return c
+    return candidates[0]
+
+
 def _check_lifecycle(touched: list[Cube]) -> None:
     """Refuse queries that touch a ``deprecated`` cube. ``beta`` flows
     through unchanged — the planner sees a "beta" annotation in the
@@ -823,6 +1057,7 @@ class _CompileEnv:
 
         _check_lifecycle(self.touched)
         _check_viewer_authorization(self.touched, viewer, policy)
+        _check_field_visibility(q, catalog, viewer)
         _check_required_filters(self.touched, q)
 
         self.backend = _pick_single_backend(self.touched)
@@ -861,6 +1096,31 @@ class _CompileEnv:
         )
         self.root = self.cubes_in_from[0]
 
+        # LogicalPlan — lower the SemanticQuery to the IR.  This is the
+        # single source of truth for emission: every post-build read
+        # (filters, joins, project, aggregate, time-window granularity,
+        # order, limit) goes through ``self.plan`` rather than the
+        # spec tree.  Built *after* the join graph (the plan owns the
+        # join graph too) but *before* the time-block below so the
+        # time_window read at 957-963 below is sourced from the plan.
+        # Pre-flight checks at 891-924 above fire before the plan is
+        # built and don't depend on it — they're the load-bearing
+        # diagnostics (``CrossBackendError``, deprecated-cube refusal,
+        # etc.) that must precede everything else.
+        from semql.logical import apply_rollup_to_plan, to_logical_plan
+
+        self.plan = to_logical_plan(q, catalog, views=self.views_map, resolved=resolved)
+
+        # Apply the plan→plan rollup transform if a rollup was
+        # picked.  Currently the catalog is also rewritten (see the
+        # comment on the rollup-routing block above) so the existing
+        # emission path keeps working; once emission reads from
+        # ``self.plan`` directly, the catalog rewrite becomes
+        # redundant.
+        if picked is not None:
+            rollup_cube, rollup = picked
+            self.plan = apply_rollup_to_plan(self.plan, rollup_cube, rollup)
+
         self.cube_aliases: dict[str, str] = {c.name: c.alias for c in self.cubes_in_from}
         self.dialect = dialect_for(self.backend, dialects)
         self.sqlglot_dialect = sqlglot_dialect_for(self.backend)
@@ -883,41 +1143,71 @@ class _CompileEnv:
         self.measure_col_names: list[str] = [
             self._col_name(c, m.name) for c, m in self.measure_fields
         ]
+        # I14 placeholder — populated after the time-block below,
+        # once ``self.time_col_name`` is set.
+        self.alias_map: dict[str, str] = {}
 
+        # Time-block: read granularity from the plan, not the spec tree.
+        # The plan's ``time_window`` is the lowered representation of
+        # ``q.time_dimension`` — same value, single source of truth.
+        plan_time_window = self.plan.time_window
         self.has_time_breakdown: bool = (
             self.time_cube is not None
             and self.time_dim is not None
-            and q.time_dimension is not None
-            and q.time_dimension.granularity is not None
+            and plan_time_window is not None
+            and plan_time_window.granularity is not None
         )
         self.time_col_name: str | None = None
         if self.has_time_breakdown:
-            assert self.time_dim is not None and q.time_dimension is not None
-            granularity = q.time_dimension.granularity
+            assert self.time_dim is not None and plan_time_window is not None
+            granularity = plan_time_window.granularity
             assert granularity is not None
             self.time_col_name = f"{self.time_dim.name}_{granularity}"
 
-        # LogicalPlan — lower the SemanticQuery to the IR.  Emission
-        # is unchanged in this stage; a follow-up wires the plan into
-        # build_inner / _emit_*_query.  The plan is stored so callers
-        # (and tests) can introspect what the compiler will emit.
-        # Built *last* so all the existing checks above fire first —
-        # their diagnostics are the load-bearing ones (e.g.
-        # ``CrossBackendError`` precedes ``JoinPathError`` for queries
-        # that span backends with no join).
-        from semql.logical import apply_rollup_to_plan, to_logical_plan
-
-        self.plan = to_logical_plan(q, catalog, views=self.views_map, resolved=resolved)
-
-        # Apply the plan→plan rollup transform if a rollup was
-        # picked.  Currently the catalog is also rewritten (see the
-        # comment on the rollup-routing block above) so the existing
-        # emission path keeps working; once emission reads from
-        # ``self.plan`` directly, the catalog rewrite becomes
-        # redundant.
-        if picked is not None:
-            rollup_cube, rollup = picked
-            self.plan = apply_rollup_to_plan(self.plan, rollup_cube, rollup)
+        # I14 — Output column aliases. Validate every alias (resolves
+        # to a declared field; key doesn't collide with an existing
+        # output column). Build a ``col_name -> alias_key`` map so
+        # projection / order / having can substitute the alias key
+        # for the original column name. Lives after the time-block
+        # so ``self.time_col_name`` is available.
+        if q.aliases:
+            existing_cols: set[str] = set(self.dim_col_names) | set(self.measure_col_names)
+            if self.time_col_name is not None:
+                existing_cols.add(self.time_col_name)
+            for alias_key, alias_ref in q.aliases.items():
+                # Resolve the alias target; reject unknown fields.
+                try:
+                    ref_cube, ref_field = _resolve_field(alias_ref, catalog)
+                except CompileError:
+                    raise CompileError(
+                        f"aliases[{alias_key!r}] = {alias_ref!r}: "
+                        f"field does not exist on any touched cube."
+                    ) from None
+                # Reject collisions with existing output column names.
+                if alias_key in existing_cols:
+                    raise CompileError(
+                        f"aliases[{alias_key!r}]: alias key collides with "
+                        f"an existing output column. Pick a distinct name."
+                    )
+                # The original col_name for this field is what
+                # projection emits; we substitute the alias key in
+                # its place. ``_col_name`` returns either the bare
+                # name or ``{cube}_{name}`` for collisions.
+                original_col = self._col_name(ref_cube, ref_field.name)
+                # If the alias target is a measure / dim that's
+                # already in the query, replace its column name with
+                # the alias key. If the target is a measure / dim
+                # NOT in the query, we'd need to add it — out of
+                # scope for I14 (keep the contract simple: aliases
+                # only re-label already-selected fields).
+                if original_col not in existing_cols:
+                    raise CompileError(
+                        f"aliases[{alias_key!r}] = {alias_ref!r}: target "
+                        "field is not selected in this query. I14 "
+                        "aliases re-label existing outputs only."
+                    )
+                self.alias_map[original_col] = alias_key
+                existing_cols.add(alias_key)
 
     # ------------------------------------------------------------------
     # Helpers — were inline closures inside ``compile_query`` before.
@@ -925,6 +1215,47 @@ class _CompileEnv:
 
     def _col_name(self, cube: Cube, field_name: str) -> str:
         return f"{cube.name}_{field_name}" if field_name in self._collisions else field_name
+
+    def field_is_masked(self, field: Measure | Dimension) -> bool:
+        """A1 mask gate — viewer has any role in ``field.mask_roles``.
+
+        The field-hide gate (a different error path) already filters
+        fields whose ``required_roles`` the viewer doesn't intersect.
+        If we got here, the viewer has the required role; we just
+        check whether they also have a mask role.
+        """
+        if self.viewer is None or not field.mask_roles:
+            return False
+        return any(r in self.viewer.roles for r in field.mask_roles)
+
+    def _masked_field_expr(
+        self,
+        field: Measure | Dimension,
+        default_expr: exp.Expression,
+        col_name: str,
+    ) -> exp.Expression:
+        """A1 mask substitution — return the field's SQL or a constant.
+
+        ``None`` mask value → ``CAST(NULL AS <inferred_type>)``.
+        String mask value → literal SQL (caller is responsible for
+        proper SQL syntax — e.g. ``"'REDACTED'"`` with quotes).
+        """
+        if not self.field_is_masked(field):
+            return default_expr
+        if field.mask_value is not None:
+            from sqlglot import exp
+
+            return exp.Literal.string(field.mask_value.strip("'\""))
+        # Default to a NULL cast whose type matches the column's
+        # storage. For measures we infer from ``agg``; for dimensions
+        # we read the declared ``type``; fall back to plain NULL.
+        from sqlglot import exp
+
+        if isinstance(field, Measure):
+            storage = _infer_measure_storage_type(field.agg)
+        else:
+            storage = field.type
+        return exp.Cast(this=exp.Null(), to=exp.DataType.build(storage))
 
     def bind(self, value: Any, dim_type: str) -> exp.Placeholder:  # noqa: ANN401
         """Allocate (or reuse) a parameter placeholder for ``value``."""
@@ -1135,24 +1466,30 @@ class _CompileEnv:
         """Emit the SELECT list: dimensions, optional bucketed time
         dimension, measures. Adds DISTINCT for ungrouped row-listing
         queries with no measures."""
-        q = self.q
         for (_cube, dim), col_name in zip(self.dim_fields, self.dim_col_names, strict=True):
-            sel = sel.select(exp.alias_(self.parse(dim.sql), col_name))
+            expr = self._masked_field_expr(dim, self.parse(dim.sql), col_name)
+            # I14: alias the output column if the user named one.
+            out_name = self.alias_map.get(col_name, col_name)
+            sel = sel.select(exp.alias_(expr, out_name))
 
         if self.has_time_breakdown:
-            assert self.time_dim is not None and q.time_dimension is not None
-            granularity = q.time_dimension.granularity
+            assert self.time_dim is not None and self.plan.time_window is not None
+            granularity = self.plan.time_window.granularity
             assert granularity is not None
             assert self.time_col_name is not None
             trunc_node = self.dialect.trunc(granularity, self.parse(self.time_dim.sql))
-            sel = sel.select(exp.alias_(trunc_node, self.time_col_name))
+            out_name = self.alias_map.get(self.time_col_name, self.time_col_name)
+            sel = sel.select(exp.alias_(trunc_node, out_name))
 
         for (cube_owner, m), col_name in zip(
             self.measure_fields, self.measure_col_names, strict=True
         ):
-            sel = sel.select(exp.alias_(self.build_measure_expr(cube_owner, m), col_name))
+            base = self.build_measure_expr(cube_owner, m)
+            expr = self._masked_field_expr(m, base, col_name)
+            out_name = self.alias_map.get(col_name, col_name)
+            sel = sel.select(exp.alias_(expr, out_name))
 
-        if not q.ungrouped and not self.measure_fields:
+        if not self.q.ungrouped and not self.measure_fields:
             sel.set("distinct", exp.Distinct())
         return sel
 
@@ -1220,7 +1557,7 @@ class _CompileEnv:
 
         return _compile_where_tree(expr, _leaf_to_node)
 
-    def _lookup_filter_field(self, leaf: Filter) -> Dimension | Measure | TimeDimension:
+    def _lookup_filter_field(self, leaf: Filter) -> Dimension | Measure | TimeDimension | Segment:
         """Find the field for a filter leaf, considering both the
         flat ``filters`` list and the where-tree leaves."""
         for f, _cube, fld in self.filter_resolutions:
@@ -1238,7 +1575,7 @@ class _CompileEnv:
     def _filter_term(
         self,
         f: Filter,
-        fld: Dimension | Measure | TimeDimension,
+        fld: Dimension | Measure | TimeDimension | Segment,
     ) -> exp.Expression:
         """Render one flat-filter / where-tree-leaf into a SQL predicate.
 
@@ -1272,8 +1609,8 @@ class _CompileEnv:
                 sel = sel.group_by(self.parse(dim.sql))
 
         if self.has_time_breakdown:
-            assert self.time_dim is not None and q.time_dimension is not None
-            granularity = q.time_dimension.granularity
+            assert self.time_dim is not None and self.plan.time_window is not None
+            granularity = self.plan.time_window.granularity
             assert granularity is not None
             assert self.time_col_name is not None
             if self.group_by_alias:
@@ -1357,8 +1694,8 @@ def _emit_compare_query(env: _CompileEnv) -> CompiledQuery:
     measure_col_names = env.measure_col_names
     time_col_name = env.time_col_name
 
-    assert q.compare is not None and q.time_dimension is not None
-    current_range = q.time_dimension.range
+    assert q.compare is not None and env.plan.time_window is not None
+    current_range = env.plan.time_window.range
     if q.compare.mode == "previous_period":
         cs = datetime.fromisoformat(current_range[0])
         ce = datetime.fromisoformat(current_range[1])
@@ -1516,6 +1853,7 @@ def _emit_compare_query(env: _CompileEnv) -> CompiledQuery:
         time_col_name,
         is_compare=True,
     )
+    cm = _apply_mask_metadata(cm, env)
     return CompiledQuery(
         backend=env.backend,
         sql=sql,
@@ -1541,9 +1879,9 @@ def _emit_simple_query(env: _CompileEnv) -> CompiledQuery:
     measure_col_names = env.measure_col_names
     time_col_name = env.time_col_name
 
-    assert q.time_dimension is None or env.time_dim is not None
+    assert env.plan.time_window is None or env.time_dim is not None
     time_range_for_query: tuple[str, str] | None = (
-        q.time_dimension.range if q.time_dimension is not None else None
+        env.plan.time_window.range if env.plan.time_window is not None else None
     )
     select_node = env.build_inner(time_range_for_query or ("", ""))
 
@@ -1551,6 +1889,12 @@ def _emit_simple_query(env: _CompileEnv) -> CompiledQuery:
     if env.has_time_breakdown and time_col_name is not None:
         columns.append(time_col_name)
     columns.extend(measure_col_names)
+    # I14: substitute alias keys for original column names in the
+    # output column list. order_by / having also use the alias key
+    # because the user wrote it that way — the SQL was already
+    # rendered with the alias key in projection.
+    if env.alias_map:
+        columns = [env.alias_map.get(c, c) for c in columns]
 
     if not columns:
         raise CompileError("Compiled query has no SELECT projections.")
@@ -1574,6 +1918,15 @@ def _emit_simple_query(env: _CompileEnv) -> CompiledQuery:
         columns.append(ir.name)
         measure_alias_map[ir.name] = node
 
+    # I14: HAVING may reference an alias key (e.g. ``net``) instead
+    # of the underlying measure name. Build a reverse map so we can
+    # substitute the canonical measure name before lookup.
+    alias_to_measure: dict[str, str] = {}
+    for alias_key, alias_ref in q.aliases.items():
+        # ``alias_ref`` is ``cube.field`` — extract the field name.
+        if "." in alias_ref:
+            alias_to_measure[alias_key] = alias_ref.rsplit(".", 1)[-1]
+
     for hf in q.having:
         if hf.dimension.startswith("compare."):
             raise CompileError(
@@ -1582,6 +1935,9 @@ def _emit_simple_query(env: _CompileEnv) -> CompiledQuery:
                 "``compare=CompareWindow(...)``."
             )
         lookup_name = hf.dimension
+        # I14: alias key → underlying measure name.
+        if lookup_name in alias_to_measure:
+            lookup_name = alias_to_measure[lookup_name]
         if lookup_name not in measure_alias_map and "." in lookup_name:
             lookup_name = lookup_name.rsplit(".", 1)[-1]
         if lookup_name not in measure_alias_map:
@@ -1600,7 +1956,7 @@ def _emit_simple_query(env: _CompileEnv) -> CompiledQuery:
     # Time spine — wrap the aggregation in a CTE and LEFT JOIN a
     # spine CTE so every bucket in [start, end) gets a row.
     fill_value: int | None = (
-        q.time_dimension.fill_nulls_with if q.time_dimension is not None else None
+        env.plan.time_window.fill_nulls_with if env.plan.time_window is not None else None
     )
     if fill_value is not None:
         if not env.has_time_breakdown:
@@ -1627,7 +1983,9 @@ def _emit_simple_query(env: _CompileEnv) -> CompiledQuery:
             )
         assert time_range_for_query is not None
         assert time_col_name is not None
-        granularity_val = q.time_dimension.granularity if q.time_dimension is not None else None
+        granularity_val = (
+            env.plan.time_window.granularity if env.plan.time_window is not None else None
+        )
         assert granularity_val is not None
         start_ph = env.bind(time_range_for_query[0], "time")
         end_ph = env.bind(time_range_for_query[1], "time")
@@ -1668,6 +2026,8 @@ def _emit_simple_query(env: _CompileEnv) -> CompiledQuery:
                 "references are only valid when the query sets "
                 "``compare=CompareWindow(...)``."
             )
+        # I14: alias key — already in the columns list, so the
+        # ``ref in columns`` branch below matches.
         if ref in measure_alias_map or ref in columns:
             order_target: exp.Expression = exp.column(ref)
         else:
@@ -1704,6 +2064,7 @@ def _emit_simple_query(env: _CompileEnv) -> CompiledQuery:
         time_col_name,
         is_compare=False,
     )
+    cm = _apply_mask_metadata(cm, env)
     return CompiledQuery(
         backend=env.backend,
         sql=sql,

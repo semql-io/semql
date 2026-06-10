@@ -134,6 +134,12 @@ class MergeSpec:
     limit: int | None
     offset: int | None
     mode: Literal["distributive", "raw_rows"]
+    # CNF clauses that touch more than one partition. Each clause is
+    # a list of (negated: bool, dimension: str, op: str, values: tuple)
+    # tuples. The merge applies them as a post-join WHERE combined
+    # with AND across clauses and OR within a clause. Used by the
+    # distributive-mode where-tree lift (v1 carryover from raw_rows).
+    cross_partition_clauses: tuple[tuple[tuple[bool, str, str, tuple[object, ...]], ...], ...] = ()
 
 
 @dataclass
@@ -544,6 +550,8 @@ def _emit_merge_sql(
     bridges: list[_Bridge],
     output_columns: list[str],
     output_column_meta: list[ColumnMeta],
+    *,
+    cross_partition_clauses: _Cnf | None = None,
 ) -> tuple[str, MergeSpec]:
     """Generate the DuckDB merge SQL.
 
@@ -695,6 +703,12 @@ def _emit_merge_sql(
     sql = f"SELECT {', '.join(select_exprs)} FROM {from_clause}"
     if joins_sql:
         sql += " " + " ".join(joins_sql)
+    if cross_partition_clauses:
+        cube_to_idx_m = {c.name: i for i, p in enumerate(partitions) for c in p.cubes}
+        clauses_sql = " AND ".join(
+            _emit_cross_partition_clause(c, cube_to_idx_m) for c in cross_partition_clauses
+        )
+        sql += f" WHERE {clauses_sql}"
     if q.measures and n_group > 0:
         sql += f" GROUP BY {group_by}"
 
@@ -720,8 +734,24 @@ def _emit_merge_sql(
         limit=q.limit,
         offset=q.offset,
         mode="distributive",
+        cross_partition_clauses=_serialise_cnf(cross_partition_clauses or []),
     )
     return sql, spec
+
+
+def _serialise_cnf(
+    clauses: _Cnf,
+) -> tuple[tuple[tuple[bool, str, str, tuple[object, ...]], ...], ...]:
+    """Serialise a CNF clause list into the MergeSpec-friendly form.
+
+    Each clause is a list of literals; each literal is a (negated,
+    dimension, op, values) tuple. The serialised form is hashable
+    so MergeSpec can stay frozen.
+    """
+    out: list[tuple[tuple[bool, str, str, tuple[object, ...]], ...]] = []
+    for clause in clauses:
+        out.append(tuple((neg, f.dimension, f.op, tuple(f.values)) for neg, f in clause))
+    return tuple(out)
 
 
 # ---------------------------------------------------------------------------
@@ -1277,6 +1307,7 @@ def _emit_merge_sql_raw_rows(
         limit=q.limit,
         offset=q.offset,
         mode="raw_rows",
+        cross_partition_clauses=_serialise_cnf(cross_partition_clauses or []),
     )
     return sql, spec
 
@@ -1450,13 +1481,6 @@ def compile_federated_query(
             "Federated compare-mode is not supported in v1.",
             reason="compare_in_federated",
         )
-    if q.where and mode == "distributive":
-        raise FederationError(
-            "Federated queries cannot use where in distributive mode.",
-            reason="where_tree_in_distributive_federated",
-        )
-    if q.segments and mode == "distributive":
-        raise FederationError("segments need mode='raw_rows'.", reason="segments_distributive")
     if q.having and mode == "distributive":
         raise FederationError(
             "Federated queries cannot use HAVING in distributive mode.",
@@ -1509,6 +1533,7 @@ def compile_federated_query(
                 limit=None,
                 offset=None,
                 mode="distributive",
+                cross_partition_clauses=(),
             ),
             columns=c.columns,
             column_meta=c.column_meta,
