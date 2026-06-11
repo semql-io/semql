@@ -115,7 +115,12 @@ def _aliased_source(cube: Cube, resolve_sql: SqlResolver) -> exp.Expression:
     Dispatches on ``cube.resolved_source``: plain-table cubes return a
     ``Table`` node (``schema.tbl AS alias``); derived-table cubes return a
     ``Subquery`` wrapping the resolved SQL (``(<sql>) AS alias``). Both
-    flow through the same ``resolve_sql`` placeholder substitution."""
+    flow through the same ``resolve_sql`` placeholder substitution.
+
+    Cubes with ``physical_sources`` are handled by
+    :func:`semql.partition.emit_physical_sources` via the dialect
+    ``emit_source`` method — they have no single ``CubeSource`` to
+    resolve here."""
     src = cube.resolved_source
     if isinstance(src, DerivedTable):
         return _aliased_derived(cube, src, resolve_sql)

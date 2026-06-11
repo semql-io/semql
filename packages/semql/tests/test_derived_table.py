@@ -47,7 +47,7 @@ def test_cube_explicit_source_takes_effect() -> None:
 
 
 def test_cube_rejects_neither_table_nor_source() -> None:
-    with pytest.raises(ValidationError, match=r"(?i)either ``table=``"):
+    with pytest.raises(ValidationError, match=r"(?i)must declare one source"):
         Cube(name="c", backend=Backend.POSTGRES, alias="c")
 
 

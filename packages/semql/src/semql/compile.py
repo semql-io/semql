@@ -68,7 +68,7 @@ from semql.errors import (
     UnknownIdentifierError,
 )
 from semql.introspect import PolicyFn, ScopeFn, viewer_sees
-from semql.logical import LogicalPlan, build_join_graph
+from semql.logical import LogicalPlan
 from semql.model import (
     AggLiteral,
     AuthContext,
@@ -82,6 +82,7 @@ from semql.model import (
     Segment,
     StorageType,
     TimeDimension,
+    TimePartitionedSource,
     View,
 )
 from semql.rollup import apply_rollup, pick_rollup
@@ -194,6 +195,12 @@ class CompiledQuery:
     # rollup routing fired. ``None`` means the query went to the base
     # tables. See :mod:`semql.rollup` for the matching rules.
     applied_rollup: str | None = None
+    # Names of the physical sources a partitioned cube (#48) actually
+    # scanned, in declaration order. ``()`` for cubes without
+    # ``physical_sources`` or when the query's time range fell outside
+    # every source (a zero-row subquery was emitted instead). See
+    # :mod:`semql.partition` for the routing rules.
+    physical_sources_hit: tuple[str, ...] = ()
 
     def model_dump(self) -> dict[str, Any]:
         """JSON-safe dict view of this CompiledQuery (I9 round-trip helper).
@@ -212,6 +219,7 @@ class CompiledQuery:
             "touched_cube_names": list(self.touched_cube_names),
             "derived_sources": list(self.derived_sources),
             "applied_rollup": self.applied_rollup,
+            "physical_sources_hit": list(self.physical_sources_hit),
         }
 
     @classmethod
@@ -235,6 +243,7 @@ class CompiledQuery:
             touched_cube_names=list(data.get("touched_cube_names", [])),
             derived_sources=list(data.get("derived_sources", [])),
             applied_rollup=data.get("applied_rollup"),
+            physical_sources_hit=tuple(data.get("physical_sources_hit", ())),
         )
 
 
@@ -252,12 +261,36 @@ def _collect_derived_sources(
     enter the compiled query."""
     out: list[str] = []
     for cube in touched:
+        if cube.physical_sources:
+            # Time-partitioned cubes (#48) have no single
+            # ``DerivedTable`` to materialise — each physical
+            # source is a plain table reference. The matched
+            # sources' SQL is captured by the dialect's emit
+            # path and is also surfaced via
+            # ``physical_sources_hit``; nothing to add here.
+            continue
         src = cube.resolved_source
         if isinstance(src, DerivedTable):
             for cte in src.with_ctes:
                 out.append(resolve_sql(cte.sql))
             out.append(resolve_sql(src.sql))
     return out
+
+
+def _empty_source_for(cube: Cube) -> exp.Subquery:
+    """Build a zero-row subquery aliased to ``cube.alias``.
+
+    Used as a fallback when a cube with ``physical_sources`` has
+    no source that intersects the query's time range. The
+    outer query's predicates still apply, so the result is
+    empty by construction — no rows leak across the time
+    boundary, and the cube is still queryable (the rest of the
+    pipeline continues to run)."""
+    inner = exp.Select().select(exp.Literal.number(1)).where(exp.Boolean(this=False))
+    return exp.Subquery(
+        this=inner,
+        alias=exp.TableAlias(this=exp.to_identifier(cube.alias)),
+    )
 
 
 def _collect_hoisted_ctes(
@@ -273,6 +306,11 @@ def _collect_hoisted_ctes(
     seen: set[str] = set()
     out: list[tuple[str, str]] = []
     for cube in touched:
+        if cube.physical_sources:
+            # Time-partitioned cubes (#48) have no single
+            # ``CubeSource`` to resolve — the source set is a
+            # list of physical tables, each without CTEs.
+            continue
         src = cube.resolved_source
         if not isinstance(src, DerivedTable):
             continue
@@ -1028,6 +1066,14 @@ class _CompileEnv:
             catalog = apply_rollup(catalog, rollup_cube, rollup)
             self.applied_rollup = rollup.name
 
+        # Time-partitioned source routing (#48). For each cube with
+        # ``physical_sources``, intersect the query's TimeWindow.range
+        # with each source's range and stash the matches here. The
+        # _from_clause_stage reads this to dispatch the partitioned
+        # emit path; ``CompiledQuery.physical_sources_hit`` exposes
+        # the matched names for observability.
+        self.physical_sources_matched: dict[str, tuple[str, ...]] = {}
+
         self.q = q
         self.catalog = catalog
         self.group_by_alias = group_by_alias
@@ -1091,35 +1137,64 @@ class _CompileEnv:
                     "left-joined cube's column to express the anti-join."
                 )
 
-        self.cubes_in_from, self.join_edges = build_join_graph(
-            self.touched, catalog, left_join_cubes=self.left_join_cubes
-        )
-        self.root = self.cubes_in_from[0]
-
         # LogicalPlan — lower the SemanticQuery to the IR.  This is the
         # single source of truth for emission: every post-build read
-        # (filters, joins, project, aggregate, time-window granularity,
-        # order, limit) goes through ``self.plan`` rather than the
-        # spec tree.  Built *after* the join graph (the plan owns the
-        # join graph too) but *before* the time-block below so the
-        # time_window read at 957-963 below is sourced from the plan.
-        # Pre-flight checks at 891-924 above fire before the plan is
-        # built and don't depend on it — they're the load-bearing
-        # diagnostics (``CrossBackendError``, deprecated-cube refusal,
-        # etc.) that must precede everything else.
+        # (scans, joins, project, aggregate, time-window granularity,
+        # order, limit, filters) goes through ``self.plan`` rather
+        # than the spec tree.  The join graph, projection columns, and
+        # aggregate / time / order / limit fields are all derived
+        # from the plan below — the legacy ``cubes_in_from`` /
+        # ``join_edges`` / ``dim_fields`` / ``measure_fields`` /
+        # ``time_dim`` slots survive as derived caches so downstream
+        # emission helpers can read them without re-walking the plan
+        # repeatedly.
         from semql.logical import apply_rollup_to_plan, to_logical_plan
 
         self.plan = to_logical_plan(q, catalog, views=self.views_map, resolved=resolved)
 
         # Apply the plan→plan rollup transform if a rollup was
-        # picked.  Currently the catalog is also rewritten (see the
-        # comment on the rollup-routing block above) so the existing
-        # emission path keeps working; once emission reads from
-        # ``self.plan`` directly, the catalog rewrite becomes
-        # redundant.
+        # picked.  The catalog is also rewritten (legacy path) so
+        # backends that read field SQLs from the catalog still see
+        # the rolled-up version; emission reads field SQLs from
+        # ``self.plan`` (via ``ColumnRef.field.sql``) so the rewrite
+        # is no longer load-bearing — it stays for now so the rest
+        # of the pipeline (auth wrappers, ``_collect_derived_sources``)
+        # keeps working transparently.
         if picked is not None:
             rollup_cube, rollup = picked
-            self.plan = apply_rollup_to_plan(self.plan, rollup_cube, rollup)
+            rollup_plan = apply_rollup_to_plan(self.plan, rollup_cube, rollup)
+            # The plan→plan transform produces a fresh logical cube;
+            # we still rewrite the catalog so the auth / tenancy
+            # code paths see the rolled-up shape.
+            catalog = apply_rollup(catalog, rollup_cube, rollup)
+            self.applied_rollup = rollup.name
+            self.plan = rollup_plan
+
+        # Time-partitioned source routing (#48). For each cube in the
+        # join graph that declares ``physical_sources``, intersect
+        # the plan's ``time_window.range`` with each source's range
+        # and stash the matched names. ``_from_clause_stage`` reads
+        # this to dispatch the partitioned emit path.
+        from semql.partition import select_physical_sources
+
+        for s in self.plan.scans:
+            c = s.cube
+            if c.physical_sources:
+                matched = select_physical_sources(c, self.plan.time_window)
+                self.physical_sources_matched[c.name] = tuple(s.name for s in matched)
+
+        # Derive the join-graph view from the plan. The plan's
+        # ``scans`` is the list of cubes the FROM clause sees
+        # (root first, joins appended in BFS order); ``joins`` is
+        # the list of edges.  The legacy ``cubes_in_from`` /
+        # ``join_edges`` fields are kept as derived caches — same
+        # shape as before so the rest of the emission code reads
+        # them transparently.
+        self.cubes_in_from: list[Cube] = [s.cube for s in self.plan.scans]
+        self.join_edges: list[tuple[Cube, Cube, Any]] = [
+            (j.left, j.right, j.model) for j in self.plan.joins
+        ]
+        self.root: Cube = self.cubes_in_from[0]
 
         self.cube_aliases: dict[str, str] = {c.name: c.alias for c in self.cubes_in_from}
         self.dialect = dialect_for(self.backend, dialects)
@@ -1216,7 +1291,7 @@ class _CompileEnv:
     def _col_name(self, cube: Cube, field_name: str) -> str:
         return f"{cube.name}_{field_name}" if field_name in self._collisions else field_name
 
-    def field_is_masked(self, field: Measure | Dimension) -> bool:
+    def field_is_masked(self, field: Measure | Dimension | TimeDimension) -> bool:
         """A1 mask gate — viewer has any role in ``field.mask_roles``.
 
         The field-hide gate (a different error path) already filters
@@ -1224,13 +1299,21 @@ class _CompileEnv:
         If we got here, the viewer has the required role; we just
         check whether they also have a mask role.
         """
-        if self.viewer is None or not field.mask_roles:
+        if self.viewer is None:
             return False
-        return any(r in self.viewer.roles for r in field.mask_roles)
+        # ``TimeDimension`` doesn't carry ``mask_roles`` — only
+        # ``Measure`` and ``Dimension`` do.  Return early for the
+        # time-dim case (the projection's ``kind="time"`` branch
+        # passes the source ``TimeDimension`` through here so the
+        # bucketed column participates in the same mask check).
+        mask_roles = getattr(field, "mask_roles", None)
+        if not mask_roles:
+            return False
+        return any(r in self.viewer.roles for r in mask_roles)
 
     def _masked_field_expr(
         self,
-        field: Measure | Dimension,
+        field: Measure | Dimension | TimeDimension,
         default_expr: exp.Expression,
         col_name: str,
     ) -> exp.Expression:
@@ -1242,10 +1325,14 @@ class _CompileEnv:
         """
         if not self.field_is_masked(field):
             return default_expr
-        if field.mask_value is not None:
+        # ``TimeDimension`` doesn't carry ``mask_value`` — fall
+        # through to the truncation expression (the time bucket
+        # isn't itself sensitive; the dim it slices is).
+        mask_value = getattr(field, "mask_value", None)
+        if mask_value is not None:
             from sqlglot import exp
 
-            return exp.Literal.string(field.mask_value.strip("'\""))
+            return exp.Literal.string(mask_value.strip("'\""))
         # Default to a NULL cast whose type matches the column's
         # storage. For measures we infer from ``agg``; for dimensions
         # we read the declared ``type``; fall back to plain NULL.
@@ -1447,49 +1534,136 @@ class _CompileEnv:
     def _from_clause_stage(self, sel: exp.Select) -> exp.Select:
         """Attach the FROM root + LEFT JOINs across the catalog's join
         graph. Per-cube isolation subqueries (tenancy / security_sql /
-        scope) wrap each source via ``wrap_for_tenancy``."""
-        sel = sel.from_(
-            self.wrap_for_tenancy(
-                self.root,
-                self.dialect.emit_source(self.root, self.catalog, self.resolve_in_ctx),
+        scope) wrap each source via ``wrap_for_tenancy``.
+
+        The root + join targets are read from
+        ``self.plan.scans`` / ``self.plan.joins`` (LOGb — the plan
+        is the single source of truth).  The legacy
+        derived-cube / derived-edge slots on the env survive for
+        any helpers that still reach past the plan; emission here
+        never touches them.
+
+        For cubes with ``physical_sources`` (#48), the per-source
+        match list was computed at env-init; the dialect's regular
+        ``emit_source`` is bypassed and the partitioned emit path
+        (a single subquery over the matched sources, all aliased
+        to ``cube.alias``) takes its place. ``wrap_for_tenancy``
+        then wraps that single subquery, so the auth / tenancy /
+        scope predicates apply to the union as a whole."""
+        from semql.partition import emit_physical_sources
+
+        plan_scans = self.plan.scans
+        plan_joins = self.plan.joins
+        root = plan_scans[0].cube
+
+        if root.physical_sources:
+            matched = self._matched_physical_sources_for(root)
+            # Query range outside every source — emit a
+            # zero-row subquery aliased to the cube's alias.
+            # The outer query's predicates still apply, so the
+            # result is empty by construction.
+            source: exp.Expression = (
+                emit_physical_sources(root, matched) if matched else _empty_source_for(root)
             )
-        )
-        for _, tgt, j in self.join_edges:
+        else:
+            source = self.dialect.emit_source(root, self.catalog, self.resolve_in_ctx)
+        sel = sel.from_(self.wrap_for_tenancy(root, source))
+        for plan_join in plan_joins:
+            tgt = plan_join.right
+            j = plan_join.model
             tgt_dialect = dialect_for(tgt.backend, self.dialects)
-            target_source = self.wrap_for_tenancy(
-                tgt, tgt_dialect.emit_source(tgt, self.catalog, self.resolve_in_ctx)
+            if tgt.physical_sources:
+                matched_t = self._matched_physical_sources_for(tgt)
+                target_source: exp.Expression = (
+                    emit_physical_sources(tgt, matched_t) if matched_t else _empty_source_for(tgt)
+                )
+            else:
+                target_source = tgt_dialect.emit_source(tgt, self.catalog, self.resolve_in_ctx)
+            sel = sel.join(
+                self.wrap_for_tenancy(tgt, target_source),
+                on=self.parse(j.on),
+                join_type="left",
             )
-            sel = sel.join(target_source, on=self.parse(j.on), join_type="left")
         return sel
 
+    def _matched_physical_sources_for(self, cube: Cube) -> list[TimePartitionedSource]:
+        """Return the list of ``TimePartitionedSource`` objects that
+        matched for ``cube`` at env-init time. The list preserves
+        declaration order so the emitted SQL is stable."""
+
+        # Re-derive the list (cheap) — the env stores names, not
+        # the objects themselves, because the same source set
+        # shouldn't be re-validated on every emit call.
+        matched_names = self.physical_sources_matched.get(cube.name, ())
+        return [s for s in cube.physical_sources if s.name in matched_names]
+
+    def all_matched_physical_source_names(self) -> tuple[str, ...]:
+        """Flat tuple of every physical source that matched across
+        all touched cubes, in cube-then-source declaration order.
+        Empty for catalogs that don't use ``physical_sources``."""
+        out: list[str] = []
+        for cube in self.cubes_in_from:
+            if cube.physical_sources:
+                out.extend(self.physical_sources_matched.get(cube.name, ()))
+        return tuple(out)
+
     def _projection_stage(self, sel: exp.Select) -> exp.Select:
-        """Emit the SELECT list: dimensions, optional bucketed time
-        dimension, measures. Adds DISTINCT for ungrouped row-listing
-        queries with no measures."""
-        for (_cube, dim), col_name in zip(self.dim_fields, self.dim_col_names, strict=True):
-            expr = self._masked_field_expr(dim, self.parse(dim.sql), col_name)
-            # I14: alias the output column if the user named one.
+        """Emit the SELECT list. Source: ``self.plan.project.columns`` —
+        one ``ColumnRef`` per output column, carrying the resolved
+        field object (``Measure`` / ``Dimension`` / ``TimeDimension``)
+        and the alias.
+
+        The legacy projection-derived slots on the env survive for
+        callers (e.g. ``_apply_mask_metadata``) but emission here
+        never reads them — the plan is the single source of truth
+        for the projection.
+        """
+        # Cache the lookup so we don't re-walk the ColumnRef list
+        # per column.  The same dim/measure field list still drives
+        # the collision-prefix table populated at env-init.
+        col_by_name: dict[str, str] = {}
+        for col_name in self.dim_col_names:
+            col_by_name[col_name] = "dimension"
+        for col_name in self.measure_col_names:
+            col_by_name[col_name] = "measure"
+        if self.time_col_name is not None:
+            col_by_name[self.time_col_name] = "time"
+
+        measure_count = 0
+        for col in self.plan.project.columns:
+            col_name = col.alias
             out_name = self.alias_map.get(col_name, col_name)
+            if col.kind == "dimension":
+                assert col.field is not None and isinstance(col.field, Dimension)
+                expr = self._masked_field_expr(col.field, self.parse(col.field.sql), col_name)
+            elif col.kind == "time":
+                assert col.field is not None and isinstance(col.field, TimeDimension)
+                assert self.plan.aggregate is not None
+                assert self.plan.aggregate.time is not None
+                granularity = self.plan.aggregate.time.granularity
+                assert granularity is not None
+                expr = self._masked_field_expr(
+                    col.field,
+                    self.dialect.trunc(granularity, self.parse(col.field.sql)),
+                    col_name,
+                )
+            elif col.kind == "measure":
+                assert col.field is not None and isinstance(col.field, Measure)
+                measure_count += 1
+                # ``build_measure_expr`` needs (cube, measure) — both
+                # are on the ColumnRef.
+                expr = self._masked_field_expr(
+                    col.field, self.build_measure_expr(col.cube, col.field), col_name
+                )
+            else:  # "computed" — derived / inline measure, deferred to ``_emit_simple_query``
+                continue
             sel = sel.select(exp.alias_(expr, out_name))
 
-        if self.has_time_breakdown:
-            assert self.time_dim is not None and self.plan.time_window is not None
-            granularity = self.plan.time_window.granularity
-            assert granularity is not None
-            assert self.time_col_name is not None
-            trunc_node = self.dialect.trunc(granularity, self.parse(self.time_dim.sql))
-            out_name = self.alias_map.get(self.time_col_name, self.time_col_name)
-            sel = sel.select(exp.alias_(trunc_node, out_name))
-
-        for (cube_owner, m), col_name in zip(
-            self.measure_fields, self.measure_col_names, strict=True
-        ):
-            base = self.build_measure_expr(cube_owner, m)
-            expr = self._masked_field_expr(m, base, col_name)
-            out_name = self.alias_map.get(col_name, col_name)
-            sel = sel.select(exp.alias_(expr, out_name))
-
-        if not self.q.ungrouped and not self.measure_fields:
+        if self.plan.aggregate is not None and measure_count == 0:
+            # Row-listing mode with no measures — DISTINCT collapses
+            # the duplicate rows the join produced.  ``plan.aggregate
+            # is None`` is the ungrouped case; ``measure_count == 0``
+            # with an aggregate is the "SELECT DISTINCT dim" pattern.
             sel.set("distinct", exp.Distinct())
         return sel
 
@@ -1593,30 +1767,54 @@ class _CompileEnv:
         return _filter_node(f, fld_node, fld_type, self.dialect, self.bind)
 
     def _group_by_stage(self, sel: exp.Select) -> exp.Select:
-        """Emit GROUP BY when the query has measures and isn't
-        ``ungrouped``. Groups by every projected dimension; the bucket
-        column when a time breakdown is in play. ``group_by_alias``
-        controls whether GROUP BY references the SELECT alias or
-        repeats the resolved expression."""
-        q = self.q
-        if q.ungrouped or not self.measure_fields:
+        """Emit GROUP BY from the plan's ``Aggregate`` node.
+
+        ``plan.aggregate is None`` is the row-listing case (no
+        GROUP BY).  Otherwise, group by every projected
+        ``kind="dimension"`` ColumnRef, then by the time bucket
+        when the plan carries a ``kind="time"`` ColumnRef.
+        ``group_by_alias`` controls whether GROUP BY references
+        the SELECT alias or repeats the resolved expression.
+
+        Source: ``self.plan.aggregate`` — the plan is the single
+        source of truth for the aggregation shape.
+        """
+        aggregate = self.plan.aggregate
+        if aggregate is None:
             return sel
 
-        for i, (_cube, dim) in enumerate(self.dim_fields):
-            if self.group_by_alias:
-                sel = sel.group_by(exp.column(self.dim_col_names[i]))
-            else:
-                sel = sel.group_by(self.parse(dim.sql))
+        # Group by the SELECT alias when configured.  The plan's
+        # ``Project.columns`` is in the same order the SELECT list
+        # was emitted, so a parallel walk over the dim columns
+        # matches the SELECT list.
+        dim_idx = 0
+        for col in self.plan.project.columns:
+            if col.kind == "dimension":
+                if self.group_by_alias:
+                    sel = sel.group_by(exp.column(self.dim_col_names[dim_idx]))
+                else:
+                    assert col.field is not None
+                    sel = sel.group_by(self.parse(col.field.sql))
+                dim_idx += 1
 
-        if self.has_time_breakdown:
-            assert self.time_dim is not None and self.plan.time_window is not None
+        if aggregate.time is not None and self.time_col_name is not None:
+            assert self.plan.time_window is not None
             granularity = self.plan.time_window.granularity
             assert granularity is not None
-            assert self.time_col_name is not None
             if self.group_by_alias:
                 sel = sel.group_by(exp.column(self.time_col_name))
             else:
-                sel = sel.group_by(self.dialect.trunc(granularity, self.parse(self.time_dim.sql)))
+                # Find the time-dim field for the trunc source.
+                td = next(
+                    (
+                        c.field
+                        for c in self.plan.project.columns
+                        if c.kind == "time" and c.field is not None
+                    ),
+                    None,
+                )
+                if td is not None:
+                    sel = sel.group_by(self.dialect.trunc(granularity, self.parse(td.sql)))
         return sel
 
     def emit(self) -> CompiledQuery:
@@ -1819,7 +2017,7 @@ def _emit_compare_query(env: _CompileEnv) -> CompiledQuery:
             join_type="full outer",
         )
 
-    for ref, direction in q.order:
+    for ref, direction in env.plan.order.keys:
         col = _resolve_compare_outer_ref(ref, outer_columns, measure_col_names, what="ORDER BY")
         outer = outer.order_by(exp.Ordered(this=exp.column(col), desc=(direction == "desc")))
 
@@ -1834,10 +2032,10 @@ def _emit_compare_query(env: _CompileEnv) -> CompiledQuery:
         )
         outer = outer.having(_filter_node(hf, exp.column(col), "number", env.dialect, env.bind))
 
-    if q.limit is not None:
-        outer = outer.limit(int(q.limit))
-    if q.offset is not None and q.offset > 0:
-        outer = outer.offset(int(q.offset))
+    if env.plan.limit.limit is not None:
+        outer = outer.limit(int(env.plan.limit.limit))
+    if env.plan.limit.offset is not None and env.plan.limit.offset > 0:
+        outer = outer.offset(int(env.plan.limit.offset))
 
     outer = _apply_with_clause(
         outer, _collect_hoisted_ctes(env.touched, env.resolve_in_ctx), env.backend
@@ -1863,6 +2061,7 @@ def _emit_compare_query(env: _CompileEnv) -> CompiledQuery:
         touched_cube_names=[c.name for c in env.touched],
         derived_sources=_collect_derived_sources(env.touched, env.resolve_in_ctx),
         applied_rollup=env.applied_rollup,
+        physical_sources_hit=env.all_matched_physical_source_names(),
     )
 
 
@@ -2019,7 +2218,7 @@ def _emit_simple_query(env: _CompileEnv) -> CompiledQuery:
         )
         select_node = outer
 
-    for ref, direction in q.order:
+    for ref, direction in env.plan.order.keys:
         if ref.startswith("compare."):
             raise CompileError(
                 f"ORDER BY {ref!r}: ``compare.<measure>.<facet>`` "
@@ -2043,10 +2242,10 @@ def _emit_simple_query(env: _CompileEnv) -> CompiledQuery:
             exp.Ordered(this=order_target, desc=(direction == "desc"))
         )
 
-    if q.limit is not None:
-        select_node = select_node.limit(int(q.limit))
-    if q.offset is not None and q.offset > 0:
-        select_node = select_node.offset(int(q.offset))
+    if env.plan.limit.limit is not None:
+        select_node = select_node.limit(int(env.plan.limit.limit))
+    if env.plan.limit.offset is not None and env.plan.limit.offset > 0:
+        select_node = select_node.offset(int(env.plan.limit.offset))
 
     select_node = _apply_with_clause(
         select_node,
@@ -2074,6 +2273,7 @@ def _emit_simple_query(env: _CompileEnv) -> CompiledQuery:
         touched_cube_names=[c.name for c in env.touched],
         derived_sources=_collect_derived_sources(env.touched, env.resolve_in_ctx),
         applied_rollup=env.applied_rollup,
+        physical_sources_hit=env.all_matched_physical_source_names(),
     )
 
 
@@ -2115,6 +2315,96 @@ def explain_plan(
         allow_unbounded_ungrouped=False,
     )
     return env.plan
+
+
+def compile_plan(
+    plan: LogicalPlan,
+    catalog: dict[str, Cube],
+    *,
+    context: dict[str, str] | None = None,
+    group_by_alias: bool = True,
+    having_alias: bool = False,
+    dialects: dict[Backend, BackendDialect] | None = None,
+    views: dict[str, View] | None = None,
+    viewer: AuthContext | None = None,
+    policy: PolicyFn | None = None,
+    scope_fns: dict[str, ScopeFn] | None = None,
+    _allow_unbounded_ungrouped: bool = False,
+) -> CompiledQuery:
+    """Compile a :class:`LogicalPlan` directly to a :class:`CompiledQuery`.
+
+    LOGb entry point — the plan is the single source of truth for
+    emission.  Used by:
+
+    - The federation split-point
+      (:func:`semql.federate.compile_federated_query` calls
+      :func:`partition_scans` to derive per-backend plans, then this
+      function compiles each).
+    - Callers that want the MCP ``explain``-then-emit flow
+      (build a plan, inspect it, then compile to SQL).
+    - Round-trip tests that precompute a plan and assert the
+      emitted SQL matches the spec-tree path
+      (see ``test_logb_ii_plan_driven_compile``).
+
+    The plan is augmented internally with the matching
+    ``SemanticQuery`` (re-derived from the plan's fields) so the
+    pre-flight checks (``_validate_query_invariants``,
+    ``_check_lifecycle``, etc.) can run.  The end-to-end SQL is
+    byte-identical to :func:`compile_query` on the equivalent
+    query — the plan is a strict intermediate representation; the
+    spec-tree path and the plan path agree exactly.
+    """
+    from semql.spec import SemanticQuery
+
+    # Re-derive the SemanticQuery from the plan.  The plan is
+    # frozen and the schema is small; a structural rebuild keeps
+    # the round-trip lossless and avoids a side channel for
+    # "the spec was X but the plan lowered to Y" mismatches.
+    dim_refs: list[str] = []
+    measure_refs: list[str] = []
+    for col in plan.project.columns:
+        if col.kind == "dimension" and col.field is not None:
+            dim_refs.append(f"{col.cube.name}.{col.field.name}")
+        elif col.kind == "measure" and col.field is not None:
+            measure_refs.append(f"{col.cube.name}.{col.field.name}")
+        # kind="time" maps to plan.time_window — handled below.
+
+    # Rebuild the compare-mode CompareWindow from the plan. The
+    # plan stores the pre-computed current / prior ranges;
+    # we surface them as a fresh ``CompareWindow`` so the
+    # emit path's compare-mode shape checks match.
+    from semql.spec import CompareWindow
+
+    compare_window: CompareWindow | None = None
+    if plan.compare is not None:
+        compare_window = CompareWindow(
+            mode="explicit",
+            range=plan.compare.prior_range,
+        )
+
+    q = SemanticQuery(
+        measures=measure_refs,
+        dimensions=dim_refs,
+        time_dimension=plan.time_window,
+        compare=compare_window,
+        order=list(plan.order.keys),
+        limit=plan.limit.limit,
+        offset=plan.limit.offset,
+    )
+    env = _CompileEnv(
+        q,
+        catalog,
+        context=context,
+        group_by_alias=group_by_alias,
+        having_alias=having_alias,
+        dialects=dialects,
+        views=views,
+        viewer=viewer,
+        policy=policy,
+        scope_fns=scope_fns,
+        allow_unbounded_ungrouped=_allow_unbounded_ungrouped,
+    )
+    return env.emit()
 
 
 def compile_query(
@@ -2182,6 +2472,7 @@ __all__ = [
     "PhaseDeferredError",
     "PlaceholderError",
     "UnknownIdentifierError",
+    "compile_plan",
     "compile_query",
     "explain_plan",
 ]

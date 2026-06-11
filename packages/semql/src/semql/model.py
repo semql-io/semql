@@ -474,6 +474,117 @@ class DerivedTable(BaseModel):
 CubeSource = PhysicalTable | DerivedTable
 
 
+class TimePartition(BaseModel):
+    """Declares which ``TimeDimension`` on the cube drives source
+    selection when the cube has multiple ``TimePartitionedSource``s.
+
+    The same physical layout is reused by every source's half-open
+    range; each source binds its own bounds. Routing is unambiguous
+    — there is one routing dim per cube.
+
+    Set this together with :attr:`Cube.physical_sources`; setting it
+    alone is a configuration error."""
+
+    model_config = ConfigDict(frozen=True)
+    time_dimension: str
+
+
+class TimePartitionedSource(BaseModel):
+    """One physical table in a cube's time-partitioned source set.
+
+    A cube that historically has "old" and "new" tables (e.g. a
+    monthly-rolled-up archive table and a per-row live table) declares
+    one ``TimePartitionedSource`` per physical table. The compiler
+    intersects the query's ``TimeWindow.range`` with each source's
+    half-open range and ``UNION ALL``s the matches — the auth /
+    tenancy / scope wrappers then wrap the union as a whole, so a
+    single outer ``OR`` predicate can't bypass the per-source
+    boundaries.
+
+    ``range_start`` / ``range_end`` are ISO-8601 lower / upper
+    bounds; ``None`` on a side means open-ended in that direction.
+    Two sources MAY overlap (the compiler unions the overlap);
+    ``range_start >= range_end`` is a construction error. Sources
+    are matched by the cube's :class:`TimePartition` on the routing
+    time dimension.
+
+    ``column_renames`` maps a logical field name (as declared on
+    the cube) to this source's physical column. The compiler emits
+    the source as a ``SELECT <physical> AS <logical>, ... FROM
+    <table>`` subquery, so the outer query and the planner see
+    only logical names. The cube's field-level column map is the
+    source of truth; missing renames fall back to the logical name
+    verbatim.
+
+    The single-source shorthand (``Cube.table="t"``) is unaffected
+    — ``physical_sources`` is a strict opt-in."""
+
+    model_config = ConfigDict(frozen=True)
+    name: str
+    table: str
+    alias: str = "s"
+    range_start: str | None = None
+    range_end: str | None = None
+    column_renames: dict[str, str] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _check_range_ordering(self) -> TimePartitionedSource:
+        if (
+            self.range_start is not None
+            and self.range_end is not None
+            and not self.range_start < self.range_end
+        ):
+            raise ValueError(
+                f"TimePartitionedSource {self.name!r}: range_start "
+                f"{self.range_start!r} must be strictly less than "
+                f"range_end {self.range_end!r}. Half-open intervals "
+                "with start == end are empty."
+            )
+        return self
+
+
+class PartitionedScan(BaseModel):
+    """The routing metadata for a time-partitioned cube after the
+    plan→plan ``apply_partition_to_plan`` transform.
+
+    A synthetic :class:`Cube` whose ``partitioned_scan`` is set
+    represents "this cube is read through the matched physical
+    sources, not through ``table`` / ``source``." The compiler's
+    ``_from_clause_stage`` checks for a non-None ``partitioned_scan``
+    and emits the unioned subquery in place of the cube's normal
+    table reference.
+
+    ``sources`` is the (sub)set of :class:`TimePartitionedSource` the
+    query's ``TimeWindow.range`` intersected with. ``is_empty`` is a
+    shortcut for the case where no source matched: the plan
+    lowers to a zero-row subquery (``SELECT 1 WHERE FALSE``) and
+    the outer query's predicates still apply, so the result is
+    empty by construction.
+
+    Lives on the cube value rather than as a free-floating IR node
+    because the synthetic cube is what the existing emission path
+    reads (``_from_clause_stage`` already dispatches on cube-level
+    metadata for the ``physical_sources`` case). Putting
+    ``PartitionedScan`` on the cube keeps the IR's ``scans`` list
+    a flat list of :class:`Scan` nodes — a tagged-union surface
+    would be a bigger contract change for marginal benefit.
+    """
+
+    model_config = ConfigDict(frozen=True)
+    sources: tuple[TimePartitionedSource, ...] = ()
+    is_empty: bool = False
+
+    @model_validator(mode="after")
+    def _check_consistency(self) -> PartitionedScan:
+        if self.is_empty and self.sources:
+            raise ValueError(
+                "PartitionedScan: is_empty=True and sources non-empty is "
+                "self-contradictory. Set is_empty=False when the matched "
+                "source list is non-empty."
+            )
+        return self
+
+
 class Cube(BaseModel):
     name: str
     backend: Backend
@@ -594,6 +705,25 @@ class Cube(BaseModel):
     # default. The value is a *declared* count, not a live
     # measurement; callers update it on a schedule.
     size_hint: int | None = None
+    # Time-partitioned physical source set — see
+    # :class:`TimePartition` / :class:`TimePartitionedSource`. The
+    # compiler intersects the query's ``TimeWindow.range`` with each
+    # source's half-open range and ``UNION ALL``s the matches.
+    # Mutually exclusive with ``table`` / ``source``: a cube has
+    # exactly one source declaration. The two single-source variants
+    # (``table`` shorthand, ``source=PhysicalTable``) are unaffected.
+    physical_sources: list[TimePartitionedSource] = []
+    # Routing time dimension for the partition set. Required when
+    # ``physical_sources`` is non-empty; ignored otherwise. Names a
+    # ``TimeDimension`` on this cube.
+    time_partition: TimePartition | None = None
+    # Set by the plan→plan ``apply_partition_to_plan`` transform
+    # when a time-partitioned cube is routed. The synthetic cube
+    # the transform produces carries the matched source set here;
+    # ``_from_clause_stage`` checks this and emits the unioned
+    # subquery in place of ``table`` / ``source``. ``None`` for
+    # the unpartitioned case (the common path).
+    partitioned_scan: PartitionedScan | None = None
 
     @model_validator(mode="after")
     def _check_size_hint(self) -> Cube:
@@ -601,6 +731,61 @@ class Cube(BaseModel):
             raise ValueError(
                 f"Cube {self.name!r}: size_hint must be non-negative, got {self.size_hint}"
             )
+        return self
+
+    @model_validator(mode="after")
+    def _check_physical_sources(self) -> Cube:
+        """Validate the time-partitioned source set: uniqueness, the
+        routing dim exists on the cube, every column rename maps to
+        a real field, and ``time_partition`` is set when the source
+        set is non-empty.
+
+        Source / ``physical_sources`` mutual exclusivity is checked
+        in :meth:`_check_source_consistency`; this validator only
+        concerns the contents of the source set itself."""
+        if not self.physical_sources:
+            if self.time_partition is not None:
+                raise ValueError(
+                    f"Cube {self.name!r}: time_partition is set but "
+                    "physical_sources is empty. Either drop time_partition "
+                    "or populate physical_sources with at least one entry."
+                )
+            return self
+
+        if self.time_partition is None:
+            raise ValueError(
+                f"Cube {self.name!r}: physical_sources is non-empty but "
+                "time_partition is not set. The router needs to know which "
+                "TimeDimension drives source selection."
+            )
+
+        td_names = {td.name for td in self.time_dimensions}
+        if self.time_partition.time_dimension not in td_names:
+            raise ValueError(
+                f"Cube {self.name!r}: time_partition.time_dimension "
+                f"{self.time_partition.time_dimension!r} is not a "
+                "TimeDimension on this cube. Known: "
+                f"{sorted(td_names)}."
+            )
+
+        field_names = self.field_names() | {td.name for td in self.time_dimensions}
+        seen: set[str] = set()
+        for src in self.physical_sources:
+            if src.name in seen:
+                raise ValueError(
+                    f"Cube {self.name!r}: duplicate physical source name "
+                    f"{src.name!r}. Source names must be unique within a cube."
+                )
+            seen.add(src.name)
+            for logical_name in src.column_renames:
+                if logical_name not in field_names:
+                    raise ValueError(
+                        f"Cube {self.name!r}, physical source {src.name!r}: "
+                        f"column_renames key {logical_name!r} is not a field "
+                        f"(measure / dimension / time dimension / segment) "
+                        f"on this cube. Known: {sorted(field_names)}."
+                    )
+        return self
         return self
 
     @model_validator(mode="after")
@@ -710,17 +895,30 @@ class Cube(BaseModel):
 
     @model_validator(mode="after")
     def _check_source_consistency(self) -> Cube:
-        """Exactly one source declaration: ``table`` (shorthand) or
-        ``source`` (explicit). Setting both is OK only when ``source`` is
-        a ``PhysicalTable`` whose ``table`` matches; mixing a ``table`` value
-        with a ``DerivedTable`` is rejected."""
+        """Exactly one source declaration: ``table`` (shorthand),
+        ``source`` (explicit ``PhysicalTable`` / ``DerivedTable``), or
+        ``physical_sources`` (time-partitioned set). Setting both
+        ``table`` and ``source`` is OK only when ``source`` is a
+        ``PhysicalTable`` whose ``table`` matches; mixing a ``table``
+        value with a ``DerivedTable`` is rejected.
+
+        ``physical_sources`` is mutually exclusive with both ``table``
+        and ``source`` — a cube has one source declaration, full stop."""
         has_table = bool(self.table)
         has_source = self.source is not None
-        if not has_table and not has_source:
+        has_physical = bool(self.physical_sources)
+        if not has_table and not has_source and not has_physical:
             raise ValueError(
-                f"Cube {self.name!r}: must declare either ``table=`` "
-                "(plain table reference) or ``source=DerivedTable(sql=...)`` "
-                "(derived source)."
+                f"Cube {self.name!r}: must declare one source: ``table=`` "
+                "(plain table reference), ``source=DerivedTable(sql=...)`` "
+                "(derived source), or ``physical_sources=[...]`` "
+                "(time-partitioned set)."
+            )
+        if has_physical and (has_table or has_source):
+            raise ValueError(
+                f"Cube {self.name!r}: cannot set ``physical_sources`` "
+                "together with ``table`` or ``source``. Pick one source "
+                "declaration."
             )
         if has_table and has_source:
             if isinstance(self.source, PhysicalTable):
@@ -773,12 +971,25 @@ class Cube(BaseModel):
 
     @property
     def resolved_source(self) -> CubeSource:
-        """Canonical source spec.
+        """Canonical single-source spec.
 
         Returns ``self.source`` when explicitly set, otherwise wraps
-        ``self.table`` in a :class:`PhysicalTable`. Use this from the compiler
-        / backend dialect so the ``table`` / ``source`` shorthand
-        distinction stays a model concern."""
+        ``self.table`` in a :class:`PhysicalTable`. Use this from the
+        compiler / backend dialect so the ``table`` / ``source``
+        shorthand distinction stays a model concern.
+
+        For cubes with ``physical_sources`` this property is not
+        meaningful — a partitioned cube has N physical tables, not
+        one. It raises so callers that forgot to branch on
+        ``physical_sources`` fail loudly rather than silently
+        emitting a wrong FROM clause."""
+        if self.physical_sources:
+            raise ValueError(
+                f"Cube {self.name!r}: resolved_source is not defined for "
+                "cubes with physical_sources. Use the time-partitioned "
+                "compile path (dialect.emit_physical_sources / "
+                "compile._resolve_physical_sources) instead."
+            )
         if self.source is not None:
             return self.source
         return PhysicalTable(table=self.table)
@@ -1021,5 +1232,7 @@ __all__ = [
     "PhysicalTable",
     "TenancyMode",
     "TimeDimension",
+    "TimePartition",
+    "TimePartitionedSource",
     "View",
 ]

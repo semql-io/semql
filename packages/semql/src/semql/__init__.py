@@ -91,6 +91,7 @@ from semql.model import (
     LookupValues,
     Measure,
     NamedCTE,
+    PartitionedScan,
     PhysicalTable,
     ResolutionContext,
     Rollup,
@@ -98,6 +99,8 @@ from semql.model import (
     Segment,
     StabilityLiteral,
     TimeDimension,
+    TimePartition,
+    TimePartitionedSource,
     View,
 )
 from semql.parse import ParseError, ParserDecision, parse_sql_statement
@@ -279,6 +282,9 @@ __all__ = [
     "SemanticQueryDefaults",
     "PhysicalTable",
     "TimeDimension",
+    "PartitionedScan",
+    "TimePartition",
+    "TimePartitionedSource",
     "TimeWindow",
     "TokenVerifier",
     "ToolDescriptionProjection",

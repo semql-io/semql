@@ -63,12 +63,22 @@ class ColumnRef:
     ``time``, ``measure``, or ``computed`` (a derived or inline
     measure).  Carrying it on the plan lets the emitter skip the
     re-derivation it otherwise has to do per column.
+
+    ``field`` is the resolved :class:`Measure` / :class:`Dimension` /
+    :class:`TimeDimension` from the catalog. Carrying the resolved
+    object (not just the field name) means the emitter can render
+    the column's SQL straight from ``field.sql`` without a re-lookup.
+    ``None`` for the synthetic time-breakdown column whose field
+    name is a derived bucket name (``"created_at_month"``) — the
+    emitter reads ``time_breakdown.granularity`` from the plan's
+    :class:`Aggregate.time` node instead.
     """
 
     cube: Cube
     field_name: str
     alias: str
     kind: Literal["dimension", "time", "measure", "computed"]
+    field: Measure | Dimension | TimeDimension | None = None
 
 
 @dataclass(frozen=True)
@@ -316,20 +326,36 @@ def to_logical_plan(
     for cube, dim in resolved.dim_fields:
         alias = _col_alias(cube, dim.name, query)
         project_cols.append(
-            ColumnRef(cube=cube, field_name=dim.name, alias=alias, kind="dimension")
+            ColumnRef(cube=cube, field_name=dim.name, alias=alias, kind="dimension", field=dim)
         )
     if aggregate is not None and aggregate.time is not None and resolved.time_cube is not None:
+        # The time-breakdown column's "field" is the source
+        # TimeDimension — the emitter reads the granularity from
+        # ``aggregate.time.granularity`` and renders the truncation
+        # expression itself.  Carrying the source TimeDimension on
+        # the ColumnRef keeps the resolved-field invariant uniform.
+        source_td = next(
+            (
+                td
+                for td in resolved.time_cube.time_dimensions
+                if td.name == aggregate.time.field_name
+            ),
+            None,
+        )
         project_cols.append(
             ColumnRef(
                 cube=resolved.time_cube,
                 field_name=aggregate.time.field_name,
                 alias=f"{aggregate.time.field_name}_{aggregate.time.granularity}",
                 kind="time",
+                field=source_td,
             )
         )
     for cube, m in resolved.measure_fields:
         alias = _col_alias(cube, m.name, query)
-        project_cols.append(ColumnRef(cube=cube, field_name=m.name, alias=alias, kind="measure"))
+        project_cols.append(
+            ColumnRef(cube=cube, field_name=m.name, alias=alias, kind="measure", field=m)
+        )
     project = Project(columns=project_cols)
 
     # 6. Order / Limit.
@@ -621,6 +647,82 @@ def partition_scans(plan: LogicalPlan) -> dict[Backend, LogicalPlan]:
     return out
 
 
+def apply_partition_to_plan(plan: LogicalPlan, cube: Cube) -> LogicalPlan:
+    """Route a time-partitioned cube through the matching physical
+    sources. Pure plan→plan transform.
+
+    Mirrors :func:`apply_rollup_to_plan` in shape — the matched
+    ``Scan`` is replaced with a ``Scan`` whose cube is a synthetic
+    :class:`Cube` (a fresh ``model_copy``) carrying a
+    :class:`PartitionedScan` on its ``partitioned_scan`` slot.  The
+    emitter reads that slot and emits the unioned subquery in
+    place of ``cube.table``.
+
+    The original cube, the original catalog, and the input plan
+    are all untouched.  A future plan transform can keep
+    inspecting the "un-routed" path without confusing it with the
+    routed one.
+
+    Empty-match case: when no source's range intersects the
+    query's ``TimeWindow.range``, the synthetic cube carries
+    ``PartitionedScan(is_empty=True)`` and the emitter emits a
+    zero-row subquery (``SELECT 1 WHERE FALSE``) so the outer
+    query predicates still apply and the result is empty by
+    construction.
+    """
+    # Late import — partition module imports model; logical is the
+    # other side of the cycle.  The function is invoked after both
+    # modules are fully imported (the test harness / catalog
+    # construction always happens after the import graph is
+    # complete).
+    from semql.model import PartitionedScan
+    from semql.partition import select_physical_sources
+
+    if not cube.physical_sources:
+        raise ValueError(
+            f"apply_partition_to_plan: cube {cube.name!r} has no "
+            f"physical_sources — nothing to route."
+        )
+    if cube.time_partition is None:
+        raise ValueError(
+            f"apply_partition_to_plan: cube {cube.name!r} declares "
+            f"physical_sources but no time_partition."
+        )
+
+    matched = select_physical_sources(cube, plan.time_window)
+    if not matched:
+        partitioned = PartitionedScan(sources=(), is_empty=True)
+    else:
+        # Stable ordering — same source declaration order on every
+        # call.  ``select_physical_sources`` already returns
+        # declaration order, but enforce it again for the
+        # contract.
+        ordered = tuple(next(s for s in cube.physical_sources if s.name == m.name) for m in matched)
+        partitioned = PartitionedScan(sources=ordered, is_empty=False)
+
+    # Synthetic cube — a model_copy with ``partitioned_scan`` set
+    # and the cube's normal table field cleared (so the emitter's
+    # table-name fallback doesn't trip on a stale value).
+    new_cube = cube.model_copy(
+        update={
+            "table": "",
+            "source": None,
+            "physical_sources": [],
+            "time_partition": None,
+            "partitioned_scan": partitioned,
+        }
+    )
+
+    new_scans: list[Scan] = []
+    for scan in plan.scans:
+        if scan.cube.name == cube.name:
+            new_scans.append(Scan(cube=new_cube, alias=scan.alias))
+        else:
+            new_scans.append(scan)
+
+    return replace(plan, scans=new_scans)
+
+
 __all__ = [
     "Aggregate",
     "ColumnRef",
@@ -634,6 +736,7 @@ __all__ = [
     "Rollup",  # re-export for callers of apply_rollup_to_plan
     "Scan",
     "TimeBreakdown",
+    "apply_partition_to_plan",
     "apply_rollup_to_plan",
     "partition_scans",
     "to_logical_plan",

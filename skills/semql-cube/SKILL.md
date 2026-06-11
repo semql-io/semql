@@ -478,6 +478,93 @@ callers that don't want the four-stage breakdown.
   set in `context=` wins over `viewer.viewer_id`; useful for
   impersonation flows, surprising otherwise.
 
+## Step 2b — time-partitioned physical sources
+
+When a fact table is spread across N physical tables partitioned by
+time — "orders before 2024 are in `orders_archive` (rolled up
+monthly), 2024 onwards in `orders_live`" — declare the partition
+set on the cube. The compiler routes each query to the matching
+sources based on the query's `TimeWindow.range` and `UNION ALL`s
+the results. The auth / tenancy / scope wrappers wrap the union
+as a whole, the same way they wrap a single source.
+
+```python
+from semql import TimePartition, TimePartitionedSource
+
+orders = Cube(
+    name="orders",
+    backend=Backend.POSTGRES,
+    alias="o",
+    time_partition=TimePartition(time_dimension="placed_at"),
+    physical_sources=[
+        TimePartitionedSource(
+            name="archive",
+            table="orders_archive",
+            range_start="2020-01-01",
+            range_end="2024-01-01",
+        ),
+        TimePartitionedSource(
+            name="live",
+            table="orders_live",
+            range_start="2024-01-01",
+            range_end=None,                # open-ended
+        ),
+    ],
+    measures=[...], dimensions=[...], time_dimensions=[...],
+)
+```
+
+Each source's `range_start` / `range_end` are ISO-8601 lower / upper
+bounds; `None` on a side means open-ended. Half-open intervals:
+a source with `range_end="2024-01-01"` covers rows strictly before
+that date. Touching ranges (e.g. `[2020, 2024)` and `[2024, 2030)`)
+don't overlap, so no double-counting at the boundary.
+
+The cube's `time_partition.time_dimension` must name a real
+`TimeDimension` on the cube — the router uses it as the
+routing key. `time_partition` is required whenever
+`physical_sources` is non-empty; setting `time_partition` alone
+is a configuration error.
+
+**Schema drift.** When the older table uses different physical
+column names, declare per-source renames. The cube's logical
+field names are the source of truth:
+
+```python
+TimePartitionedSource(
+    name="archive",
+    table="orders_archive",
+    range_start="2020-01-01",
+    range_end="2024-01-01",
+    column_renames={"placed_at": "ts", "total_amt": "amount"},
+)
+```
+
+The compiler emits `SELECT ts AS placed_at, total_amt AS amount,
+... FROM orders_archive` — the outer query and the planner see
+the canonical cube names. Missing renames fall back to the
+logical name verbatim. Every source must expose every cube
+field, either by name or via `column_renames`; the catalog
+validates that every rename target is a real field on the cube.
+
+**What doesn't apply.**
+
+- `tenancy="schema"` substitution (`{tenant_schema}`) on
+  partitioned sources: each source's `table` accepts the
+  same substitution.
+- `source=DerivedTable(...)` and `time_partition` are
+  mutually exclusive — a cube has one source declaration,
+  full stop.
+- `Rollup` is orthogonal: a cube can declare both
+  `physical_sources` and `rollups`. The rollup match runs
+  first; if a rollup fits, it bypasses the partition set
+  entirely. The `physical_sources_hit` field on
+  `CompiledQuery` lists the actual sources scanned (or the
+  rollup's `physical_table`) for observability.
+
+See `docs/specs/time-partitioned-sources.md` for the full
+design record and the test surface.
+
 ## See also
 
 - `skills/semql-requirement-discovery.md` — upstream skill that
