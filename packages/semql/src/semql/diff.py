@@ -241,9 +241,7 @@ def _set_role_diff(
     )
 
 
-def _diff_measures(
-    cube_name: str, old: list[Measure], new: list[Measure]
-) -> list[Change]:
+def _diff_measures(cube_name: str, old: list[Measure], new: list[Measure]) -> list[Change]:
     """Compare two measure lists on a cube.
 
     Pairs are matched by ``name``. Agg changes are breaking (e.g.
@@ -276,9 +274,7 @@ def _diff_measures(
     return out
 
 
-def _diff_dimensions(
-    cube_name: str, old: list[Dimension], new: list[Dimension]
-) -> list[Change]:
+def _diff_dimensions(cube_name: str, old: list[Dimension], new: list[Dimension]) -> list[Change]:
     out: list[Change] = []
     by_name_old = {d.name: d for d in old}
     by_name_new = {d.name: d for d in new}
@@ -313,9 +309,7 @@ def _diff_dimensions(
     return out
 
 
-def _diff_segments(
-    cube_name: str, old: list[Segment], new: list[Segment]
-) -> list[Change]:
+def _diff_segments(cube_name: str, old: list[Segment], new: list[Segment]) -> list[Change]:
     out: list[Change] = []
     by_name_old = {s.name: s for s in old}
     by_name_new = {s.name: s for s in new}

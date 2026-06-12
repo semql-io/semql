@@ -99,10 +99,7 @@ def duckdb_as_pg() -> duckdb.DuckDBPyConnection:
     con = duckdb.connect(":memory:")
     con.execute("CREATE TABLE orders (id INTEGER, status TEXT, amount DOUBLE)")
     con.execute(
-        "INSERT INTO orders VALUES "
-        "(1, 'paid', 100.0), "
-        "(2, 'paid', 200.0), "
-        "(3, 'pending', 25.0)"
+        "INSERT INTO orders VALUES (1, 'paid', 100.0), (2, 'paid', 200.0), (3, 'pending', 25.0)"
     )
     return con
 

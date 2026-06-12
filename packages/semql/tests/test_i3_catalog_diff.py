@@ -257,9 +257,7 @@ def test_diff_no_pii_leakage() -> None:
     attribute changed but doesn't dump the full SQL.)"""
     old = _orders()
     secret = "amount > 1000000 AND user_id = 42"  # noqa: S105 - test fixture
-    new_cube = old.model_copy(
-        update={"segments": [Segment(name="vip_order", sql=secret)]}
-    )
+    new_cube = old.model_copy(update={"segments": [Segment(name="vip_order", sql=secret)]})
     diff = diff_catalogs({"orders": old}, {"orders": new_cube})
     md = diff.to_markdown()
     assert secret not in md

@@ -269,9 +269,7 @@ def test_async_bq_adapter_runs_through_async_engine_via_duckdb_stand_in() -> Non
             translated = re.sub(r"@(\w+)", r"$\1", sql)
             params: dict[str, Any] = {}
             if job_config is not None:
-                params = {
-                    p.name: p.value for p in getattr(job_config, "query_parameters", [])
-                }
+                params = {p.name: p.value for p in getattr(job_config, "query_parameters", [])}
             cur = self._raw.execute(translated, params if params else None)
             self.calls.append({"sql": sql, "translated": translated, "params": params})
             desc = list(cur.description or [])

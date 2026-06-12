@@ -138,8 +138,7 @@ class PromptBudget(BaseModel):
     max_tokens: int = Field(
         ge=0,
         description=(
-            "Maximum allowed token count. Texts already at or below this "
-            "pass through unchanged."
+            "Maximum allowed token count. Texts already at or below this pass through unchanged."
         ),
     )
 
@@ -178,9 +177,7 @@ class PromptBudget(BaseModel):
 
         # 1. Drop relations block.
         if "## Cross-cube relations" in current or "## Relations" in current:
-            current, removed = _slice_section(
-                current, "## Cross-cube relations", None
-            )
+            current, removed = _slice_section(current, "## Cross-cube relations", None)
             if not removed and "## Relations" in current:
                 current, removed = _slice_section(current, "## Relations", None)
             if removed:
@@ -242,8 +239,7 @@ class BudgetResult(BaseModel):
     dropped: tuple[str, ...] = Field(
         default_factory=lambda: tuple[str, ...](),
         description=(
-            "Ordered list of what was dropped "
-            "(e.g. ['relations', 'glossary', 'cube:orders'])."
+            "Ordered list of what was dropped (e.g. ['relations', 'glossary', 'cube:orders'])."
         ),
     )
 

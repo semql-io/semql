@@ -353,9 +353,7 @@ class AsyncClickHouseAdapter:
         column_names: list[str] = list(getattr(result, "column_names", []) or [])
         # ``QueryResult.result_rows`` is a list of positional tuples;
         # ``named_results()`` returns dicts which we don't need.
-        raw_rows: list[Sequence[Any]] = [
-            tuple(r) for r in getattr(result, "result_rows", []) or []
-        ]
+        raw_rows: list[Sequence[Any]] = [tuple(r) for r in getattr(result, "result_rows", []) or []]
         return AdapterResult(columns=column_names, rows=raw_rows)
 
 

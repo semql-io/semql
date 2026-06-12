@@ -109,9 +109,7 @@ class QueryBudget(BaseModel):
                 f"exceeds budget of {self.max_rows_scanned}."
             )
         if self.max_cubes is not None:
-            touched = len(estimate.cubes_estimated) + (
-                1 if estimate.rows_scanned_unknown else 0
-            )
+            touched = len(estimate.cubes_estimated) + (1 if estimate.rows_scanned_unknown else 0)
             # Count unknown as one touched cube; conservative.
             if touched > self.max_cubes:
                 raise BudgetExceededError(

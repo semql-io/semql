@@ -135,9 +135,7 @@ def test_async_ch_adapter_runs_under_event_loop() -> None:
             await asyncio.sleep(0.05)
             return await super().query(query, parameters)
 
-    client = _SlowFakeAsyncCHClient(
-        [_FakeCHResult(column_names=["a"], result_rows=[(1,)])]
-    )
+    client = _SlowFakeAsyncCHClient([_FakeCHResult(column_names=["a"], result_rows=[(1,)])])
     adapter = AsyncClickHouseAdapter(client)
     progress: list[int] = []
 
@@ -226,9 +224,7 @@ def test_async_ch_adapter_supports_native_named_params() -> None:
     """The real clickhouse-connect client takes ``parameters={...}``
     and binds them to ``{name:Type}`` placeholders. Verify the
     adapter's hand-off is purely that."""
-    client = _FakeAsyncCHClient(
-        [_FakeCHResult(column_names=["v"], result_rows=[(42,)])]
-    )
+    client = _FakeAsyncCHClient([_FakeCHResult(column_names=["v"], result_rows=[(42,)])])
     adapter = AsyncClickHouseAdapter(client)
     _run(
         adapter.execute(
