@@ -29,6 +29,8 @@ rollup's physical table, leaving the original catalog untouched.
 
 from __future__ import annotations
 
+from collections import Counter
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Literal
 
@@ -333,9 +335,13 @@ def to_logical_plan(
 
     # 5. Project — ColumnRef per output column.  Carrying kind lets
     # the emitter skip per-column re-derivation.
+    collisions = output_column_collisions(
+        [dim.name for _, dim in resolved.dim_fields],
+        [m.name for _, m in resolved.measure_fields],
+    )
     project_cols: list[ColumnRef] = []
     for cube, dim in resolved.dim_fields:
-        alias = _col_alias(cube, dim.name, query)
+        alias = output_alias(cube.name, dim.name, collisions)
         project_cols.append(
             ColumnRef(cube=cube, field_name=dim.name, alias=alias, kind="dimension", field=dim)
         )
@@ -363,7 +369,7 @@ def to_logical_plan(
             )
         )
     for cube, m in resolved.measure_fields:
-        alias = _col_alias(cube, m.name, query)
+        alias = output_alias(cube.name, m.name, collisions)
         project_cols.append(
             ColumnRef(cube=cube, field_name=m.name, alias=alias, kind="measure", field=m)
         )
@@ -434,23 +440,26 @@ def to_logical_plan(
     )
 
 
-def _col_alias(cube: Cube, field_name: str, query: SemanticQuery) -> str:
-    """Mirror the existing collision-prefix convention on the compiler.
+def output_column_collisions(
+    dim_field_names: Sequence[str],
+    measure_field_names: Sequence[str],
+) -> set[str]:
+    """Resolved field names that appear more than once across the
+    projected dimensions + measures.
 
-    When the same field name appears on multiple touched cubes, prefix
-    the alias with the cube name.  Otherwise the field local name is
-    the output alias.
-    """
-    counts: dict[str, int] = {}
-    for m in query.measures:
-        local = m.split(".", 1)[1] if "." in m else m
-        counts[local] = counts.get(local, 0) + 1
-    for d in query.dimensions:
-        local = d.split(".", 1)[1] if "." in d else d
-        counts[local] = counts.get(local, 0) + 1
-    if counts.get(field_name, 0) > 1:
-        return f"{cube.name}_{field_name}"
-    return field_name
+    The collision set is computed on *resolved field names* — not the
+    query's ref locals — so referencing a dimension by an I7 input-alias
+    (``orders.territory`` for the ``region`` dimension) can't defeat the
+    prefix. This is the single basis shared by the plan's projection and
+    the emitter (review B1: the convention used to exist twice)."""
+    counts = Counter([*dim_field_names, *measure_field_names])
+    return {n for n, c in counts.items() if c > 1}
+
+
+def output_alias(cube_name: str, field_name: str, collisions: set[str]) -> str:
+    """The output-column alias for a projected field: cube-prefixed when
+    the field name collides across cubes, else the bare field name."""
+    return f"{cube_name}_{field_name}" if field_name in collisions else field_name
 
 
 # ---------------------------------------------------------------------------

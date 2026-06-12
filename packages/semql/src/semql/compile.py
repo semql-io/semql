@@ -34,7 +34,6 @@ Out of scope (deferred):
 from __future__ import annotations
 
 import re
-from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass
 from dataclasses import field as dc_field
@@ -68,7 +67,7 @@ from semql.errors import (
     UnknownIdentifierError,
 )
 from semql.introspect import PolicyFn, ScopeFn, viewer_sees
-from semql.logical import LogicalPlan
+from semql.logical import LogicalPlan, output_alias, output_column_collisions
 from semql.model import (
     AggLiteral,
     AuthContext,
@@ -1209,11 +1208,13 @@ class _CompileEnv:
 
         # Output-column allocation. Collision-prefix any name that
         # appears more than once across dims + measures so each output
-        # column is unique.
-        proposed: list[str] = [d.name for _, d in self.dim_fields]
-        proposed.extend(m.name for _, m in self.measure_fields)
-        counts = Counter(proposed)
-        self._collisions: set[str] = {n for n, c in counts.items() if c > 1}
+        # column is unique. Shared with the plan's projection via
+        # ``output_column_collisions`` / ``output_alias`` so the two can't
+        # disagree (review B1: the convention used to exist twice).
+        self._collisions: set[str] = output_column_collisions(
+            [d.name for _, d in self.dim_fields],
+            [m.name for _, m in self.measure_fields],
+        )
         self.dim_col_names: list[str] = [self._col_name(c, d.name) for c, d in self.dim_fields]
         self.measure_col_names: list[str] = [
             self._col_name(c, m.name) for c, m in self.measure_fields
@@ -1289,7 +1290,7 @@ class _CompileEnv:
     # ------------------------------------------------------------------
 
     def _col_name(self, cube: Cube, field_name: str) -> str:
-        return f"{cube.name}_{field_name}" if field_name in self._collisions else field_name
+        return output_alias(cube.name, field_name, self._collisions)
 
     def field_is_masked(self, field: Measure | Dimension | TimeDimension) -> bool:
         """A1 mask gate — viewer has any role in ``field.mask_roles``.
