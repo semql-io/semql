@@ -30,6 +30,12 @@ review, the rest should be confirmed with a failing test before fixing
    path supports in/not_in/is_null/contains, so the same FederatedPlan
    returns different rows per merge engine. Same silent-skip pattern in
    the having loop (`:348`, currently unreachable).
+   **Resolved 2026-06-12 (decisions.md D6):** `PolarsMergeEngine` was
+   removed rather than fixed — a parallel hand-written merge was a
+   standing divergence hazard and its no-DuckDB rationale was already
+   false (`semql-engine` hard-depends on duckdb). The DuckDB merge SQL
+   is now the single source of truth, so this bug class is structurally
+   gone.
 4. **5 federate tests fail on main** (acknowledged in TODOS.org as
    pre-existing). The gate is off exactly where the code is most
    fragile. Fix or quarantine.

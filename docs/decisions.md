@@ -130,3 +130,43 @@ classification, not as a directive to remove the public field.
 **Revisit.** If `Measure.filter` plus `InlineDerived` turn out to
 cover every observed `having` use in practice, re-open the
 consolidation question before the v1 freeze — not after.
+
+---
+
+## D6. Drop `PolarsMergeEngine` — one merge implementation, not two
+
+**Context.** Review defect A3: `PolarsMergeEngine` hand-reimplements
+the merge in Polars and had drifted from the canonical DuckDB merge
+SQL — it silently dropped cross-partition filter literals whose op it
+didn't recognise (`in`/`not_in`/`is_null`/`not_null`/`contains`) and
+read only `vals[0]`, so the *same* `FederatedPlan` returned different
+rows depending on the merge engine. The fix was small, but the
+question A3 actually poses is whether a parallel merge implementation
+should exist at all.
+
+**Decision.** Remove `PolarsMergeEngine` (engine, `merge`
+subpackage, and contract tests — ~775 LoC). The DuckDB merge SQL
+(`FederatedPlan.merge.sql`) is the single source of truth. The
+generic `MergeEngine` / `AsyncMergeEngine` plug-in protocol stays —
+a caller can still register a custom merge engine — but the project
+ships exactly one implementation.
+
+**Why.** Its stated reason to exist — "merge without a DuckDB
+dependency at execute time" — was already false: `semql-engine`
+hard-depends on `duckdb` (`engine.py:35`) and `Engine.__init__`
+opens a `duckdb.connect(":memory:")` regardless of the merge engine.
+`polars` was never declared in any `pyproject` (a phantom dep) and
+the advertised `semql-engine[polars]` extra didn't exist. So the
+engine bought no dependency reduction while adding a second
+hand-written copy of the merge semantics — the exact divergence
+hazard A3 is, and structurally the same debt as B1's parallel
+federate compiler. Deleting it makes the A3 *class* of bug
+impossible rather than merely fixing this instance.
+
+**Revisit.** If a DataFrame-native merge runtime becomes a real
+requirement (e.g. an Arrow/Polars-only deployment that genuinely
+drops DuckDB), reintroduce it behind the existing `MergeEngine`
+protocol — but gate it on a differential harness that runs every
+`FederatedPlan` through both engines and asserts identical rows, so
+it can never silently diverge again. (Maintainer-confirmed
+2026-06-12.)

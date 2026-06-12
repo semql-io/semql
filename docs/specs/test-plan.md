@@ -108,12 +108,17 @@ network.
 
 ### 4.2 Engine + federation (semql-engine)
 
-- **Differential merge-engine test (defect A3's net).** One harness:
+- **Differential merge-engine test (defect A3's net).** ~~One harness:
   generate a FederatedPlan + fragment result sets, execute the merge
-  through DuckDB merge *and* PolarsMergeEngine, assert identical rows
-  (sorted, type-normalised). Hypothesis-driven over filter ops incl.
-  in/not_in/is_null/contains. Any op one engine supports and the other
-  silently skips becomes a failure, permanently.
+  through DuckDB merge *and* PolarsMergeEngine, assert identical rows.~~
+  **Moot as of 2026-06-12 (decisions.md D6):** `PolarsMergeEngine` was
+  removed, leaving one merge implementation (DuckDB merge SQL), so
+  there is no second engine to differ from. Retain this harness *shape*
+  as the entry gate for any future `MergeEngine`: the day a second
+  implementation lands, it must run every `FederatedPlan` through both
+  and assert identical rows (sorted, type-normalised), Hypothesis-driven
+  over filter ops incl. in/not_in/is_null/contains — so an op one engine
+  supports and the other silently skips fails permanently.
 - **Federated ≡ single-source.** Load identical data into one DuckDB
   and into two DuckDBs split by the partition scheme; same
   SemanticQuery must return identical rows. This is the federation
