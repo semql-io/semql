@@ -1499,6 +1499,69 @@ def _emit_having_term(alias: str, f: Filter, binder: _MergeBinder) -> exp.Expres
     )
 
 
+def _merge_meta_for_dim(
+    ref: str,
+    partitions: Sequence[_MergePartition],
+    fragments: list[CompiledQuery],
+    cube_to_idx: dict[str, int],
+) -> ColumnMeta:
+    """Output ColumnMeta for a merged dimension — inherits the fragment's
+    column meta (kind/unit/display) under the unqualified output name."""
+    idx = cube_to_idx[ref.split(".", 1)[0]]
+    col = partitions[idx].dim_columns[ref]
+    for cm in fragments[idx].column_meta:
+        if cm.name == col:
+            return ColumnMeta(
+                name=ref.rsplit(".", 1)[1],
+                kind=cm.kind,
+                display_name=cm.display_name,
+                unit=cm.unit,
+                display_unit=cm.display_unit,
+                format=cm.format,
+            )
+    return ColumnMeta(name=ref.rsplit(".", 1)[1], kind="dimension")
+
+
+def _merge_meta_for_measure(ref: str, catalog: dict[str, Cube]) -> ColumnMeta:
+    """Output ColumnMeta for a merged measure — carries the cube measure's
+    unit/format so the merged result presents like a single-source query."""
+    owner = _resolve_field_to_cube(ref, catalog)
+    m_name = ref.rsplit(".", 1)[1]
+    m = next(x for x in owner.measures if x.name == m_name)
+    return ColumnMeta(
+        name=m_name,
+        kind="measure",
+        display_name=m.display_name or m_name.replace("_", " ").title(),
+        unit=m.unit,
+        display_unit=m.display_unit,
+        format=m.format,
+    )
+
+
+def _merge_output_columns(
+    q: SemanticQuery,
+    catalog: dict[str, Cube],
+    partitions: Sequence[_MergePartition],
+    fragments: list[CompiledQuery],
+    *,
+    time_output: tuple[str, ColumnMeta] | None,
+) -> tuple[list[str], list[ColumnMeta]]:
+    """The user-facing output columns + meta for a merged plan: dims, then
+    the (mode-specific) time column, then measures. Shared by both
+    pipelines — only ``time_output`` differs (raw-rows buckets the name)."""
+    cube_to_idx = {c.name: i for i, p in enumerate(partitions) for c in p.cubes}
+    columns = [r.rsplit(".", 1)[1] for r in q.dimensions]
+    meta = [_merge_meta_for_dim(r, partitions, fragments, cube_to_idx) for r in q.dimensions]
+    if time_output is not None:
+        col, cm = time_output
+        columns.append(col)
+        meta.append(cm)
+    for r in q.measures:
+        columns.append(r.rsplit(".", 1)[1])
+        meta.append(_merge_meta_for_measure(r, catalog))
+    return columns, meta
+
+
 def _compile_raw_rows(
     q: SemanticQuery,
     catalog: dict[str, Cube],
@@ -1542,46 +1605,16 @@ def _compile_raw_rows(
     ]
 
     cube_to_idx = {c.name: i for i, p in enumerate(partitions) for c in p.cubes}
-
-    def _meta_for_dim(ref: str) -> ColumnMeta:
-        idx, plan = cube_to_idx[ref.split(".", 1)[0]], partitions[cube_to_idx[ref.split(".", 1)[0]]]
-        col = plan.dim_columns[ref]
-        for cm in fragments[idx].column_meta:
-            if cm.name == col:
-                return ColumnMeta(
-                    name=ref.rsplit(".", 1)[1],
-                    kind=cm.kind,
-                    display_name=cm.display_name,
-                    unit=cm.unit,
-                    display_unit=cm.display_unit,
-                    format=cm.format,
-                )
-        return ColumnMeta(name=ref.rsplit(".", 1)[1], kind="dimension")
-
-    def _meta_for_measure(ref: str) -> ColumnMeta:
-        owner = _resolve_field_to_cube(ref, catalog)
-        m_name = ref.rsplit(".", 1)[1]
-        m = next(x for x in owner.measures if x.name == m_name)
-        return ColumnMeta(
-            name=m_name,
-            kind="measure",
-            display_name=m.display_name or m_name.replace("_", " ").title(),
-            unit=m.unit,
-            display_unit=m.display_unit,
-            format=m.format,
-        )
-
-    output_columns = [r.rsplit(".", 1)[1] for r in q.dimensions]
-    output_column_meta = [_meta_for_dim(r) for r in q.dimensions]
+    time_output: tuple[str, ColumnMeta] | None = None
     if q.time_dimension:
         td_name = q.time_dimension.dimension.rsplit(".", 1)[1]
         plan = partitions[cube_to_idx[q.time_dimension.dimension.split(".", 1)[0]]]
+        # Raw-rows buckets at merge, so the output column carries the grain.
         td_col = f"{td_name}_{plan.time_grain}" if plan.time_grain else td_name
-        output_columns.append(td_col)
-        output_column_meta.append(ColumnMeta(name=td_col, kind="time", display_name=td_col))
-    for r in q.measures:
-        output_columns.append(r.rsplit(".", 1)[1])
-        output_column_meta.append(_meta_for_measure(r))
+        time_output = (td_col, ColumnMeta(name=td_col, kind="time", display_name=td_col))
+    output_columns, output_column_meta = _merge_output_columns(
+        q, catalog, partitions, fragments, time_output=time_output
+    )
 
     merge_sql, merge_spec, merge_params = _emit_merge_sql_raw_rows(
         q,
@@ -1736,46 +1769,16 @@ def compile_federated_query(
         for p in partitions
     ]
     cube_to_idx = {c.name: i for i, p in enumerate(partitions) for c in p.cubes}
-
-    def _meta_for_dim(ref: str) -> ColumnMeta:
-        idx, plan = cube_to_idx[ref.split(".", 1)[0]], partitions[cube_to_idx[ref.split(".", 1)[0]]]
-        col = plan.dim_columns[ref]
-        for cm in fragments[idx].column_meta:
-            if cm.name == col:
-                return ColumnMeta(
-                    name=ref.rsplit(".", 1)[1],
-                    kind=cm.kind,
-                    display_name=cm.display_name,
-                    unit=cm.unit,
-                    display_unit=cm.display_unit,
-                    format=cm.format,
-                )
-        return ColumnMeta(name=ref.rsplit(".", 1)[1], kind="dimension")
-
-    def _meta_for_measure(ref: str) -> ColumnMeta:
-        owner = _resolve_field_to_cube(ref, catalog)
-        m_name = ref.rsplit(".", 1)[1]
-        m = next(x for x in owner.measures if x.name == m_name)
-        return ColumnMeta(
-            name=m_name,
-            kind="measure",
-            display_name=m.display_name or m_name.replace("_", " ").title(),
-            unit=m.unit,
-            display_unit=m.display_unit,
-            format=m.format,
-        )
-
-    output_columns = [r.rsplit(".", 1)[1] for r in q.dimensions]
-    output_column_meta = [_meta_for_dim(r) for r in q.dimensions]
+    time_output: tuple[str, ColumnMeta] | None = None
     if q.time_dimension:
-        td_col = partitions[cube_to_idx[q.time_dimension.dimension.split(".", 1)[0]]].dim_columns[
-            q.time_dimension.dimension
-        ]
-        output_columns.append(td_col)
-        output_column_meta.append(_meta_for_dim(q.time_dimension.dimension))
-    for r in q.measures:
-        output_columns.append(r.rsplit(".", 1)[1])
-        output_column_meta.append(_meta_for_measure(r))
+        ref = q.time_dimension.dimension
+        # Distributive already buckets in the fragment, so the merge
+        # passes the dimension column through under its own name.
+        td_col = partitions[cube_to_idx[ref.split(".", 1)[0]]].dim_columns[ref]
+        time_output = (td_col, _merge_meta_for_dim(ref, partitions, fragments, cube_to_idx))
+    output_columns, output_column_meta = _merge_output_columns(
+        q, catalog, partitions, fragments, time_output=time_output
+    )
 
     merge_sql, merge_spec, merge_params = _emit_merge_sql(
         q,
