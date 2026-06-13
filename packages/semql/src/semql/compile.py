@@ -44,6 +44,10 @@ import sqlglot
 from sqlglot import exp
 from sqlglot.errors import ParseError
 
+# Module handle for tests that monkey-patch ``semql.logical.to_logical_plan``
+# (the local ``to_logical_plan`` name is bound at import time and wouldn't
+# see the patch — see the _CompileEnv.__init__ lowering call site).
+from semql import logical as _logical_mod
 from semql._resolve import (
     _ResolvedFields,
     walk_query_fields,
@@ -67,7 +71,12 @@ from semql.errors import (
     UnknownIdentifierError,
 )
 from semql.introspect import PolicyFn, ScopeFn, viewer_sees
-from semql.logical import LogicalPlan, output_alias, output_column_collisions
+from semql.logical import (
+    LogicalPlan,
+    apply_rollup_to_plan,
+    output_alias,
+    output_column_collisions,
+)
 from semql.model import (
     AggLiteral,
     AuthContext,
@@ -84,8 +93,9 @@ from semql.model import (
     TimePartitionedSource,
     View,
 )
+from semql.partition import emit_physical_sources, select_physical_sources
 from semql.rollup import apply_rollup, pick_rollup
-from semql.spec import BoolExpr, Filter, InlineDerived, SemanticQuery
+from semql.spec import BoolExpr, CompareWindow, Filter, InlineDerived, SemanticQuery
 
 MAX_UNGROUPED_ROWS = 1000
 
@@ -1140,8 +1150,6 @@ def _check_field_visibility(
 
 def _walk_where_dims(node: BoolExpr | Filter) -> list[str]:
     """Walk a BoolExpr / Filter tree and collect every ``Filter.dimension`` ref."""
-    from semql.spec import BoolExpr, Filter
-
     out: list[str] = []
     if isinstance(node, Filter):
         out.append(node.dimension)
@@ -1447,8 +1455,6 @@ class _CompileEnv:
         # ``time_dim`` slots survive as derived caches so downstream
         # emission helpers can read them without re-walking the plan
         # repeatedly.
-        from semql.logical import apply_rollup_to_plan, to_logical_plan
-
         if plan is not None:
             # Trust the caller's plan verbatim.  No re-lowering, no
             # rollup transform — any plan→plan rewrite (rollup /
@@ -1457,7 +1463,14 @@ class _CompileEnv:
             # survive to emission.
             self.plan = plan
         else:
-            self.plan = to_logical_plan(q, catalog, views=self.views_map, resolved=resolved)
+            # Reach through ``semql.logical`` (not the local
+            # ``to_logical_plan`` name) so monkey-patching
+            # ``semql.logical.to_logical_plan`` in tests still
+            # takes effect. The local name is bound at import time
+            # and wouldn't see the patch.
+            self.plan = _logical_mod.to_logical_plan(
+                q, catalog, views=self.views_map, resolved=resolved
+            )
 
             # Apply the plan→plan rollup transform if a rollup was
             # picked.  The catalog is also rewritten (legacy path) so
@@ -1482,8 +1495,6 @@ class _CompileEnv:
         # the plan's ``time_window.range`` with each source's range
         # and stash the matched names. ``_from_clause_stage`` reads
         # this to dispatch the partitioned emit path.
-        from semql.partition import select_physical_sources
-
         for s in self.plan.scans:
             c = s.cube
             if c.physical_sources:
@@ -1861,11 +1872,10 @@ class _CompileEnv:
         For cubes with ``physical_sources`` (#48), the per-source
         match list was computed at env-init; the dialect's regular
         ``emit_source`` is bypassed and the partitioned emit path
-        (a single subquery over the matched sources, all aliased
-        to ``cube.alias``) takes its place. ``wrap_for_tenancy``
-        then wraps that single subquery, so the auth / tenancy /
-        scope predicates apply to the union as a whole."""
-        from semql.partition import emit_physical_sources
+         (a single subquery over the matched sources, all aliased
+         to ``cube.alias``) takes its place. ``wrap_for_tenancy``
+         then wraps that single subquery, so the auth / tenancy /
+         scope predicates apply to the union as a whole."""
 
         plan_scans = self.plan.scans
         plan_joins = self.plan.joins
@@ -2673,8 +2683,6 @@ def compile_plan(
     the plan is a strict intermediate representation; the spec-tree
     path and the plan path agree exactly.
     """
-    from semql.spec import SemanticQuery
-
     # Re-derive the SemanticQuery from the plan.  The plan is
     # frozen and the schema is small; a structural rebuild keeps
     # the round-trip lossless and avoids a side channel for
@@ -2731,8 +2739,6 @@ def compile_plan(
     # plan stores the pre-computed current / prior ranges;
     # we surface them as a fresh ``CompareWindow`` so the
     # emit path's compare-mode shape checks match.
-    from semql.spec import CompareWindow
-
     compare_window: CompareWindow | None = None
     if plan.compare is not None:
         compare_window = CompareWindow(

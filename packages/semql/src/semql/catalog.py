@@ -35,15 +35,13 @@ from __future__ import annotations
 import difflib
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import Any, TypeVar
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from semql._grounding import validate_relations
-
-# B8 — error contract hooks. Local re-export to keep ``_enrich_filter_type_error``
-# readable; the class is the LLM-facing leaf for the next_tool affordance.
-from semql.errors import FilterTypeError  # noqa: E402  (re-exported for the helper)
+from semql.compile import CompiledQuery, compile_query, explain_plan
+from semql.errors import FilterTypeError, SemQLError
 from semql.hooks import CompileHook, SqlRewriteHook
 from semql.introspect import META_CUBES, PolicyFn, ScopeFn
 from semql.model import (
@@ -57,16 +55,12 @@ from semql.model import (
     Lookup,
     View,
 )
-from semql.spec import SavedQuery
+from semql.retrieve import EmbeddingProvider, Retriever, build_default_retriever
+from semql.spec import SavedQuery, SemanticQuery, SemanticQueryDefaults, _apply_query_defaults
 from semql.units import DEFAULT_REGISTRY, Registry
+from semql.validate import ValidationError, validate
 
 _T = TypeVar("_T", bound=BaseField)
-
-if TYPE_CHECKING:
-    from semql.compile import CompiledQuery
-    from semql.retrieve import EmbeddingProvider, Retriever
-    from semql.spec import SemanticQuery
-    from semql.validate import ValidationError
 
 
 class CatalogSpec(BaseModel):
@@ -963,8 +957,6 @@ class Catalog:
         Rollup routing is applied so the explained plan matches what
         would actually be executed.
         """
-        from semql.compile import explain_plan
-
         plan = explain_plan(query, self.as_dict(), context=context, viewer=viewer)
         return repr(plan)
 
@@ -993,10 +985,6 @@ class Catalog:
         consumer can call the lookup tool to resolve the free-text
         value instead of guessing.
         """
-        from semql.compile import compile_query
-        from semql.errors import FilterTypeError, SemQLError
-        from semql.spec import SemanticQueryDefaults, _apply_query_defaults
-
         if isinstance(query_defaults, SemanticQueryDefaults):
             query = _apply_query_defaults(query, query_defaults)
 
@@ -1141,12 +1129,6 @@ class Catalog:
         a structured ``ValidationError`` analogue fall through as
         ``ValidationError(code="compile_error", message=str(exc))``.
         """
-        # Local import to avoid the top-level circular between catalog
-        # and errors (errors is leaf-light; safe to import lazily).
-        from semql.errors import SemQLError
-        from semql.spec import SemanticQueryDefaults, _apply_query_defaults
-        from semql.validate import ValidationError, validate
-
         if isinstance(query_defaults, SemanticQueryDefaults):
             query = _apply_query_defaults(query, query_defaults)
 
@@ -1186,8 +1168,6 @@ class Catalog:
 
         Deprecated cubes are excluded from the index — the compiler
         refuses to materialise them anyway."""
-        from semql.retrieve import build_default_retriever
-
         # Filter deprecated up front so the retriever can't recommend
         # something the compiler will then refuse.
         live_cubes = [c for c in self._cubes if c.stability != "deprecated"]

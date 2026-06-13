@@ -32,8 +32,10 @@ from __future__ import annotations
 from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Literal
+from typing import Literal
 
+from semql._resolve import _ResolvedFields, walk_query_fields
+from semql.cnf import to_cnf
 from semql.errors import CompileError, JoinPathError
 from semql.model import (
     Cube,
@@ -41,17 +43,15 @@ from semql.model import (
     Dimension,
     GranularityLiteral,
     Measure,
+    PartitionedScan,
     Provenance,
     Rollup,
     TimeDimension,
     View,
 )
 from semql.model import Join as ModelJoin
+from semql.partition import select_physical_sources
 from semql.spec import BoolExpr, Filter, SemanticQuery, TimeWindow
-
-if TYPE_CHECKING:
-    from semql._resolve import _ResolvedFields
-
 
 # ---------------------------------------------------------------------------
 # Pure data nodes
@@ -278,8 +278,6 @@ def to_logical_plan(
     work.
     """
     if resolved is None:
-        from semql._resolve import walk_query_fields
-
         views_map = views or {}
         resolved, diagnostics = walk_query_fields(query, catalog, views_map=views_map)
         if diagnostics:
@@ -315,8 +313,6 @@ def to_logical_plan(
     # CNF pre-pass so every downstream consumer (federation, segment
     # routing, pushdown) sees a top-level AND of OR-clauses. The
     # pass is pure: a tree already in CNF is rebuilt equal to itself.
-    from semql.cnf import to_cnf
-
     filters: list[Predicate] = [Predicate(expr=to_cnf(f)) for f in query.filters]
     if query.where is not None:
         filters.append(Predicate(expr=to_cnf(query.where)))
@@ -758,9 +754,6 @@ def apply_partition_to_plan(plan: LogicalPlan, cube: Cube) -> LogicalPlan:
     # modules are fully imported (the test harness / catalog
     # construction always happens after the import graph is
     # complete).
-    from semql.model import PartitionedScan
-    from semql.partition import select_physical_sources
-
     if not cube.physical_sources:
         raise ValueError(
             f"apply_partition_to_plan: cube {cube.name!r} has no "
