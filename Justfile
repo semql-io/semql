@@ -52,10 +52,10 @@ secrets_file := "secrets.enc.yaml"
 clean-dist:
     rm -rf dist
 
-# Build wheels + sdists for one or all packages. Defaults to all six.
-#   just build           # all six
+# Build wheels + sdists for one or all packages. Defaults to all eight.
+#   just build           # all eight
 #   just build semql     # just semql
-build *pkgs="semql semql-mcp semql-erd semql-validate-db semql-engine semql-introspect": clean-dist
+build *pkgs="semql semql-mcp semql-erd semql-validate-db semql-engine semql-introspect semql-auth semql-prompt": clean-dist
     #!/usr/bin/env bash
     set -euo pipefail
     for pkg in {{pkgs}}; do
@@ -231,7 +231,7 @@ wait-indexed pkg:
 publish-test-rest: clean-dist
     #!/usr/bin/env bash
     set -euo pipefail
-    for pkg in semql-mcp semql-erd semql-validate-db semql-engine semql-introspect; do
+    for pkg in semql-mcp semql-erd semql-validate-db semql-engine semql-introspect semql-auth semql-prompt; do
       echo "── build $pkg ──"
       uv build --package "$pkg"
     done
@@ -247,7 +247,7 @@ publish-test-rest: clean-dist
 publish-rest: clean-dist
     #!/usr/bin/env bash
     set -euo pipefail
-    for pkg in semql-mcp semql-erd semql-validate-db semql-engine semql-introspect; do
+    for pkg in semql-mcp semql-erd semql-validate-db semql-engine semql-introspect semql-auth semql-prompt; do
       echo "── build $pkg ──"
       uv build --package "$pkg"
     done
