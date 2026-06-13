@@ -1,9 +1,6 @@
 """Catalog-level prompt conveniences.
 
-These were ``Catalog.prompt`` / ``.prompt_segments`` / ``.prompt_hash`` /
-``.to_openai_tools`` / ``.to_langchain_tools`` on the core ``Catalog``.
-They moved here when prompt rendering was split out of the pure core, so
-each now takes the catalog as its first argument and reads it through the
+Each takes the catalog as its first argument and reads it through the
 public surface (``catalog.as_dict()``, ``catalog.policy``,
 ``catalog.views`` / ``.lookups`` / ``.glossary`` / ``.relations`` /
 ``.saved_queries``)."""
@@ -46,8 +43,7 @@ def planner_prompt(
     extra: str | None = None,
     cube_prompt_hooks: list[CubePromptHook] | None = None,
 ) -> str:
-    """Render the planner prompt fragment for ``catalog`` (was
-    ``Catalog.prompt``).
+    """Render the planner prompt fragment for ``catalog``.
 
     When ``viewer`` is provided, the catalog block shrinks to the cubes
     the viewer is allowed to see. ``ctx`` is the resolution context for
@@ -91,9 +87,8 @@ def planner_prompt_segments(
     top_k: int = 10,
     retrieval_threshold: int = 50,
 ) -> CatalogPrompt:
-    """Render the planner prompt as a cacheable two-segment object (was
-    ``Catalog.prompt_segments``) — a viewer-invariant ``static`` segment
-    plus a per-viewer ``overlay``."""
+    """Render the planner prompt as a cacheable two-segment object — a
+    viewer-invariant ``static`` segment plus a per-viewer ``overlay``."""
     return build_planner_prompt_segments(
         catalog.as_dict(),
         only_exposed=only_exposed,
@@ -119,9 +114,9 @@ def prompt_hash(
     only_exposed: bool = True,
     ctx: ResolutionContext | None = None,
 ) -> str:
-    """SHA256 hex digest of the static (viewer-invariant) prompt segment
-    (was ``Catalog.prompt_hash``) — stable across viewer changes, so it
-    keys a prompt-fragment cache that a catalog mutation invalidates."""
+    """SHA256 hex digest of the static (viewer-invariant) prompt segment —
+    stable across viewer changes, so it keys a prompt-fragment cache that a
+    catalog mutation invalidates."""
     return catalog_prompt_hash(
         catalog.as_dict(),
         only_exposed=only_exposed,
@@ -138,9 +133,9 @@ def to_openai_tools(
     viewer: AuthContext | None = None,
     only_exposed: bool = True,
 ) -> list[dict[str, Any]]:
-    """One OpenAI-format tool dict per visible cube + saved query (was
-    ``Catalog.to_openai_tools``). Role-gated cubes / saved queries are
-    excluded unless ``viewer`` holds a matching role."""
+    """One OpenAI-format tool dict per visible cube + saved query.
+    Role-gated cubes / saved queries are excluded unless ``viewer`` holds a
+    matching role."""
     from semql.introspect import iter_cubes
     from semql.spec import SemanticQuery
 
@@ -189,9 +184,9 @@ def to_langchain_tools(
     viewer: AuthContext | None = None,
     only_exposed: bool = True,
 ) -> list[object]:
-    """One LangChain ``StructuredTool`` per visible cube (was
-    ``Catalog.to_langchain_tools``). Requires ``langchain-core``; each
-    tool compiles and returns ``{"sql": ..., "params": ...}``."""
+    """One LangChain ``StructuredTool`` per visible cube. Requires
+    ``langchain-core``; each tool compiles and returns
+    ``{"sql": ..., "params": ...}``."""
     from typing import cast
 
     try:

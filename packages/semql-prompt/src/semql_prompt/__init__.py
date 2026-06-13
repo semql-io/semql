@@ -5,11 +5,11 @@ four-role planner / router / presenter / drilldown prompt fragments, the
 cacheable two-segment ``CatalogPrompt``, tool-description projection
 (OpenAI / LangChain), and prompt-token budgeting.
 
-This is split out of the pure ``semql`` core: the compiler emits SQL and
-never renders a prompt. The catalog-level conveniences that used to live
-on ``Catalog`` (``prompt`` / ``prompt_segments`` / ``prompt_hash`` /
-``to_openai_tools`` / ``to_langchain_tools``) are here as functions taking
-the catalog as their first argument.
+The ``semql`` compiler emits SQL and never renders a prompt; that lives
+here. Catalog-level conveniences (``planner_prompt`` /
+``planner_prompt_segments`` / ``prompt_hash`` / ``to_openai_tools`` /
+``to_langchain_tools``) are functions taking the catalog as their first
+argument.
 """
 
 from __future__ import annotations
@@ -69,7 +69,7 @@ __all__ = [
     "PromptBudget",
     "apply_budget",
     "estimate_tokens",
-    # catalog-level conveniences (formerly Catalog methods)
+    # catalog-level conveniences
     "planner_prompt",
     "planner_prompt_segments",
     "prompt_hash",

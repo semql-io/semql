@@ -16,17 +16,16 @@ renders a prompt. This package is the rendering layer on top:
 - **Prompt-token budgeting** — `PromptBudget`, `apply_budget`,
   `estimate_tokens`.
 
-The catalog-level conveniences that used to be `Catalog` methods now take
-the catalog as their first argument:
+The catalog-level conveniences take the catalog as their first argument:
 
 ```python
 from semql import Catalog
 from semql_prompt import planner_prompt, planner_prompt_segments, prompt_hash, to_openai_tools
 
-text = planner_prompt(catalog, viewer=viewer)        # was catalog.prompt(...)
-segs = planner_prompt_segments(catalog)              # was catalog.prompt_segments(...)
-key  = prompt_hash(catalog)                          # was catalog.prompt_hash(...)
-tools = to_openai_tools(catalog, viewer=viewer)      # was catalog.to_openai_tools(...)
+text = planner_prompt(catalog, viewer=viewer)
+segs = planner_prompt_segments(catalog)
+key  = prompt_hash(catalog)
+tools = to_openai_tools(catalog, viewer=viewer)
 ```
 
 ## License

@@ -47,8 +47,7 @@ if TYPE_CHECKING:
 
 class Catalog:
     """A validated collection of cubes plus the convenience surface
-    (``compile``, ``as_dict``, ``with_retrieval``) downstream code wants.
-    Prompt rendering moved to the ``semql-prompt`` package."""
+    (``compile``, ``as_dict``, ``with_retrieval``) downstream code wants."""
 
     def __init__(
         self,
