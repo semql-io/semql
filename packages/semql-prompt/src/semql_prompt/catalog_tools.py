@@ -24,7 +24,9 @@ from semql_prompt.prompt import (
 if TYPE_CHECKING:
     from semql import Catalog
     from semql.hooks import CubePromptHook
+    from semql.model import Cube
     from semql.retrieve import Retriever
+    from semql.spec import SavedQuery
 
 
 def planner_prompt(
@@ -127,17 +129,20 @@ def prompt_hash(
     )
 
 
-def to_openai_tools(
+def _visible_tool_targets(
     catalog: Catalog,
     *,
-    viewer: AuthContext | None = None,
-    only_exposed: bool = True,
-) -> list[dict[str, Any]]:
-    """One OpenAI-format tool dict per visible cube + saved query.
-    Role-gated cubes / saved queries are excluded unless ``viewer`` holds a
-    matching role."""
+    viewer: AuthContext | None,
+    only_exposed: bool,
+) -> tuple[list[Cube], list[SavedQuery]]:
+    """The cubes + saved queries a viewer may expose as tools.
+
+    The single visibility decision both :func:`to_openai_tools` and
+    :func:`to_langchain_tools` consume, so the two exporters can't drift:
+    cube gating runs through ``project_tool_descriptions`` (policy- and
+    role-aware), saved-query gating through ``required_roles`` (ANY-match,
+    the same rule the MCP server applies)."""
     from semql.introspect import iter_cubes
-    from semql.spec import SemanticQuery
 
     by_name = catalog.as_dict()
     proj = project_tool_descriptions(
@@ -147,9 +152,8 @@ def to_openai_tools(
         policy=catalog.policy,
     )
     visible_cubes = {**proj.invariant, **proj.viewer_gated}
-
-    tools: list[dict[str, Any]] = [
-        to_openai_function(c)
+    cubes = [
+        c
         for c in iter_cubes(
             by_name,
             include_meta=False,
@@ -159,12 +163,29 @@ def to_openai_tools(
         )
         if c.name in visible_cubes
     ]
+    saved = [
+        sq
+        for sq in catalog.saved_queries.values()
+        if not sq.required_roles
+        or (viewer is not None and any(r in viewer.roles for r in sq.required_roles))
+    ]
+    return cubes, saved
 
-    for sq in catalog.saved_queries.values():
-        if sq.required_roles and (
-            viewer is None or not any(r in viewer.roles for r in sq.required_roles)
-        ):
-            continue
+
+def to_openai_tools(
+    catalog: Catalog,
+    *,
+    viewer: AuthContext | None = None,
+    only_exposed: bool = True,
+) -> list[dict[str, Any]]:
+    """One OpenAI-format tool dict per visible cube + saved query.
+    Role-gated cubes / saved queries are excluded unless ``viewer`` holds a
+    matching role."""
+    from semql.spec import SemanticQuery
+
+    cubes, saved = _visible_tool_targets(catalog, viewer=viewer, only_exposed=only_exposed)
+    tools: list[dict[str, Any]] = [to_openai_function(c) for c in cubes]
+    for sq in saved:
         tools.append(
             {
                 "type": "function",
@@ -184,9 +205,11 @@ def to_langchain_tools(
     viewer: AuthContext | None = None,
     only_exposed: bool = True,
 ) -> list[object]:
-    """One LangChain ``StructuredTool`` per visible cube. Requires
-    ``langchain-core``; each tool compiles and returns
-    ``{"sql": ..., "params": ...}``."""
+    """One LangChain ``StructuredTool`` per visible cube + saved query.
+    Requires ``langchain-core``. Cube tools compile a caller-supplied
+    ``SemanticQuery``; saved-query tools are zero-arg and run the baked
+    query — matching the cube/saved-query split of :func:`to_openai_tools`
+    via the shared :func:`_visible_tool_targets`."""
     from typing import cast
 
     try:
@@ -198,18 +221,9 @@ def to_langchain_tools(
         ) from None
     structured_tool_cls = cast(Any, StructuredTool)
 
-    from semql.introspect import iter_cubes
     from semql.spec import SemanticQuery
 
-    cubes = list(
-        iter_cubes(
-            catalog.as_dict(),
-            include_meta=False,
-            only_exposed=only_exposed,
-            viewer=viewer,
-            policy=catalog.policy,
-        )
-    )
+    cubes, saved = _visible_tool_targets(catalog, viewer=viewer, only_exposed=only_exposed)
     tools: list[object] = []
     for cube in cubes:
         _cube_ref = cube
@@ -224,6 +238,20 @@ def to_langchain_tools(
                 name=f"query_{cube.name}",
                 description=render_tool_description(cube),
                 args_schema=SemanticQuery,
+            )
+        )
+    for sq in saved:
+        _sq_ref = sq
+
+        def _run_saved(*, _q: SavedQuery = _sq_ref) -> dict[str, object]:
+            compiled = catalog.compile(_q.query, viewer=viewer)
+            return {"sql": compiled.sql, "params": compiled.params}
+
+        tools.append(
+            structured_tool_cls.from_function(
+                func=_run_saved,
+                name=f"saved_{sq.name}",
+                description=render_saved_query_tool_description(sq),
             )
         )
     return tools
