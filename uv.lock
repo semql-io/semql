@@ -2081,7 +2081,7 @@ wheels = [
 
 [[package]]
 name = "semql"
-version = "0.3.0"
+version = "0.4.0"
 source = { editable = "packages/semql" }
 dependencies = [
     { name = "pydantic" },
@@ -2103,7 +2103,7 @@ provides-extras = ["retrieval"]
 
 [[package]]
 name = "semql-auth"
-version = "0.3.0"
+version = "0.4.0"
 source = { editable = "packages/semql-auth" }
 dependencies = [
     { name = "semql" },
@@ -2133,7 +2133,7 @@ provides-extras = ["jwks", "introspect", "x509"]
 
 [[package]]
 name = "semql-engine"
-version = "0.3.0"
+version = "0.4.0"
 source = { editable = "packages/semql-engine" }
 dependencies = [
     { name = "duckdb" },
@@ -2148,7 +2148,7 @@ requires-dist = [
 
 [[package]]
 name = "semql-erd"
-version = "0.3.0"
+version = "0.4.0"
 source = { editable = "packages/semql-erd" }
 dependencies = [
     { name = "semql" },
@@ -2168,7 +2168,7 @@ provides-extras = ["image"]
 
 [[package]]
 name = "semql-introspect"
-version = "0.3.0"
+version = "0.4.0"
 source = { editable = "packages/semql-introspect" }
 dependencies = [
     { name = "semql" },
@@ -2179,7 +2179,7 @@ requires-dist = [{ name = "semql", editable = "packages/semql" }]
 
 [[package]]
 name = "semql-mcp"
-version = "0.3.0"
+version = "0.4.0"
 source = { editable = "packages/semql-mcp" }
 dependencies = [
     { name = "fastmcp" },
@@ -2196,7 +2196,7 @@ requires-dist = [
 
 [[package]]
 name = "semql-prompt"
-version = "0.3.0"
+version = "0.4.0"
 source = { editable = "packages/semql-prompt" }
 dependencies = [
     { name = "semql" },
@@ -2207,7 +2207,7 @@ requires-dist = [{ name = "semql", editable = "packages/semql" }]
 
 [[package]]
 name = "semql-validate-db"
-version = "0.3.0"
+version = "0.4.0"
 source = { editable = "packages/semql-validate-db" }
 dependencies = [
     { name = "semql" },
