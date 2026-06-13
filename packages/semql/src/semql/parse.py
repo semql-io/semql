@@ -191,13 +191,36 @@ def _agg_func_name(func: exp.Expression) -> str | None:
     return None
 
 
+def _inside_subquery(node: exp.Expression, root: exp.Expression) -> bool:
+    """True if ``node`` sits inside a nested SELECT/subquery relative to
+    ``root`` (C12).
+
+    ``Expression.walk()`` descends into subqueries, so an aggregate that
+    belongs to a scalar subquery would otherwise be attributed to the outer
+    query. Walking up from ``node`` to ``root``, a ``Subquery`` or ``Select``
+    boundary means the node is nested, not top-level."""
+    if node is root:
+        # The projection node itself; its parent is the outer SELECT, which
+        # must not count as a boundary.
+        return False
+    parent = node.parent
+    while parent is not None and parent is not root:
+        if isinstance(parent, (exp.Subquery, exp.Select)):
+            return True
+        parent = parent.parent
+    return False
+
+
 def _collect_aggregates(expr: exp.Expression) -> list[exp.AggFunc | exp.Anonymous]:
-    """Find all aggregate-function call nodes inside ``expr``."""
+    """Find aggregate-function call nodes at the top level of ``expr``.
+
+    Aggregates nested inside a subquery are excluded (C12) — they belong to
+    that subquery, not the projection being classified."""
     out: list[Any] = []
     for node in expr.walk():
         if isinstance(node, (exp.Sum, exp.Count, exp.Avg, exp.Min, exp.Max, exp.Anonymous)):
             name = _agg_func_name(node)
-            if name in _AGG_FUNCS:
+            if name in _AGG_FUNCS and not _inside_subquery(node, expr):
                 out.append(node)
     return out
 
@@ -286,6 +309,14 @@ def parse_sql_statement(
         if isinstance(expr, exp.Star):
             # SELECT * — every dimension implicitly. We don't emit
             # anything; the compile pipeline will infer.
+            continue
+        if expr.find(exp.Select) is not None:
+            # A subquery projection (scalar subquery) is unsupported — its
+            # inner aggregates are NOT outer-query measures (C12). Surface it
+            # rather than silently dropping the projection.
+            errors.append(
+                f"Unsupported SELECT projection {expr.sql()!r}: subqueries are not supported."
+            )
             continue
         agg_nodes = _collect_aggregates(expr)
         if agg_nodes:
