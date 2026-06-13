@@ -217,7 +217,9 @@ a prebuilt plan — the A1 finish, a rewritten scan / pushed-down predicate
 survives to emission (stage 4); distributive where-tree + segment lift
 with cross-partition merge residual — the R3 carryovers, 5 parked A4
 tests now green (stage 5); `FederatedPlan` frozen + version-stamped
-(stage 7). Parked: `Join.kind` honouring (D9 → W3); deleting the
+(stage 7). `Join.kind` honouring is resolved (D9 — emitter honours
+`plan_join.kind`, graph re-roots off left-joined cubes, default joins
+INNER). Parked: deleting the
 parallel compiler + `_lit` removal (D10 → its own post-W2 workstream —
 `partition_scans` + a plan-trusting `compile_plan` are the primitives it
 will build on). The "user value at the end" risk was retired by landing

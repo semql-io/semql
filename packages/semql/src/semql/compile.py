@@ -1897,7 +1897,7 @@ class _CompileEnv:
             sel = sel.join(
                 self.wrap_for_tenancy(tgt, target_source),
                 on=self.parse(j.on),
-                join_type="left",
+                join_type=plan_join.kind,
             )
         return sel
 

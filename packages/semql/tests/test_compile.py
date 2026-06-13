@@ -164,14 +164,19 @@ def test_compile_distinct_when_no_measures(catalog: dict[str, Cube]) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_compile_join_emits_left_join(catalog: dict[str, Cube]) -> None:
+def test_compile_join_emits_inner_join(catalog: dict[str, Cube]) -> None:
+    """A default multi-cube join is an INNER JOIN (D9): ``Join.kind`` is
+    now honoured at emission, and a plain join with no ``left_joins`` is
+    stamped ``kind="inner"``. The LEFT-JOIN spine is opt-in via
+    ``left_joins`` (see test_left_joins)."""
     q = SemanticQuery(
         measures=["orders.count"],
         dimensions=["customers.name"],
     )
     out = compile_query(q, catalog, context=CONTEXT)
     assert out.backend is Backend.POSTGRES
-    assert "LEFT JOIN" in out.sql
+    assert "INNER JOIN" in out.sql.upper()
+    assert "LEFT JOIN" not in out.sql.upper()
     assert "c.id" in out.sql
 
 

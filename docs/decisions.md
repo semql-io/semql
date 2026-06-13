@@ -255,36 +255,42 @@ those become catchable mismatches too. (Maintainer-confirmed
 
 ---
 
-## D9. Honouring `Join.kind` at emission waits for the join-graph rebuild (W3)
+## D9. `Join.kind` is honoured at emission (RESOLVED)
 
 **Context.** W2 (review B1) listed "`Join.kind` honoured" — the emitter
-hardcodes `join_type="left"` (`compile.py`) while the plan carries a
+hardcoded `join_type="left"` (`compile.py`) while the plan carries a
 `kind` (`logical.py` sets `left` for cubes in `query.left_joins`, else
 `inner`, matching the spec doc "Cubes to LEFT JOIN instead of INNER").
-The naive fix is to pass `plan_join.kind` to the emitter.
+The naive fix — passing `plan_join.kind` to the emitter — was originally
+deferred because `build_join_graph` rooted the FROM clause at
+`touched[0]`. For the `left_joins` *spine* case that could land the
+left-joined cube on the FROM root (`facts → spine`), so honouring `kind`
+would emit a wrong-rooted INNER join and drop the very rows the spine
+feature exists to keep (e.g. employees with zero punches).
 
-**Decision.** Defer it to W3 (the ktx M2 join-graph rebuild).
-`build_join_graph` does not yet compute the correct FROM root /
-direction for the `left_joins` *spine* case: a query with
-`left_joins=["facts"]` and a dimension from the spine cube roots at
-`facts` and emits `facts → spine`, so the spine cube lands on the
-`right` with `kind="inner"`. Honouring that `kind` produces a
-wrong-rooted INNER join that drops the very rows the spine feature
-exists to keep (e.g. employees with zero punches). The plan's `kind` is
-only as correct as the graph that assigns it, and root/direction
-selection is exactly what W3 rebuilds (Dijkstra + `JoinPath`).
+**Decision.** Unblock the root-selection problem directly rather than
+waiting for the full W3 Dijkstra rebuild. `build_join_graph` now roots at
+the first touched cube that is **not** in `left_joins`
+(`next((c for c in touched if c.name not in left_set), touched[0])`), so
+every left-joined cube lands on the `right` side of an edge and the plan
+stamps it `kind="left"`. The emitter then reads `join_type=plan_join.kind`.
+For the no-`left_joins` default, the root is unchanged (`touched[0]`) and
+every edge is `kind="inner"` — so a plain multi-cube join now emits
+**INNER JOIN**, the documented intended default.
 
-**Why.** Honouring a provably-incorrect `kind` is not an improvement
-over the (also-wrong-but-stable) always-LEFT status quo — it trades one
-wrong result for another and ships a regression for spine queries.
-Fixing it properly means correcting root/direction in the join graph,
-which would mean building on `build_join_graph` right before W3 replaces
-it (the anti-pattern R3 warns against). The emitter is left at
-always-LEFT until the graph produces a trustworthy `kind`.
+**Why.** The deferral hinged on one defect — wrong FROM root for the
+spine case — not on the whole join graph being untrustworthy. A targeted
+re-root fixes exactly that defect without pre-empting W3's broader
+Dijkstra/`JoinPath` work (the edges and direction are otherwise
+unchanged). Honouring `kind` is now a correctness improvement, not a
+trade of one wrong result for another: spine queries keep their
+zero-match rows (LEFT) and ordinary joins stop silently widening to LEFT.
 
-**Revisit.** With W3's join-graph rebuild — at which point the emitter
-reads `plan_join.kind` and a spine query roots at the spine cube with
-the fact cube LEFT-joined. (Maintainer-confirmed 2026-06-12.)
+**Behaviour change.** Default multi-cube joins flip LEFT→INNER. Blast
+radius was two assertions (`test_compile.py` default-join test + one
+`test_snapshots.ambr` line); explicit-`left_joins`, time-spine, and
+federation paths are unaffected (verified: full suite green, 1714
+passed). (Resolved 2026-06-13.)
 
 ---
 

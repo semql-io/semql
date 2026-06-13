@@ -487,7 +487,13 @@ def build_join_graph(
     left_join_cubes: set[str] | None = None,
 ) -> tuple[list[Cube], list[tuple[Cube, Cube, ModelJoin]]]:
     left_set: set[str] = left_join_cubes or set()
-    root = touched[0]
+    # Root the FROM clause at a cube that is *not* left-joined, so the
+    # left-joined cubes land on the ``right`` side of an edge and the
+    # logical plan stamps them ``kind="left"`` (the spine pattern: keep
+    # all root rows, optionally match the fact). Falls back to the first
+    # touched cube when none qualifies — unchanged for the no-left-join
+    # default, where every edge is an inner join.
+    root = next((c for c in touched if c.name not in left_set), touched[0])
     join_edges: list[tuple[Cube, Cube, ModelJoin]] = []
     cubes_in_from: list[Cube] = [root]
     for c in touched:

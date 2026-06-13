@@ -157,18 +157,17 @@ def test_left_joined_cube_in_dimensions_rejected() -> None:
 
 
 def test_left_joins_idempotent_with_existing_forward_edge() -> None:
-    """If the user names a cube that's already reachable forward
-    (e.g. they explicitly want LEFT JOIN semantics for a normal
-    forward edge), the compile still succeeds — bidirectional BFS
-    is a superset of forward BFS, never a refusal."""
+    """A plain forward-edge query (no ``left_joins``) compiles cleanly —
+    bidirectional BFS is a superset of forward BFS, never a refusal. With
+    D9 the edge honours ``Join.kind``: an un-listed forward edge is an
+    INNER JOIN (the LEFT spine is opt-in via ``left_joins``)."""
     catalog = Catalog([_identity_cube(), _punch_log_cube()])
-    # In this catalog the forward edge is user_punch_log → identity,
-    # so listing ``identity`` in left_joins when querying FROM
-    # user_punch_log is the forward case. Compile must still succeed.
+    # The forward edge is user_punch_log → identity, reached from the
+    # FROM root user_punch_log without any left_joins hint.
     q = SemanticQuery(
         measures=["user_punch_log.punch_count"],
         dimensions=["identity.region"],
-        # left_joins is empty here — sanity baseline.
     )
     out = catalog.compile(q)
-    assert "LEFT JOIN" in out.sql.upper()
+    assert "INNER JOIN" in out.sql.upper()
+    assert "LEFT JOIN" not in out.sql.upper()

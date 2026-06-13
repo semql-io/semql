@@ -96,7 +96,9 @@ review, the rest should be confirmed with a failing test before fixing
    federation path lifts the where-tree + segments into fragments with a
    cross-partition residual in the merge (stage 5, the R3 carryovers — 5
    parked A4 tests now green); `FederatedPlan` is frozen + version-stamped
-   (stage 7). Still open: `Join.kind` honouring (decisions.md D9 → W3) and
+   (stage 7). `Join.kind` honouring is now resolved (decisions.md D9 — the
+   emitter reads `plan_join.kind` and `build_join_graph` re-roots off the
+   left-joined cubes; default joins are INNER). Still open:
    the parallel-compiler deletion incl. `_lit` removal (decisions.md D10 →
    its own post-W2 workstream; the split-point primitive `partition_scans`
    and a plan-trusting `compile_plan` are now in place for it).
