@@ -681,10 +681,12 @@ class X509Mapper:
                 return san
         for san in cert.sans:
             if "@" in san:
-                # Email-style: use the local part as the
-                # viewer id (the domain is captured in
-                # ``attrs`` already via ``sans``).
-                return san.split("@", 1)[0]
+                # Email-style: use the *full* address as the viewer
+                # id. The local part alone is not unique —
+                # alice@a.com and alice@b.com are different
+                # principals, and collapsing them to "alice" would
+                # cross-wire row-level security between tenants.
+                return san
         return ""
 
 

@@ -458,14 +458,29 @@ def test_x509_mapper_uses_dns_san_when_no_uri_san() -> None:
 
 def test_x509_mapper_uses_email_san_when_no_uri_or_dns() -> None:
     """Email SANs are common in client certs (e.g. per-user
-    mTLS). The mapper extracts the email local-part as the
-    viewer id (the domain is captured in ``attrs``)."""
+    mTLS). The mapper uses the *full* email as the viewer id —
+    the local part alone is not a unique identity (the domain is
+    also kept in ``attrs`` via ``sans``)."""
     from semql.auth import X509Mapper
 
     m = X509Mapper()
     cert = _fake_cert(subject_cn="", sans=("alice@example.com",))
     ctx = m.verify(cert)
-    assert ctx.viewer_id == "alice"
+    assert ctx.viewer_id == "alice@example.com"
+
+
+def test_x509_mapper_email_san_keeps_distinct_domains_distinct() -> None:
+    """Two users with the same local part but different domains
+    (alice@a.com vs alice@b.com) are different principals — the
+    mapper must not collapse them to a shared viewer id, or one
+    tenant's row-level security would leak to the other."""
+    from semql.auth import X509Mapper
+
+    m = X509Mapper()
+    a = m.verify(_fake_cert(subject_cn="", sans=("alice@a.com",)))
+    b = m.verify(_fake_cert(subject_cn="", sans=("alice@b.com",)))
+    assert a.viewer_id != b.viewer_id
+    assert (a.viewer_id, b.viewer_id) == ("alice@a.com", "alice@b.com")
 
 
 def test_x509_mapper_no_cn_no_san_raises_auth_error() -> None:
