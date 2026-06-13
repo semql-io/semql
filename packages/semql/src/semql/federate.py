@@ -630,13 +630,18 @@ def _emit_merge_sql(
     output_column_meta: list[ColumnMeta],
     *,
     cross_partition_clauses: _Cnf | None = None,
-) -> tuple[str, MergeSpec]:
+) -> tuple[str, MergeSpec, dict[str, object]]:
     """Generate the DuckDB merge SQL.
 
     Frags are aliased ``f0``, ``f1``, ... matching the partitions order.
     The primary fragment is the FROM target; every other fragment
     LEFT JOINs onto it via the appropriate bridge.
+
+    Returns ``(sql, spec, params)`` — the params map carries any
+    cross-partition filter values, bound as ``$name`` placeholders
+    rather than inlined as literals.
     """
+    binder = _MergeBinder()
     # Index the partitions by backend for join-key lookup.
     by_dialect: dict[Dialect, tuple[int, _PartitionPlan]] = {
         p.dialect: (i, p) for i, p in enumerate(partitions)
@@ -784,7 +789,7 @@ def _emit_merge_sql(
     if cross_partition_clauses:
         cube_to_idx_m = {c.name: i for i, p in enumerate(partitions) for c in p.cubes}
         clauses_sql = " AND ".join(
-            _emit_cross_partition_clause(c, cube_to_idx_m) for c in cross_partition_clauses
+            _emit_cross_partition_clause(c, cube_to_idx_m, binder) for c in cross_partition_clauses
         )
         sql += f" WHERE {clauses_sql}"
     if q.measures and n_group > 0:
@@ -814,7 +819,7 @@ def _emit_merge_sql(
         mode="distributive",
         cross_partition_clauses=_serialise_cnf(cross_partition_clauses or []),
     )
-    return sql, spec
+    return sql, spec, binder.params
 
 
 def _serialise_cnf(
@@ -1079,46 +1084,67 @@ def _route_where_distributive(
     return out, cross
 
 
-def _emit_filter_predicate(col_expr: str, f: Filter) -> str:
+class _MergeBinder:
+    """Bind merge-SQL filter values as DuckDB named parameters.
+
+    The merge step runs in-process DuckDB over fragment result sets;
+    DuckDB reads ``$name`` placeholders against the params mapping. Every
+    cross-partition residual / HAVING value flows through here so it
+    binds rather than inlining — ``Filter.values`` are LLM/user-derived,
+    and the federation invariant is "values bind as parameters, never as
+    literals." Names are ``m0``, ``m1``, … kept distinct from the
+    ``p*`` fragment params (which live in separate dicts regardless)."""
+
+    def __init__(self) -> None:
+        self.params: dict[str, object] = {}
+
+    def bind(self, value: object) -> str:
+        name = f"m{len(self.params)}"
+        self.params[name] = value
+        return f"${name}"
+
+
+def _emit_filter_predicate(col_expr: str, f: Filter, binder: _MergeBinder) -> str:
     op = f.op
     vals = list(f.values)
     if op == "eq":
-        return f"{col_expr} = {_lit(vals[0])}"
+        return f"{col_expr} = {binder.bind(vals[0])}"
     if op == "neq":
-        return f"{col_expr} <> {_lit(vals[0])}"
+        return f"{col_expr} <> {binder.bind(vals[0])}"
     if op == "gt":
-        return f"{col_expr} > {_lit(vals[0])}"
+        return f"{col_expr} > {binder.bind(vals[0])}"
     if op == "gte":
-        return f"{col_expr} >= {_lit(vals[0])}"
+        return f"{col_expr} >= {binder.bind(vals[0])}"
     if op == "lt":
-        return f"{col_expr} < {_lit(vals[0])}"
+        return f"{col_expr} < {binder.bind(vals[0])}"
     if op == "lte":
-        return f"{col_expr} <= {_lit(vals[0])}"
+        return f"{col_expr} <= {binder.bind(vals[0])}"
     if op == "in":
-        items = ", ".join(_lit(v) for v in vals)
+        items = ", ".join(binder.bind(v) for v in vals)
         return f"{col_expr} IN ({items})"
     if op == "not_in":
-        items = ", ".join(_lit(v) for v in vals)
+        items = ", ".join(binder.bind(v) for v in vals)
         return f"{col_expr} NOT IN ({items})"
     if op == "is_null":
         return f"{col_expr} IS NULL"
     if op == "not_null":
         return f"{col_expr} IS NOT NULL"
     if op == "contains":
-        return f"{col_expr} ILIKE {_lit('%' + str(vals[0]) + '%')}"
+        return f"{col_expr} ILIKE {binder.bind('%' + str(vals[0]) + '%')}"
     raise FederationError(f"Filter op {op!r} unsupported.", reason="unsupported_op")
 
 
 def _emit_cross_partition_clause(
     clause: _CnfClause,
     cube_to_idx: dict[str, int],
+    binder: _MergeBinder,
 ) -> str:
     lits: list[str] = []
     for negated, f in clause:
         cube_name, dim_name = f.dimension.split(".", 1)
         idx = cube_to_idx[cube_name]
         col_expr = f"f{idx}.{_quote_ident(dim_name)}"
-        pred = _emit_filter_predicate(col_expr, f)
+        pred = _emit_filter_predicate(col_expr, f, binder)
         if negated:
             pred = f"NOT ({pred})"
         lits.append(pred)
@@ -1293,7 +1319,8 @@ def _emit_merge_sql_raw_rows(
     output_column_meta: list[ColumnMeta],
     *,
     cross_partition_clauses: _Cnf | None = None,
-) -> tuple[str, MergeSpec]:
+) -> tuple[str, MergeSpec, dict[str, object]]:
+    binder = _MergeBinder()
     by_dialect: dict[Dialect, tuple[int, _RawRowPartitionPlan]] = {
         p.dialect: (i, p) for i, p in enumerate(partitions)
     }
@@ -1434,7 +1461,7 @@ def _emit_merge_sql_raw_rows(
         sql += " " + " ".join(joins_sql)
     if cross_partition_clauses:
         clauses_sql = " AND ".join(
-            _emit_cross_partition_clause(c, cube_to_idx) for c in cross_partition_clauses
+            _emit_cross_partition_clause(c, cube_to_idx, binder) for c in cross_partition_clauses
         )
         sql += f" WHERE {clauses_sql}"
     if q.measures and n_group_dims > 0:
@@ -1442,7 +1469,7 @@ def _emit_merge_sql_raw_rows(
         sql += f" GROUP BY {group_cols}"
     if q.having:
         having_sql = " AND ".join(
-            _emit_having_term(hf.dimension.rsplit(".", 1)[1], hf) for hf in q.having
+            _emit_having_term(hf.dimension.rsplit(".", 1)[1], hf, binder) for hf in q.having
         )
         sql += f" HAVING {having_sql}"
     if q.order:
@@ -1469,7 +1496,7 @@ def _emit_merge_sql_raw_rows(
         mode="raw_rows",
         cross_partition_clauses=_serialise_cnf(cross_partition_clauses or []),
     )
-    return sql, spec
+    return sql, spec, binder.params
 
 
 def _raw_agg_expr(agg: str, col: str, frag_alias: str) -> str:
@@ -1494,8 +1521,8 @@ def _raw_agg_expr(agg: str, col: str, frag_alias: str) -> str:
     raise FederationError(f"agg={agg!r} unsupported.", reason="unsupported_agg")
 
 
-def _emit_having_term(alias: str, f: Filter) -> str:
-    col, op, val = _quote_ident(alias), f.op, _lit(f.values[0])
+def _emit_having_term(alias: str, f: Filter, binder: _MergeBinder) -> str:
+    col, op, val = _quote_ident(alias), f.op, binder.bind(f.values[0])
     if op == "gt":
         return f"{col} > {val}"
     if op == "gte":
@@ -1509,14 +1536,6 @@ def _emit_having_term(alias: str, f: Filter) -> str:
     if op == "neq":
         return f"{col} <> {val}"
     raise FederationError(f"HAVING op {op!r} unsupported.", reason="unsupported_having_op")
-
-
-def _lit(v: object) -> str:
-    if isinstance(v, bool):
-        return "TRUE" if v else "FALSE"
-    if isinstance(v, (int, float)):
-        return str(v)
-    return f"'{str(v).replace(chr(39), chr(39) + chr(39))}'"
 
 
 def _compile_raw_rows(
@@ -1603,7 +1622,7 @@ def _compile_raw_rows(
         output_columns.append(r.rsplit(".", 1)[1])
         output_column_meta.append(_meta_for_measure(r))
 
-    merge_sql, merge_spec = _emit_merge_sql_raw_rows(
+    merge_sql, merge_spec, merge_params = _emit_merge_sql_raw_rows(
         q,
         catalog,
         primary_partition,
@@ -1615,7 +1634,7 @@ def _compile_raw_rows(
     )
     return FederatedPlan(
         fragments=fragments,
-        merge=MergePlan(sql=merge_sql),
+        merge=MergePlan(sql=merge_sql, params=merge_params),
         merge_spec=merge_spec,
         columns=output_columns,
         column_meta=output_column_meta,
@@ -1798,7 +1817,7 @@ def compile_federated_query(
         output_columns.append(r.rsplit(".", 1)[1])
         output_column_meta.append(_meta_for_measure(r))
 
-    merge_sql, merge_spec = _emit_merge_sql(
+    merge_sql, merge_spec, merge_params = _emit_merge_sql(
         q,
         catalog,
         primary_partition,
@@ -1810,7 +1829,7 @@ def compile_federated_query(
     )
     return FederatedPlan(
         fragments=fragments,
-        merge=MergePlan(sql=merge_sql),
+        merge=MergePlan(sql=merge_sql, params=merge_params),
         merge_spec=merge_spec,
         columns=output_columns,
         column_meta=output_column_meta,
