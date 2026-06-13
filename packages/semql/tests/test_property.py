@@ -22,10 +22,10 @@ import sqlglot
 from hypothesis import HealthCheck, example, given, settings
 from hypothesis import strategies as st
 from semql import (
-    Backend,
     BoolExpr,
     Catalog,
     Cube,
+    Dialect,
     Dimension,
     Filter,
     Measure,
@@ -66,7 +66,7 @@ def _outcome(thunk: object) -> tuple[str, object, object]:
 def _catalog() -> Catalog:
     orders = Cube(
         name="orders",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="orders",
         alias="o",
         base_predicate="{o}.deleted_at IS NULL",

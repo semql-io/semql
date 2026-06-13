@@ -11,9 +11,9 @@ from __future__ import annotations
 
 import pytest
 from semql import (
-    Backend,
     Catalog,
     Cube,
+    Dialect,
     Dimension,
     Measure,
     SemanticQuery,
@@ -55,7 +55,7 @@ def test_compiled_sql_round_trip_is_safe() -> None:
     surfaces here, not in production logs."""
     orders = Cube(
         name="orders",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="orders",
         alias="o",
         measures=[Measure(name="revenue", sql="{o}.amount", agg="sum", unit="currency")],

@@ -35,7 +35,7 @@ from typing import Any, Protocol, cast, runtime_checkable
 import duckdb
 from semql.compile import ColumnMeta
 from semql.federate import FederatedPlan
-from semql.model import Backend
+from semql.model import Dialect
 
 from semql_engine.adapter import Adapter, AdapterResult, AsyncAdapter
 
@@ -196,7 +196,7 @@ class Engine:
         self,
         duckdb_connection: Any | None = None,  # noqa: ANN401
         *,
-        adapters: dict[Backend, Adapter] | None = None,
+        adapters: dict[Dialect, Adapter] | None = None,
         merge_engine: MergeEngine | None = None,
         cache_size: int = 0,
         cache_ttl: float | None = None,
@@ -207,7 +207,7 @@ class Engine:
         if cache_ttl is not None and cache_ttl <= 0:
             raise ValueError(f"cache_ttl must be positive when set, got {cache_ttl}")
         self._con: Any = duckdb_connection or duckdb.connect(":memory:")
-        self._adapters: dict[Backend, Adapter] = dict(adapters or {})
+        self._adapters: dict[Dialect, Adapter] = dict(adapters or {})
         self._merge_engine = merge_engine
         self._cache_size = cache_size
         self._cache_ttl = cache_ttl
@@ -221,7 +221,7 @@ class Engine:
         # hard-coded call) so tests can drive expiry deterministically.
         self._clock: Callable[[], float] = time.monotonic
 
-    def register(self, backend: Backend, adapter: Adapter) -> None:
+    def register(self, backend: Dialect, adapter: Adapter) -> None:
         """Bind an adapter to a backend. Replacing an existing
         registration is allowed (so callers can swap adapters mid-flight
         in tests)."""
@@ -324,7 +324,7 @@ class Engine:
                 raise EngineError(
                     f"No adapter registered for backend "
                     f"{fragment.backend.value!r}. Call Engine.register("
-                    f"Backend.{fragment.backend.name}, your_adapter) "
+                    f"Dialect.{fragment.backend.name}, your_adapter) "
                     f"before running this plan."
                 )
             result = adapter.execute(fragment.sql, fragment.params)
@@ -501,15 +501,15 @@ class AsyncEngine:
         self,
         duckdb_connection: Any | None = None,  # noqa: ANN401
         *,
-        adapters: dict[Backend, AsyncAdapter] | None = None,
+        adapters: dict[Dialect, AsyncAdapter] | None = None,
         merge_engine: AsyncMergeEngine | None = None,
     ) -> None:
         self._con: Any = duckdb_connection or duckdb.connect(":memory:")
-        self._adapters: dict[Backend, AsyncAdapter] = dict(adapters or {})
+        self._adapters: dict[Dialect, AsyncAdapter] = dict(adapters or {})
         self._merge_engine = merge_engine
         self.last_iter_run_used_fast_path: bool = False
 
-    def register(self, backend: Backend, adapter: AsyncAdapter) -> None:
+    def register(self, backend: Dialect, adapter: AsyncAdapter) -> None:
         """Bind an async adapter to a backend. Replacing an existing
         registration is allowed."""
         self._adapters[backend] = adapter
@@ -628,7 +628,7 @@ class AsyncEngine:
                 raise EngineError(
                     f"No adapter registered for backend "
                     f"{frag.backend.value!r}. Call AsyncEngine.register("
-                    f"Backend.{frag.backend.name}, your_adapter) before "
+                    f"Dialect.{frag.backend.name}, your_adapter) before "
                     f"running this plan."
                 )
 

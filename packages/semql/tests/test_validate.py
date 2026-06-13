@@ -17,14 +17,14 @@ from semql import (
     TimeDimension,
     TimeWindow,
 )
-from semql.model import Backend, Segment
+from semql.model import Dialect, Segment
 from semql.validate import ValidationError, validate
 
 
 def _cat() -> Catalog:
     orders = Cube(
         name="orders",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="orders",
         alias="o",
         measures=[
@@ -46,7 +46,7 @@ def _cat() -> Catalog:
     )
     restricted = Cube(
         name="restricted",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="restricted",
         alias="r",
         expose_in_prompt=False,

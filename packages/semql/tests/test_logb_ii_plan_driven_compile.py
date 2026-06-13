@@ -55,8 +55,8 @@ from semql.logical import (
     to_logical_plan,
 )
 from semql.model import (
-    Backend,
     Cube,
+    Dialect,
     Dimension,
     Measure,
     PartitionedScan,
@@ -98,7 +98,7 @@ def test_column_ref_carries_resolved_field() -> None:
             name="orders",
             alias="o",
             table="prod.orders",
-            backend=Backend.POSTGRES,
+            backend=Dialect.POSTGRES,
             dimensions=[Dimension(name="region", sql="{o}.region", type="string")],
             measures=[Measure(name="revenue", sql="{o}.amount", agg="sum")],
         )
@@ -124,7 +124,7 @@ def test_column_ref_field_type_matches_kind() -> None:
             name="orders",
             alias="o",
             table="prod.orders",
-            backend=Backend.POSTGRES,
+            backend=Dialect.POSTGRES,
             dimensions=[Dimension(name="region", sql="{o}.region", type="string")],
             measures=[Measure(name="revenue", sql="{o}.amount", agg="sum")],
         )
@@ -202,7 +202,7 @@ def test_simple_query_sql_unchanged_after_plan_wiring() -> None:
             name="orders",
             alias="o",
             table="{schema}.orders",
-            backend=Backend.POSTGRES,
+            backend=Dialect.POSTGRES,
             measures=[Measure(name="revenue", sql="{o}.amount", agg="sum")],
             dimensions=[Dimension(name="region", sql="{o}.region", type="string")],
         )
@@ -225,7 +225,7 @@ def test_join_sql_unchanged_after_plan_wiring() -> None:
         name="orders",
         alias="o",
         table="{schema}.orders",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         measures=[Measure(name="revenue", sql="{o}.amount", agg="sum")],
         dimensions=[Dimension(name="region", sql="{o}.region", type="string")],
         joins=[
@@ -236,7 +236,7 @@ def test_join_sql_unchanged_after_plan_wiring() -> None:
         name="customers",
         alias="c",
         table="{schema}.customers",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         dimensions=[Dimension(name="name", sql="{c}.name", type="string")],
     )
     catalog = {"orders": orders, "customers": customers}
@@ -268,7 +268,7 @@ def test_left_join_sql_unchanged_after_plan_wiring() -> None:
         name="orders",
         alias="o",
         table="{schema}.orders",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         measures=[Measure(name="revenue", sql="{o}.amount", agg="sum")],
         dimensions=[Dimension(name="region", sql="{o}.region", type="string")],
         joins=[
@@ -279,7 +279,7 @@ def test_left_join_sql_unchanged_after_plan_wiring() -> None:
         name="customers",
         alias="c",
         table="{schema}.customers",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         dimensions=[Dimension(name="name", sql="{c}.name", type="string")],
     )
     catalog = {"orders": orders, "customers": customers}
@@ -306,7 +306,7 @@ def test_group_by_skipped_for_ungrouped_query_via_plan() -> None:
             name="orders",
             alias="o",
             table="prod.orders",
-            backend=Backend.POSTGRES,
+            backend=Dialect.POSTGRES,
             dimensions=[Dimension(name="region", sql="{o}.region", type="string")],
         )
     }
@@ -331,7 +331,7 @@ def test_time_breakdown_via_plan_aggregate() -> None:
             name="orders",
             alias="o",
             table="prod.orders",
-            backend=Backend.POSTGRES,
+            backend=Dialect.POSTGRES,
             measures=[Measure(name="revenue", sql="{o}.amount", agg="sum")],
             time_dimensions=[
                 TimeDimension(
@@ -370,7 +370,7 @@ def test_compare_mode_emits_current_prior_full_outer_join() -> None:
             name="orders",
             alias="o",
             table="prod.orders",
-            backend=Backend.POSTGRES,
+            backend=Dialect.POSTGRES,
             measures=[Measure(name="revenue", sql="{o}.amount", agg="sum")],
             time_dimensions=[
                 TimeDimension(
@@ -429,7 +429,7 @@ def test_apply_partition_to_plan_rewrites_matched_scan() -> None:
     cube = Cube(
         name="orders",
         alias="o",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         time_partition=TimePartition(time_dimension="created_at"),
         physical_sources=[
             TimePartitionedSource(
@@ -495,7 +495,7 @@ def test_apply_partition_to_plan_empty_match_uses_empty_source() -> None:
     cube = Cube(
         name="orders",
         alias="o",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         time_partition=TimePartition(time_dimension="created_at"),
         physical_sources=[
             TimePartitionedSource(
@@ -535,7 +535,7 @@ def test_apply_partition_to_plan_does_not_mutate_catalog() -> None:
     cube = Cube(
         name="orders",
         alias="o",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         time_partition=TimePartition(time_dimension="created_at"),
         physical_sources=[
             TimePartitionedSource(
@@ -573,7 +573,7 @@ def test_apply_partition_to_plan_does_not_mutate_catalog() -> None:
 
 
 def test_partition_scans_returns_one_entry_per_backend() -> None:
-    """``partition_scans(plan)`` returns a ``dict[Backend, LogicalPlan]``
+    """``partition_scans(plan)`` returns a ``dict[Dialect, LogicalPlan]``
     — one entry per backend in the join graph. Single-backend plans
     return a one-entry dict whose value is the input plan."""
     from semql.federate import compile_federated_query
@@ -582,7 +582,7 @@ def test_partition_scans_returns_one_entry_per_backend() -> None:
         name="orders",
         alias="o",
         table="prod.orders",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         measures=[Measure(name="revenue", sql="{o}.amount", agg="sum")],
         dimensions=[
             Dimension(name="region", sql="{o}.region", type="string"),
@@ -600,7 +600,7 @@ def test_partition_scans_returns_one_entry_per_backend() -> None:
         name="sessions",
         alias="s",
         table="prod.sessions",
-        backend=Backend.CLICKHOUSE,
+        backend=Dialect.CLICKHOUSE,
         measures=[Measure(name="count", sql="*", agg="count")],
         dimensions=[
             Dimension(name="app_name", sql="{s}.app_name", type="string"),
@@ -615,10 +615,10 @@ def test_partition_scans_returns_one_entry_per_backend() -> None:
     plan = to_logical_plan(q, catalog)
     by_backend = partition_scans(plan)
     # Two cubes on two backends → two partitions.
-    assert set(by_backend.keys()) == {Backend.POSTGRES, Backend.CLICKHOUSE}
+    assert set(by_backend.keys()) == {Dialect.POSTGRES, Dialect.CLICKHOUSE}
     # Each partition's plan only contains its own scans.
-    pg_plan = by_backend[Backend.POSTGRES]
-    ch_plan = by_backend[Backend.CLICKHOUSE]
+    pg_plan = by_backend[Dialect.POSTGRES]
+    ch_plan = by_backend[Dialect.CLICKHOUSE]
     pg_cube_names = {s.cube.name for s in pg_plan.scans}
     ch_cube_names = {s.cube.name for s in ch_plan.scans}
     assert "orders" in pg_cube_names
@@ -637,16 +637,16 @@ def test_partition_scans_single_backend_returns_input() -> None:
             name="orders",
             alias="o",
             table="prod.orders",
-            backend=Backend.POSTGRES,
+            backend=Dialect.POSTGRES,
             measures=[Measure(name="revenue", sql="{o}.amount", agg="sum")],
         )
     }
     q = SemanticQuery(measures=["orders.revenue"])
     plan = to_logical_plan(q, catalog)
     by_backend = partition_scans(plan)
-    assert list(by_backend.keys()) == [Backend.POSTGRES]
+    assert list(by_backend.keys()) == [Dialect.POSTGRES]
     # The single-backend plan is the input plan (same object).
-    assert by_backend[Backend.POSTGRES] is plan
+    assert by_backend[Dialect.POSTGRES] is plan
 
 
 def test_partition_scans_drops_cross_backend_joins() -> None:
@@ -657,7 +657,7 @@ def test_partition_scans_drops_cross_backend_joins() -> None:
         name="orders",
         alias="o",
         table="prod.orders",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         measures=[Measure(name="revenue", sql="{o}.amount", agg="sum")],
         dimensions=[
             Dimension(name="region", sql="{o}.region", type="string"),
@@ -675,7 +675,7 @@ def test_partition_scans_drops_cross_backend_joins() -> None:
         name="sessions",
         alias="s",
         table="prod.sessions",
-        backend=Backend.CLICKHOUSE,
+        backend=Dialect.CLICKHOUSE,
         dimensions=[
             Dimension(name="app_name", sql="{s}.app_name", type="string"),
             Dimension(name="id", sql="{s}.id", type="string"),
@@ -691,8 +691,8 @@ def test_partition_scans_drops_cross_backend_joins() -> None:
 
     # The per-partition plans carry no joins (the cross-backend edge
     # is dropped — the merge step handles it).
-    assert by_backend[Backend.POSTGRES].joins == []
-    assert by_backend[Backend.CLICKHOUSE].joins == []
+    assert by_backend[Dialect.POSTGRES].joins == []
+    assert by_backend[Dialect.CLICKHOUSE].joins == []
 
 
 # ---------------------------------------------------------------------------
@@ -708,7 +708,7 @@ def test_plan_aggregate_carries_derived_measures() -> None:
             name="orders",
             alias="o",
             table="prod.orders",
-            backend=Backend.POSTGRES,
+            backend=Dialect.POSTGRES,
             measures=[
                 Measure(name="revenue", sql="{o}.amount", agg="sum"),
                 Measure(name="count", sql="*", agg="count"),
@@ -738,7 +738,7 @@ def test_plan_order_limit_captured() -> None:
             name="orders",
             alias="o",
             table="prod.orders",
-            backend=Backend.POSTGRES,
+            backend=Dialect.POSTGRES,
             dimensions=[Dimension(name="region", sql="{o}.region", type="string")],
             measures=[Measure(name="revenue", sql="{o}.amount", agg="sum")],
         )
@@ -786,7 +786,7 @@ def test_compile_plan_entry_point_emits_sql_directly() -> None:
             name="orders",
             alias="o",
             table="{schema}.orders",
-            backend=Backend.POSTGRES,
+            backend=Dialect.POSTGRES,
             measures=[Measure(name="revenue", sql="{o}.amount", agg="sum")],
             dimensions=[Dimension(name="region", sql="{o}.region", type="string")],
         )
@@ -816,7 +816,7 @@ def test_compile_plan_byte_equal_to_compile_query() -> None:
             name="orders",
             alias="o",
             table="{schema}.orders",
-            backend=Backend.POSTGRES,
+            backend=Dialect.POSTGRES,
             measures=[Measure(name="revenue", sql="{o}.amount", agg="sum")],
             dimensions=[Dimension(name="region", sql="{o}.region", type="string")],
         )
@@ -848,7 +848,7 @@ def test_plan_project_columns_carry_kind_metadata() -> None:
             name="orders",
             alias="o",
             table="prod.orders",
-            backend=Backend.POSTGRES,
+            backend=Dialect.POSTGRES,
             dimensions=[Dimension(name="region", sql="{o}.region", type="string")],
             measures=[Measure(name="revenue", sql="{o}.amount", agg="sum")],
             time_dimensions=[
@@ -887,7 +887,7 @@ def test_plan_filters_carry_resolved_field_via_predicate() -> None:
             name="orders",
             alias="o",
             table="prod.orders",
-            backend=Backend.POSTGRES,
+            backend=Dialect.POSTGRES,
             dimensions=[Dimension(name="region", sql="{o}.region", type="string")],
             measures=[Measure(name="revenue", sql="{o}.amount", agg="sum")],
         )
@@ -929,7 +929,7 @@ def test_plan_migration_keeps_existing_snapshot_shape() -> None:
             name="orders",
             alias="o",
             table="prod.orders",
-            backend=Backend.POSTGRES,
+            backend=Dialect.POSTGRES,
             measures=[Measure(name="revenue", sql="{o}.amount", agg="sum")],
             dimensions=[Dimension(name="region", sql="{o}.region", type="string")],
         )
@@ -959,7 +959,7 @@ def test_plan_sql_keywords_unaffected_by_migration() -> None:
             name="orders",
             alias="o",
             table="{schema}.orders",
-            backend=Backend.POSTGRES,
+            backend=Dialect.POSTGRES,
             measures=[Measure(name="revenue", sql="{o}.amount", agg="sum")],
             dimensions=[
                 Dimension(name="region", sql="{o}.region", type="string"),
@@ -994,7 +994,7 @@ def test_sql_round_trip_through_plan_snapshots(snapshot: object) -> None:
             name="orders",
             alias="o",
             table="prod.orders",
-            backend=Backend.POSTGRES,
+            backend=Dialect.POSTGRES,
             measures=[Measure(name="revenue", sql="{o}.amount", agg="sum")],
             dimensions=[Dimension(name="region", sql="{o}.region", type="string")],
         )

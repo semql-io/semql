@@ -41,7 +41,7 @@ from typing import TYPE_CHECKING, Literal
 from semql.compile import ColumnMeta, CompiledQuery, compile_query
 from semql.errors import FederationError
 from semql.introspect import resolve_query
-from semql.model import Backend, Cube, Dimension, Join, Measure
+from semql.model import Cube, Dialect, Dimension, Join, Measure
 from semql.spec import BoolExpr, Filter, SemanticQuery, TimeWindow
 
 FederationMode = Literal["distributive", "raw_rows"]
@@ -58,7 +58,7 @@ FederationMode = Literal["distributive", "raw_rows"]
 """
 
 if TYPE_CHECKING:
-    from semql.backend import BackendDialect
+    from semql.backend import DialectStrategy
     from semql.introspect import PolicyFn, ScopeFn
     from semql.model import AuthContext, View
 
@@ -414,7 +414,7 @@ class _PartitionPlan:
     pass-through.
     """
 
-    backend: Backend
+    backend: Dialect
     cubes: list[Cube]
     sub_query: SemanticQuery
     # Map from the original measure ref ("orders.revenue") to the
@@ -435,7 +435,7 @@ def _build_partition_sub_query(
     q: SemanticQuery,
     catalog: dict[str, Cube],
     partition_cubes: list[Cube],
-    primary_partition: Backend,
+    primary_partition: Dialect,
     bridges: list[_Bridge],
 ) -> _PartitionPlan:
     """Construct the ``SemanticQuery`` that will compile into this
@@ -623,7 +623,7 @@ def _quote_ident(name: str) -> str:
 def _emit_merge_sql(
     q: SemanticQuery,
     catalog: dict[str, Cube],
-    primary_partition: Backend,
+    primary_partition: Dialect,
     partitions: list[_PartitionPlan],
     bridges: list[_Bridge],
     output_columns: list[str],
@@ -638,7 +638,7 @@ def _emit_merge_sql(
     LEFT JOINs onto it via the appropriate bridge.
     """
     # Index the partitions by backend for join-key lookup.
-    by_backend: dict[Backend, tuple[int, _PartitionPlan]] = {
+    by_backend: dict[Dialect, tuple[int, _PartitionPlan]] = {
         p.backend: (i, p) for i, p in enumerate(partitions)
     }
     primary_idx, _primary_plan = by_backend[primary_partition]
@@ -850,7 +850,7 @@ def _raw_measure_col(measure_name: str) -> str:
 class _RawRowPartitionPlan:
     """Per-backend sub-query for raw-row federation."""
 
-    backend: Backend
+    backend: Dialect
     cubes: list[Cube]
     sub_query: SemanticQuery
     raw_measure_columns: dict[str, tuple[str, str]]
@@ -1146,7 +1146,7 @@ def _build_partition_sub_query_raw_rows(
     q: SemanticQuery,
     catalog: dict[str, Cube],
     partition_cubes: list[Cube],
-    primary_partition: Backend,
+    primary_partition: Dialect,
     bridges: list[_Bridge],
 ) -> _RawRowPartitionPlan:
     partition_names = {c.name for c in partition_cubes}
@@ -1286,7 +1286,7 @@ def _build_partition_sub_query_raw_rows(
 def _emit_merge_sql_raw_rows(
     q: SemanticQuery,
     catalog: dict[str, Cube],
-    primary_partition: Backend,
+    primary_partition: Dialect,
     partitions: list[_RawRowPartitionPlan],
     bridges: list[_Bridge],
     output_columns: list[str],
@@ -1294,7 +1294,7 @@ def _emit_merge_sql_raw_rows(
     *,
     cross_partition_clauses: _Cnf | None = None,
 ) -> tuple[str, MergeSpec]:
-    by_backend: dict[Backend, tuple[int, _RawRowPartitionPlan]] = {
+    by_backend: dict[Dialect, tuple[int, _RawRowPartitionPlan]] = {
         p.backend: (i, p) for i, p in enumerate(partitions)
     }
     primary_idx, _ = by_backend[primary_partition]
@@ -1522,15 +1522,15 @@ def _lit(v: object) -> str:
 def _compile_raw_rows(
     q: SemanticQuery,
     catalog: dict[str, Cube],
-    grouped: dict[Backend, list[Cube]],
-    backend_order: list[Backend],
-    primary_partition: Backend,
+    grouped: dict[Dialect, list[Cube]],
+    backend_order: list[Dialect],
+    primary_partition: Dialect,
     bridges: list[_Bridge],
     *,
     context: dict[str, str] | None,
     group_by_alias: bool,
     having_alias: bool,
-    dialects: dict[Backend, BackendDialect] | None,
+    dialects: dict[Dialect, DialectStrategy] | None,
     viewer: AuthContext | None,
     policy: PolicyFn | None,
     scope_fns: dict[str, ScopeFn] | None,
@@ -1629,7 +1629,7 @@ def compile_federated_query(
     context: dict[str, str] | None = None,
     group_by_alias: bool = True,
     having_alias: bool = False,
-    dialects: dict[Backend, BackendDialect] | None = None,
+    dialects: dict[Dialect, DialectStrategy] | None = None,
     views: dict[str, View] | None = None,
     viewer: AuthContext | None = None,
     policy: PolicyFn | None = None,
@@ -1711,7 +1711,7 @@ def compile_federated_query(
     if not bridges:
         raise FederationError("No cross-backend join.", reason="no_cross_backend_join")
 
-    grouped: dict[Backend, list[Cube]] = {}
+    grouped: dict[Dialect, list[Cube]] = {}
     for cube in touched:
         grouped.setdefault(cube.backend, []).append(cube)
     backend_order = [primary_partition] + [b for b in grouped if b is not primary_partition]

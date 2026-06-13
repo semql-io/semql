@@ -10,9 +10,9 @@ from __future__ import annotations
 
 import pytest
 from semql import (
-    Backend,
     Catalog,
     Cube,
+    Dialect,
     Dimension,
     Filter,
     Measure,
@@ -25,7 +25,7 @@ from semql.model import View
 def _orders_cube() -> Cube:
     return Cube(
         name="orders",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="public.orders",
         alias="o",
         measures=[Measure(name="revenue", sql="{o}.amount", agg="sum")],

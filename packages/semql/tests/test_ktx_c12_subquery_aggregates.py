@@ -12,7 +12,7 @@ at the subquery boundary.
 from __future__ import annotations
 
 import pytest
-from semql.model import Backend, Cube, Dimension, Measure
+from semql.model import Cube, Dialect, Dimension, Measure
 from semql.parse import parse_sql_statement
 
 
@@ -21,7 +21,7 @@ def cat() -> dict[str, Cube]:
     return {
         "t": Cube(
             name="t",
-            backend=Backend.POSTGRES,
+            backend=Dialect.POSTGRES,
             table="s.t",
             alias="t",
             measures=[

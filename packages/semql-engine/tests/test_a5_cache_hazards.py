@@ -28,14 +28,14 @@ from typing import Any
 
 import duckdb
 import pytest
-from semql import Backend, Cube, Dimension, Measure, SemanticQuery, compile_federated_query
+from semql import Cube, Dialect, Dimension, Measure, SemanticQuery, compile_federated_query
 from semql_engine import AdapterResult, DuckDBAdapter, Engine
 
 
 def _orders() -> Cube:
     return Cube(
         name="orders",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="orders",
         alias="o",
         primary_key="id",
@@ -97,7 +97,7 @@ class _FakeClock:
 def test_cache_hit_is_isolated_from_caller_mutation() -> None:
     """Mutating a returned result must not poison later cache hits."""
     engine = Engine(cache_size=8)
-    engine.register(Backend.POSTGRES, DuckDBAdapter(_pg_con()))
+    engine.register(Dialect.POSTGRES, DuckDBAdapter(_pg_con()))
     plan = _plan()
 
     first = engine.run(plan)  # miss
@@ -125,7 +125,7 @@ def test_cache_hit_result_meta_is_isolated() -> None:
     """column_meta is a list of mutable dataclasses; a hit must not share
     element identity with a prior return."""
     engine = Engine(cache_size=8)
-    engine.register(Backend.POSTGRES, DuckDBAdapter(_pg_con()))
+    engine.register(Dialect.POSTGRES, DuckDBAdapter(_pg_con()))
     plan = _plan()
 
     first = engine.run(plan)
@@ -157,7 +157,7 @@ def test_cache_list_param_round_trips_to_a_hit() -> None:
     plan.fragments[0].params["ids"] = [1, 2, 3]
     adapter = _FixedAdapter(plan.fragments[0].columns)
     engine = Engine(cache_size=8)
-    engine.register(Backend.POSTGRES, adapter)
+    engine.register(Dialect.POSTGRES, adapter)
 
     engine.run(plan)  # miss
     engine.run(plan)  # hit
@@ -186,7 +186,7 @@ def test_cache_entry_expires_after_ttl() -> None:
     clock = _FakeClock()
     engine = Engine(cache_size=8, cache_ttl=30.0)
     engine._clock = clock
-    engine.register(Backend.POSTGRES, DuckDBAdapter(_pg_con()))
+    engine.register(Dialect.POSTGRES, DuckDBAdapter(_pg_con()))
     plan = _plan()
 
     engine.run(plan)  # miss, stored with deadline = 1030
@@ -206,7 +206,7 @@ def test_cache_ttl_none_never_expires() -> None:
     clock = _FakeClock()
     engine = Engine(cache_size=8)  # cache_ttl defaults to None
     engine._clock = clock
-    engine.register(Backend.POSTGRES, DuckDBAdapter(_pg_con()))
+    engine.register(Dialect.POSTGRES, DuckDBAdapter(_pg_con()))
     plan = _plan()
 
     engine.run(plan)

@@ -22,10 +22,10 @@ from typing import Literal, cast
 from hypothesis import strategies as st
 from mimesis import Locale, Text
 from semql import (
-    Backend,
     BoolExpr,
     Catalog,
     Cube,
+    Dialect,
     Dimension,
     Filter,
     Join,
@@ -63,14 +63,14 @@ _POOL: list[str] = _build_pool()
 
 identifier: st.SearchStrategy[str] = st.sampled_from(_POOL)
 
-# Backends with a real sqlglot dialect (excludes META). ``Backend.value`` is
+# Backends with a real sqlglot dialect (excludes META). ``Dialect.value`` is
 # the sqlglot dialect name, so the dialect-validity property can reuse it.
 _DIALECT_BACKENDS = [
-    Backend.POSTGRES,
-    Backend.CLICKHOUSE,
-    Backend.DUCKDB,
-    Backend.BIGQUERY,
-    Backend.SNOWFLAKE,
+    Dialect.POSTGRES,
+    Dialect.CLICKHOUSE,
+    Dialect.DUCKDB,
+    Dialect.BIGQUERY,
+    Dialect.SNOWFLAKE,
 ]
 
 
@@ -199,7 +199,7 @@ def random_cube(
     *,
     alias: str | None = None,
     name: str | None = None,
-    backend: Backend = Backend.POSTGRES,
+    backend: Dialect = Dialect.POSTGRES,
 ) -> Cube:
     """A single-backend cube with realistic names. SQL fragments use
     ``{alias}.{field}`` so they always parse; the join key columns
@@ -355,7 +355,7 @@ def _bool_expr(leaves: st.SearchStrategy[Filter]) -> st.SearchStrategy[object]:
 @st.composite
 def random_query(draw: st.DrawFn, catalog: Catalog, features: frozenset[str]) -> SemanticQuery:
     cubes = list(catalog.as_dict().values())
-    cubes = [c for c in cubes if c.backend is not Backend.META]
+    cubes = [c for c in cubes if c.backend is not Dialect.META]
     m_refs = [f"{c.name}.{m.name}" for c in cubes for m in c.measures]
     string_dims = [f"{c.name}.{d.name}" for c in cubes for d in c.dimensions if d.type == "string"]
     numeric_dims = [f"{c.name}.{d.name}" for c in cubes for d in c.dimensions if d.type == "number"]
@@ -438,7 +438,7 @@ def broken_pair(draw: st.DrawFn) -> tuple[Catalog, SemanticQuery, str]:
     """A valid pair with exactly one breakage applied. Returns
     ``(catalog, broken_query, breakage_label)``."""
     catalog, q = draw(catalog_and_query())
-    cubes = [c for c in catalog.as_dict().values() if c.backend is not Backend.META]
+    cubes = [c for c in catalog.as_dict().values() if c.backend is not Dialect.META]
     a_cube = cubes[0]
     breakage = draw(st.sampled_from(["unknown_measure", "unknown_dimension", "filter_on_measure"]))
 

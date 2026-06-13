@@ -12,7 +12,7 @@ automatically.
 
 from __future__ import annotations
 
-from semql import Backend, Catalog, Cube, Dimension, Measure
+from semql import Catalog, Cube, Dialect, Dimension, Measure
 from semql.spec import SemanticQuery
 
 
@@ -23,7 +23,7 @@ def _orders_catalog() -> Catalog:
                 name="orders",
                 alias="o",
                 table="prod.orders",
-                backend=Backend.POSTGRES,
+                backend=Dialect.POSTGRES,
                 dimensions=[Dimension(name="region", sql="{o}.region", type="string")],
                 measures=[Measure(name="revenue", sql="{o}.amount", agg="sum")],
             )

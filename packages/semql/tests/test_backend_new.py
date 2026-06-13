@@ -1,5 +1,5 @@
 # pyright: reportPrivateImportUsage=false
-"""Backend strategies for BigQuery, Snowflake, and DuckDB.
+"""Dialect strategies for BigQuery, Snowflake, and DuckDB.
 
 Each emits the same sqlglot AST shape as the Postgres strategy
 (``date_trunc`` via ``exp.Anonymous``, ``ILIKE`` with ``%value%``
@@ -18,22 +18,22 @@ from typing import Any
 
 import pytest
 from semql.backend import (
-    BackendDialect,
     BigQueryDialect,
+    DialectStrategy,
     DuckDBDialect,
     SnowflakeDialect,
     SqlResolver,
     dialect_for,
     render,
 )
-from semql.model import Backend, Cube, Dimension, Measure
+from semql.model import Cube, Dialect, Dimension, Measure
 from sqlglot import exp
 
 
 def _orders() -> Cube:
     return Cube(
         name="orders",
-        backend=Backend.POSTGRES,  # backend on cube doesn't affect the strategy under test
+        backend=Dialect.POSTGRES,  # backend on cube doesn't affect the strategy under test
         table="public.orders",
         alias="o",
         measures=[Measure(name="count", sql="*", agg="count", unit="count")],
@@ -48,17 +48,17 @@ def _orders() -> Cube:
 
 def test_bigquery_placeholder_renders_at_prefix() -> None:
     s = BigQueryDialect()
-    assert render(s.placeholder("p0", "string"), Backend.BIGQUERY) == "@p0"
+    assert render(s.placeholder("p0", "string"), Dialect.BIGQUERY) == "@p0"
 
 
 def test_snowflake_placeholder_renders_colon_prefix() -> None:
     s = SnowflakeDialect()
-    assert render(s.placeholder("p0", "string"), Backend.SNOWFLAKE) == ":p0"
+    assert render(s.placeholder("p0", "string"), Dialect.SNOWFLAKE) == ":p0"
 
 
 def test_duckdb_placeholder_renders_dollar_prefix() -> None:
     s = DuckDBDialect()
-    assert render(s.placeholder("p0", "string"), Backend.DUCKDB) == "$p0"
+    assert render(s.placeholder("p0", "string"), Dialect.DUCKDB) == "$p0"
 
 
 # ---------------------------------------------------------------------------
@@ -69,12 +69,12 @@ def test_duckdb_placeholder_renders_dollar_prefix() -> None:
 @pytest.mark.parametrize(
     ("strategy_cls", "backend"),
     [
-        (BigQueryDialect, Backend.BIGQUERY),
-        (SnowflakeDialect, Backend.SNOWFLAKE),
-        (DuckDBDialect, Backend.DUCKDB),
+        (BigQueryDialect, Dialect.BIGQUERY),
+        (SnowflakeDialect, Dialect.SNOWFLAKE),
+        (DuckDBDialect, Dialect.DUCKDB),
     ],
 )
-def test_trunc_emits_date_trunc(strategy_cls: type, backend: Backend) -> None:
+def test_trunc_emits_date_trunc(strategy_cls: type, backend: Dialect) -> None:
     s = strategy_cls()
     out = render(s.trunc("day", exp.column("ts", table="x")), backend)
     assert "date_trunc" in out.lower()
@@ -97,7 +97,7 @@ def test_bigquery_emit_contains_transpiles_ilike_to_lower_like() -> None:
 
     s = BigQueryDialect()
     node = s.emit_contains(exp.column("email", table="x"), "@acme.com", bind)
-    out = render(node, Backend.BIGQUERY)
+    out = render(node, Dialect.BIGQUERY)
     # BigQuery has no native ILIKE; sqlglot rewrites to LOWER LIKE LOWER.
     assert "LOWER" in out and "LIKE" in out
     assert bound == [("%@acme.com%", "string")]
@@ -112,7 +112,7 @@ def test_snowflake_emit_contains_uses_native_ilike() -> None:
 
     s = SnowflakeDialect()
     node = s.emit_contains(exp.column("email", table="x"), "@acme.com", bind)
-    out = render(node, Backend.SNOWFLAKE)
+    out = render(node, Dialect.SNOWFLAKE)
     assert out == "x.email ILIKE :p0"
     assert bound == [("%@acme.com%", "string")]
 
@@ -126,7 +126,7 @@ def test_duckdb_emit_contains_uses_native_ilike() -> None:
 
     s = DuckDBDialect()
     node = s.emit_contains(exp.column("email", table="x"), "@acme.com", bind)
-    out = render(node, Backend.DUCKDB)
+    out = render(node, Dialect.DUCKDB)
     assert out == "x.email ILIKE $p0"
     assert bound == [("%@acme.com%", "string")]
 
@@ -139,12 +139,12 @@ def test_duckdb_emit_contains_uses_native_ilike() -> None:
 @pytest.mark.parametrize(
     ("strategy_cls", "backend"),
     [
-        (BigQueryDialect, Backend.BIGQUERY),
-        (SnowflakeDialect, Backend.SNOWFLAKE),
-        (DuckDBDialect, Backend.DUCKDB),
+        (BigQueryDialect, Dialect.BIGQUERY),
+        (SnowflakeDialect, Dialect.SNOWFLAKE),
+        (DuckDBDialect, Dialect.DUCKDB),
     ],
 )
-def test_emit_source_renders_aliased_table(strategy_cls: type, backend: Backend) -> None:
+def test_emit_source_renders_aliased_table(strategy_cls: type, backend: Dialect) -> None:
     cube = _orders()
     identity: SqlResolver = lambda x: x  # noqa: E731 -- inline identity resolver; named def is overkill for a one-line test fixture
     out = render(strategy_cls().emit_source(cube, {"orders": cube}, identity), backend)
@@ -159,13 +159,13 @@ def test_emit_source_renders_aliased_table(strategy_cls: type, backend: Backend)
 
 def test_new_strategies_satisfy_protocol() -> None:
     for s in (BigQueryDialect(), SnowflakeDialect(), DuckDBDialect()):
-        assert isinstance(s, BackendDialect)
+        assert isinstance(s, DialectStrategy)
 
 
 def test_dialect_for_returns_new_defaults() -> None:
-    assert isinstance(dialect_for(Backend.BIGQUERY), BigQueryDialect)
-    assert isinstance(dialect_for(Backend.SNOWFLAKE), SnowflakeDialect)
-    assert isinstance(dialect_for(Backend.DUCKDB), DuckDBDialect)
+    assert isinstance(dialect_for(Dialect.BIGQUERY), BigQueryDialect)
+    assert isinstance(dialect_for(Dialect.SNOWFLAKE), SnowflakeDialect)
+    assert isinstance(dialect_for(Dialect.DUCKDB), DuckDBDialect)
 
 
 # ---------------------------------------------------------------------------
@@ -176,13 +176,13 @@ def test_dialect_for_returns_new_defaults() -> None:
 @pytest.mark.parametrize(
     ("backend", "expected_placeholder"),
     [
-        (Backend.BIGQUERY, "@p0"),
-        (Backend.SNOWFLAKE, ":p0"),
-        (Backend.DUCKDB, "$p0"),
+        (Dialect.BIGQUERY, "@p0"),
+        (Dialect.SNOWFLAKE, ":p0"),
+        (Dialect.DUCKDB, "$p0"),
     ],
 )
 def test_compile_against_new_backend_uses_dialect_placeholder(
-    backend: Backend, expected_placeholder: str
+    backend: Dialect, expected_placeholder: str
 ) -> None:
     from semql import Catalog, Filter, SemanticQuery
 

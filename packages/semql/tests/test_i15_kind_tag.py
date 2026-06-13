@@ -45,11 +45,11 @@ def test_resolved_time_dimension_carries_kind_time(catalog: dict) -> None:
 def test_resolved_segment_carries_kind_segment() -> None:
     """Resolving a Segment directly returns ``kind == 'segment'``."""
     # Build a minimal in-memory catalog with a Segment.
-    from semql.model import Backend
+    from semql.model import Dialect
 
     cube = Cube(
         name="orders",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="{schema}.orders",
         alias="o",
         segments=[Segment(name="paid", sql="{o}.status = 'paid'")],

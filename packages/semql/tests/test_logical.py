@@ -30,7 +30,7 @@ from semql.logical import (
     TimeBreakdown,
     to_logical_plan,
 )
-from semql.model import Backend, Cube, Dimension, Measure, TimeDimension
+from semql.model import Cube, Dialect, Dimension, Measure, TimeDimension
 from semql.spec import (
     BoolExpr,
     CompareWindow,
@@ -48,7 +48,7 @@ def _orders_catalog() -> dict[str, Cube]:
             name="orders",
             alias="o",
             table="prod.orders",
-            backend=Backend.POSTGRES,
+            backend=Dialect.POSTGRES,
             dimensions=[Dimension(name="region", sql="{o}.region", type="string")],
             time_dimensions=[
                 TimeDimension(
@@ -222,7 +222,7 @@ def test_to_logical_plan_simple() -> None:
         name="orders",
         alias="orders",
         table="raw_orders",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         dimensions=[Dimension(name="id", sql="id", type="string")],
         measures=[Measure(name="revenue", sql="amount", agg="sum")],
     )
@@ -267,7 +267,7 @@ def test_compile_query_does_not_depend_on_partial_logical_plan(
         name="orders",
         alias="orders",
         table="raw_orders",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         dimensions=[Dimension(name="id", sql="id", type="string")],
         measures=[Measure(name="revenue", sql="amount", agg="sum")],
     )
@@ -293,7 +293,7 @@ def test_compile_query_lowers_via_logical_plan(
         name="orders",
         alias="orders",
         table="raw_orders",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         dimensions=[Dimension(name="id", sql="id", type="string")],
         measures=[Measure(name="revenue", sql="amount", agg="sum")],
     )

@@ -12,7 +12,7 @@ from collections.abc import Generator
 
 import duckdb
 import pytest
-from semql import Backend, Catalog, Cube, Dimension, Join, Measure, TimeDimension
+from semql import Catalog, Cube, Dialect, Dimension, Join, Measure, TimeDimension
 from semql_validate_db import DbValidationError, validate_against_db
 
 # ---------------------------------------------------------------------------
@@ -32,7 +32,7 @@ def conn() -> Generator[duckdb.DuckDBPyConnection, None, None]:
 def _orders_cube() -> Cube:
     return Cube(
         name="orders",
-        backend=Backend.DUCKDB,
+        backend=Dialect.DUCKDB,
         table="orders",
         alias="o",
         measures=[
@@ -51,7 +51,7 @@ def _orders_cube() -> Cube:
 def _customers_cube() -> Cube:
     return Cube(
         name="customers",
-        backend=Backend.DUCKDB,
+        backend=Dialect.DUCKDB,
         table="customers",
         alias="c",
         primary_key="id",

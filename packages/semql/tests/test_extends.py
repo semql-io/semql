@@ -14,13 +14,13 @@ merged field list.
 from __future__ import annotations
 
 import pytest
-from semql import Backend, Catalog, Cube, Dimension, Measure, SemanticQuery, TimeDimension
+from semql import Catalog, Cube, Dialect, Dimension, Measure, SemanticQuery, TimeDimension
 
 
 def _parent() -> Cube:
     return Cube(
         name="all_orders",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="orders",
         alias="o",
         measures=[
@@ -41,14 +41,14 @@ def _parent() -> Cube:
 
 
 def test_cube_extends_defaults_to_none() -> None:
-    cube = Cube(name="x", backend=Backend.POSTGRES, table="x", alias="x")
+    cube = Cube(name="x", backend=Dialect.POSTGRES, table="x", alias="x")
     assert cube.extends is None
 
 
 def test_cube_accepts_extends_field() -> None:
     cube = Cube(
         name="vip",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="orders",
         alias="o",
         extends="all_orders",
@@ -65,7 +65,7 @@ def test_cube_accepts_extends_field() -> None:
 def test_child_inherits_parent_measures() -> None:
     child = Cube(
         name="vip_orders",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="orders",
         alias="o",
         extends="all_orders",
@@ -79,7 +79,7 @@ def test_child_inherits_parent_measures() -> None:
 def test_child_inherits_parent_dimensions_and_time_dimensions() -> None:
     child = Cube(
         name="vip_orders",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="orders",
         alias="o",
         extends="all_orders",
@@ -95,7 +95,7 @@ def test_child_overrides_parent_measure_by_name() -> None:
     swapping the SQL or agg for a filtered context."""
     child = Cube(
         name="vip_orders",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="orders",
         alias="o",
         extends="all_orders",
@@ -115,7 +115,7 @@ def test_child_overrides_parent_measure_by_name() -> None:
 def test_child_can_add_new_measures() -> None:
     child = Cube(
         name="vip_orders",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="orders",
         alias="o",
         extends="all_orders",
@@ -131,7 +131,7 @@ def test_child_inherits_segments() -> None:
 
     parent = Cube(
         name="orders",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="orders",
         alias="o",
         measures=[Measure(name="count", sql="*", agg="count")],
@@ -139,7 +139,7 @@ def test_child_inherits_segments() -> None:
     )
     child = Cube(
         name="vip",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="orders",
         alias="o",
         extends="orders",
@@ -157,7 +157,7 @@ def test_extends_chain_flattens_grandparent_fields() -> None:
     grandparent = _parent()
     parent = Cube(
         name="paid_orders",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="orders",
         alias="o",
         extends="all_orders",
@@ -165,7 +165,7 @@ def test_extends_chain_flattens_grandparent_fields() -> None:
     )
     child = Cube(
         name="vip_paid_orders",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="orders",
         alias="o",
         extends="paid_orders",
@@ -176,8 +176,8 @@ def test_extends_chain_flattens_grandparent_fields() -> None:
 
 
 def test_extends_cycle_raises() -> None:
-    a = Cube(name="a", backend=Backend.POSTGRES, table="a", alias="a", extends="b")
-    b = Cube(name="b", backend=Backend.POSTGRES, table="b", alias="b", extends="a")
+    a = Cube(name="a", backend=Dialect.POSTGRES, table="a", alias="a", extends="b")
+    b = Cube(name="b", backend=Dialect.POSTGRES, table="b", alias="b", extends="a")
     with pytest.raises(ValueError, match=r"(?i)cycle|extends"):
         Catalog([a, b])
 
@@ -185,7 +185,7 @@ def test_extends_cycle_raises() -> None:
 def test_unknown_extends_target_raises() -> None:
     bad = Cube(
         name="vip",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="orders",
         alias="o",
         extends="ghost",
@@ -202,7 +202,7 @@ def test_unknown_extends_target_raises() -> None:
 def test_compile_uses_inherited_measure() -> None:
     child = Cube(
         name="vip_orders",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="orders",
         alias="o",
         extends="all_orders",

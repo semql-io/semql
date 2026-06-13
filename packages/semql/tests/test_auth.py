@@ -20,9 +20,9 @@ from __future__ import annotations
 import pytest
 from semql import (
     AuthContext,
-    Backend,
     Catalog,
     Cube,
+    Dialect,
     Dimension,
     Measure,
     SemanticQuery,
@@ -43,7 +43,7 @@ from semql_prompt import (
 def _public_cube() -> Cube:
     return Cube(
         name="public",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="public_data",
         alias="p",
         measures=[Measure(name="count", sql="*", agg="count")],
@@ -54,7 +54,7 @@ def _public_cube() -> Cube:
 def _finance_cube() -> Cube:
     return Cube(
         name="finance",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="finance_data",
         alias="f",
         required_roles=["finance"],
@@ -66,7 +66,7 @@ def _finance_cube() -> Cube:
 def _hr_cube() -> Cube:
     return Cube(
         name="hr",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="hr_data",
         alias="h",
         required_roles=["hr", "admin"],  # ANY of these
@@ -191,7 +191,7 @@ def test_compile_auto_binds_viewer_id_to_ctx() -> None:
     from ``viewer.viewer_id`` without the caller passing context."""
     scoped_cube = Cube(
         name="my_tickets",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="tickets",
         alias="t",
         security_sql="{t}.assignee = {ctx.viewer_id}",
@@ -212,7 +212,7 @@ def test_compile_explicit_context_viewer_id_wins_over_auto() -> None:
     that wins over the viewer's auto-flatten — the caller knows best."""
     scoped_cube = Cube(
         name="my_tickets",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="tickets",
         alias="t",
         security_sql="{t}.assignee = {ctx.viewer_id}",

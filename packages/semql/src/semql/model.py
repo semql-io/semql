@@ -40,7 +40,7 @@ from semql._grounding import (
 from semql.spec import parse_instant as _parse_instant
 
 
-class Backend(StrEnum):
+class Dialect(StrEnum):
     POSTGRES = "postgres"
     CLICKHOUSE = "clickhouse"
     DUCKDB = "duckdb"
@@ -659,7 +659,7 @@ class PartitionedScan(BaseModel):
 
 class Cube(BaseModel):
     name: str
-    backend: Backend
+    backend: Dialect
     # Shorthand for a plain-table source: ``Cube(table="schema.t", ...)``
     # is equivalent to ``Cube(source=PhysicalTable(table="schema.t"), ...)``.
     # Exactly one of ``table`` / ``source`` must be specified; mixing a
@@ -1407,7 +1407,7 @@ class Entity(_HashableModel):
 __all__ = [
     "AggLiteral",
     "AuthContext",
-    "Backend",
+    "Dialect",
     "BaseField",
     "ChartTypeLiteral",
     "Cube",

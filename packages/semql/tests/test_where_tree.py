@@ -17,11 +17,11 @@ from __future__ import annotations
 
 import pytest
 from semql import (
-    Backend,
     BoolExpr,
     Catalog,
     CompileError,
     Cube,
+    Dialect,
     Dimension,
     Filter,
     Measure,
@@ -32,7 +32,7 @@ from semql import (
 def _orders_cube() -> Cube:
     return Cube(
         name="orders",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="orders",
         alias="o",
         measures=[Measure(name="count", sql="*", agg="count", unit="count")],

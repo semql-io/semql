@@ -30,9 +30,9 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 from semql import (
-    Backend,
     Catalog,
     Cube,
+    Dialect,
     Dimension,
     Measure,
     SemanticQuery,
@@ -48,7 +48,7 @@ def _utc_split_cube() -> Cube:
     """orders split at the 2024-01-01T00:00:00Z instant, written in UTC."""
     return Cube(
         name="orders",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         alias="o",
         time_partition=TimePartition(time_dimension="placed_at"),
         physical_sources=[

@@ -12,14 +12,14 @@ from semql import (
     Measure,
     SemanticQuery,
 )
-from semql.model import Backend
+from semql.model import Dialect
 from semql_prompt import planner_prompt
 
 
 def _cat() -> Catalog:
     users = Cube(
         name="users",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="users",
         alias="u",
         measures=[Measure(name="count", sql="*", agg="count", unit="count")],

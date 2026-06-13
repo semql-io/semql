@@ -15,8 +15,8 @@ just won't get the new metric. Failing the build would be too loud.
 from __future__ import annotations
 
 from semql import (
-    Backend,
     Cube,
+    Dialect,
     Dimension,
     Measure,
     SemanticQuery,
@@ -28,7 +28,7 @@ from semql.validate import ValidationWarning
 def _orders(relations: str = "") -> Cube:
     return Cube(
         name="orders",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="orders",
         alias="o",
         primary_key="id",
@@ -41,7 +41,7 @@ def _orders(relations: str = "") -> Cube:
 def _deprecated_orders() -> Cube:
     return Cube(
         name="orders_v1",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="orders_v1",
         alias="o",
         primary_key="id",
@@ -75,7 +75,7 @@ def test_relations_referencing_stable_cube_no_warning() -> None:
         "orders": _orders(relations="Joins `customers` on id."),
         "customers": Cube(
             name="customers",
-            backend=Backend.POSTGRES,
+            backend=Dialect.POSTGRES,
             table="customers",
             alias="c",
             primary_key="id",
@@ -97,7 +97,7 @@ def test_relations_referencing_deprecated_cube_with_no_replacement() -> None:
         "orders": _orders(relations="Legacy data in `old_orders`."),
         "old_orders": Cube(
             name="old_orders",
-            backend=Backend.POSTGRES,
+            backend=Dialect.POSTGRES,
             table="old_orders",
             alias="o",
             primary_key="id",
@@ -122,7 +122,7 @@ def test_relations_referencing_beta_cube_no_warning() -> None:
         "orders": _orders(relations="Pilot integration with `experiments`."),
         "experiments": Cube(
             name="experiments",
-            backend=Backend.POSTGRES,
+            backend=Dialect.POSTGRES,
             table="experiments",
             alias="e",
             primary_key="id",

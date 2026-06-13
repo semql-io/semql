@@ -16,11 +16,11 @@ from __future__ import annotations
 
 import pytest
 from semql import (
-    Backend,
     Catalog,
     CompareWindow,
     CompileError,
     Cube,
+    Dialect,
     Dimension,
     Filter,
     Measure,
@@ -33,7 +33,7 @@ from semql import (
 def _cat() -> Catalog:
     orders = Cube(
         name="orders",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="orders",
         alias="o",
         base_predicate="{o}.deleted_at IS NULL",

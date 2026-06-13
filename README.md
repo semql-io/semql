@@ -46,13 +46,13 @@ pip install semql-validate-db   # + drift checker
 
 ```python
 from semql import (
-    AuthContext, Backend, Catalog, Cube, Dimension, Measure,
+    AuthContext, Dialect, Catalog, Cube, Dimension, Measure,
     ScopePredicate, SemanticQuery, TimeDimension, TimeWindow,
 )
 
 orders = Cube(
     name="orders",
-    backend=Backend.POSTGRES,
+    backend=Dialect.POSTGRES,
     table="orders",
     alias="o",
     measures=[Measure(name="revenue", sql="{o}.amount", agg="sum", unit="currency")],

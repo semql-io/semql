@@ -20,14 +20,14 @@ Two practical benefits:
 from __future__ import annotations
 
 import pytest
-from semql import Backend, Catalog, Cube, Dimension, Measure, SemanticQuery, View
+from semql import Catalog, Cube, Dialect, Dimension, Measure, SemanticQuery, View
 from semql_prompt import planner_prompt
 
 
 def _orders() -> Cube:
     return Cube(
         name="orders",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="orders",
         alias="o",
         measures=[

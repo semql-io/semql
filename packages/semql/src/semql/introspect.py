@@ -1,7 +1,7 @@
 """Catalog introspection — two complementary surfaces.
 
 **SQL surface** (``META_CUBES`` and friends): the catalog itself as
-queryable ``Backend.META`` cubes. ``_emit_cube_source`` in ``compile.py``
+queryable ``Dialect.META`` cubes. ``_emit_cube_source`` in ``compile.py``
 materialises these as ``VALUES`` literals so a planner can ask
 "which measures are seconds-typed?" via an ordinary ``SemanticQuery``.
 
@@ -24,9 +24,9 @@ from dataclasses import dataclass
 
 from semql.model import (
     AuthContext,
-    Backend,
     BaseField,
     Cube,
+    Dialect,
     Dimension,
     Join,
     Measure,
@@ -150,7 +150,7 @@ def build_meta_values(cube_name: str, catalog: dict[str, Cube]) -> str:
 
 CATALOG_CUBES = Cube(
     name="catalog_cubes",
-    backend=Backend.META,
+    backend=Dialect.META,
     table="catalog_cubes",
     alias="cc",
     expose_in_prompt=False,
@@ -168,7 +168,7 @@ CATALOG_CUBES = Cube(
 
 CATALOG_MEASURES = Cube(
     name="catalog_measures",
-    backend=Backend.META,
+    backend=Dialect.META,
     table="catalog_measures",
     alias="cm",
     expose_in_prompt=False,
@@ -187,7 +187,7 @@ CATALOG_MEASURES = Cube(
 
 CATALOG_DIMENSIONS = Cube(
     name="catalog_dimensions",
-    backend=Backend.META,
+    backend=Dialect.META,
     table="catalog_dimensions",
     alias="cd",
     expose_in_prompt=False,
@@ -257,7 +257,7 @@ def iter_cubes(
 ) -> Iterator[Cube]:
     """Yield cubes from a catalog with consistent filtering.
 
-    ``include_meta=False`` (default) skips ``Backend.META`` reflection
+    ``include_meta=False`` (default) skips ``Dialect.META`` reflection
     cubes — the right default for any tool that walks real database
     tables (validate-db, ERD, MCP). Set ``True`` to include them when
     building prompt fragments that document reflection.
@@ -272,7 +272,7 @@ def iter_cubes(
     disables authorisation entirely (today's default).
     """
     for cube in _iter_all_cubes(catalog):
-        if not include_meta and cube.backend is Backend.META:
+        if not include_meta and cube.backend is Dialect.META:
             continue
         if only_exposed and not cube.expose_in_prompt:
             continue

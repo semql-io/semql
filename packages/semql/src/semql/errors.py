@@ -2,7 +2,7 @@
 
 The compiler raises specific leaf classes — ``UnknownIdentifierError``,
 ``JoinPathError``, ``FilterTypeError``, ``PlaceholderError``,
-``CrossBackendError``, ``PhaseDeferredError`` — so callers (MCP, API
+``CrossDialectError``, ``PhaseDeferredError`` — so callers (MCP, API
 layers, the planner retry loop) can branch on failure mode
 programmatically. ``str(err)`` carries the human message; the leaf's
 attributes carry the machine-readable structure.
@@ -102,7 +102,7 @@ class PlaceholderError(CompileError):
         self.known = list(known) if known else []
 
 
-class CrossBackendError(CompileError):
+class CrossDialectError(CompileError):
     """Raised when a single query touches multiple backends. The merge
     path is deferred (Phase 2)."""
 
@@ -173,7 +173,7 @@ def closest_match(
 __all__ = [
     "CompileError",
     "AuthError",
-    "CrossBackendError",
+    "CrossDialectError",
     "FederationError",
     "FilterTypeError",
     "JoinPathError",

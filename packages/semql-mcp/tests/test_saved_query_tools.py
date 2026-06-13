@@ -14,9 +14,9 @@ from typing import Any
 
 from fastmcp import Client
 from semql import (
-    Backend,
     Catalog,
     Cube,
+    Dialect,
     Dimension,
     Filter,
     Measure,
@@ -33,7 +33,7 @@ def _run[T](coro: Awaitable[T]) -> T:
 def _orders_cube() -> Cube:
     return Cube(
         name="orders",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="orders",
         alias="o",
         measures=[Measure(name="revenue", sql="{o}.amount", agg="sum")],
@@ -168,7 +168,7 @@ def test_saved_query_tool_accepts_context_kwarg() -> None:
     def _orders_with_tenancy() -> Cube:
         return Cube(
             name="orders",
-            backend=Backend.POSTGRES,
+            backend=Dialect.POSTGRES,
             table="{tenant_schema}.orders",
             alias="o",
             tenancy="schema",

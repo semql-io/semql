@@ -14,13 +14,13 @@ foreign-key side (one customer, many orders).
 from __future__ import annotations
 
 import pytest
-from semql import Backend, Catalog, Cube, Dimension, Join, Measure, SemanticQuery
+from semql import Catalog, Cube, Dialect, Dimension, Join, Measure, SemanticQuery
 
 
 def _customers() -> Cube:
     return Cube(
         name="customers",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="customers",
         alias="c",
         primary_key="id",
@@ -34,7 +34,7 @@ def _customers() -> Cube:
 def _orders_with_fk() -> Cube:
     return Cube(
         name="orders",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="orders",
         alias="o",
         measures=[Measure(name="count", sql="*", agg="count")],
@@ -56,7 +56,7 @@ def _orders_with_fk() -> Cube:
 
 
 def test_cube_primary_key_defaults_to_none() -> None:
-    cube = Cube(name="x", backend=Backend.POSTGRES, table="x", alias="x")
+    cube = Cube(name="x", backend=Dialect.POSTGRES, table="x", alias="x")
     assert cube.primary_key is None
 
 
@@ -132,7 +132,7 @@ def test_explicit_join_suppresses_auto_inference() -> None:
     same target and surprising join behaviour."""
     orders = Cube(
         name="orders",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="orders",
         alias="o",
         measures=[Measure(name="count", sql="*", agg="count")],
@@ -165,7 +165,7 @@ def test_explicit_join_suppresses_auto_inference() -> None:
 def test_unknown_foreign_key_target_raises_at_catalog_build() -> None:
     bad = Cube(
         name="orders",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="orders",
         alias="o",
         measures=[Measure(name="count", sql="*", agg="count")],
@@ -185,7 +185,7 @@ def test_unknown_foreign_key_target_raises_at_catalog_build() -> None:
 def test_foreign_key_target_without_primary_key_raises() -> None:
     no_pk = Cube(
         name="customers",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="customers",
         alias="c",
         # primary_key intentionally omitted.
@@ -199,7 +199,7 @@ def test_foreign_key_target_without_primary_key_raises() -> None:
 def test_primary_key_must_be_a_dimension_on_the_cube() -> None:
     bad = Cube(
         name="customers",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="customers",
         alias="c",
         primary_key="not_a_dim",

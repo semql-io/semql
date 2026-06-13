@@ -22,9 +22,9 @@ from typing import Any
 
 from fastmcp import Client
 from semql import (
-    Backend,
     Catalog,
     Cube,
+    Dialect,
     Dimension,
     Lookup,
     LookupValues,
@@ -41,7 +41,7 @@ def _run[T](coro: Awaitable[T]) -> T:
 def _orders_cube() -> Cube:
     return Cube(
         name="orders",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="orders",
         alias="o",
         measures=[Measure(name="revenue", sql="{o}.amount", agg="sum")],

@@ -1,6 +1,6 @@
 """sqlglot adapters — the seam Commit 2 of the sqlglot migration drops into.
 
-This module is *additive*: it ships a SemQL ``Backend`` → sqlglot
+This module is *additive*: it ships a SemQL ``Dialect`` → sqlglot
 dialect name mapping and a typed-placeholder factory, but does not yet
 participate in ``compile_query``. The next migration commit will
 swap the compiler's string-building body onto sqlglot AST primitives,
@@ -11,7 +11,7 @@ The two pieces here:
   renderer expects (``"postgres"``, ``"clickhouse"``, ...).
 - ``placeholder_for(name, dim_type, backend)`` — an ``exp.Placeholder``
   AST node whose ``.sql(dialect=...)`` output matches the
-  ``BackendDialect.placeholder`` strings used today
+  ``DialectStrategy.placeholder`` strings used today
   (``%(p0)s`` for Postgres, ``{p0:String}`` for ClickHouse).
 
 Stock sqlglot renders ``exp.Placeholder(this="p0", kind=String)`` as
@@ -25,9 +25,9 @@ from __future__ import annotations
 
 from sqlglot import exp
 from sqlglot.dialects.clickhouse import ClickHouse
-from sqlglot.dialects.dialect import Dialect
+from sqlglot.dialects.dialect import Dialect as SqlglotDialect
 
-from semql.model import Backend
+from semql.model import Dialect
 
 # Mirrors the mapping in ``backend.py``. Duplicated here on purpose —
 # the dialect lives in string-land; this module lives in sqlglot-land.
@@ -42,19 +42,19 @@ _CH_DIM_TYPE_TO_CH_TYPE: dict[str, str] = {
 }
 
 
-_BACKEND_TO_DIALECT: dict[Backend, str] = {
-    Backend.POSTGRES: "postgres",
-    Backend.CLICKHOUSE: "clickhouse",
-    Backend.DUCKDB: "duckdb",
-    Backend.BIGQUERY: "bigquery",
-    Backend.SNOWFLAKE: "snowflake",
+_BACKEND_TO_DIALECT: dict[Dialect, str] = {
+    Dialect.POSTGRES: "postgres",
+    Dialect.CLICKHOUSE: "clickhouse",
+    Dialect.DUCKDB: "duckdb",
+    Dialect.BIGQUERY: "bigquery",
+    Dialect.SNOWFLAKE: "snowflake",
     # META cubes are materialised as portable VALUES literals; the
     # Postgres dialect is neutral enough to parse them without rewrites.
-    Backend.META: "postgres",
+    Dialect.META: "postgres",
 }
 
 
-def dialect_for(backend: Backend) -> str:
+def dialect_for(backend: Dialect) -> str:
     """Return the sqlglot dialect string for ``backend``.
 
     Unknown backends raise ``KeyError`` so a missing mapping is loud,
@@ -90,18 +90,18 @@ class _ChDialect(ClickHouse):
 # up the tighter placeholder rendering. (Importing this module is the
 # only thing that activates the override — it's not a global state hack
 # from import-time-of-anything-else.)
-Dialect.classes["clickhouse"] = _ChDialect
+SqlglotDialect.classes["clickhouse"] = _ChDialect
 
 
-def placeholder_for(name: str, dim_type: str, backend: Backend) -> exp.Placeholder:
+def placeholder_for(name: str, dim_type: str, backend: Dialect) -> exp.Placeholder:
     """Build an ``exp.Placeholder`` AST for the given backend.
 
     The returned node's ``.sql(dialect=dialect_for(backend))`` matches
-    the strings the existing ``BackendDialect.placeholder`` emits. Use
+    the strings the existing ``DialectStrategy.placeholder`` emits. Use
     this when constructing predicates / projections via sqlglot AST in
     a future Commit-2 path."""
     p = exp.Placeholder(this=name)
-    if backend is Backend.CLICKHOUSE:
+    if backend is Dialect.CLICKHOUSE:
         p.set("kind", _CH_DIM_TYPE_TO_CH_TYPE.get(dim_type, "String"))
     return p
 

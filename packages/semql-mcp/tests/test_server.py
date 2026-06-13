@@ -17,9 +17,9 @@ from typing import Any
 
 from fastmcp import Client
 from semql import (
-    Backend,
     Catalog,
     Cube,
+    Dialect,
     Dimension,
     Measure,
     SemanticQuery,
@@ -35,7 +35,7 @@ def _run[T](coro: Awaitable[T]) -> T:
 def _orders_catalog() -> Catalog:
     orders = Cube(
         name="orders",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="orders",
         alias="o",
         description="Order lines.",
@@ -227,7 +227,7 @@ def test_catalog_prompt_returns_planner_fragment() -> None:
 def test_catalog_prompt_respects_only_exposed_flag() -> None:
     hidden = Cube(
         name="internal",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="internal",
         alias="i",
         expose_in_prompt=False,
@@ -257,7 +257,7 @@ def test_query_semantic_accepts_context_kwarg() -> None:
     substitution) needs a way to reach the server side."""
     cube = Cube(
         name="orders",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="{schema}.orders",
         alias="o",
         measures=[Measure(name="count", sql="*", agg="count", unit="count")],

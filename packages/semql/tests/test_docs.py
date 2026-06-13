@@ -9,9 +9,9 @@ change.
 from __future__ import annotations
 
 from semql import (
-    Backend,
     Catalog,
     Cube,
+    Dialect,
     Dimension,
     Join,
     Measure,
@@ -24,14 +24,14 @@ from semql.docs import render_catalog_markdown
 def _full_catalog() -> Catalog:
     customers = Cube(
         name="customers",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="customers",
         alias="c",
         dimensions=[Dimension(name="id", sql="{c}.id", type="uuid")],
     )
     orders = Cube(
         name="orders",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="orders",
         alias="o",
         description="One row per checkout.",

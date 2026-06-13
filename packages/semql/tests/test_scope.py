@@ -20,9 +20,9 @@ from __future__ import annotations
 import pytest
 from semql import (
     AuthContext,
-    Backend,
     Catalog,
     Cube,
+    Dialect,
     Dimension,
     Measure,
     ScopePredicate,
@@ -38,7 +38,7 @@ from semql.errors import CompileError
 def _tickets() -> Cube:
     return Cube(
         name="tickets",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="tickets",
         alias="t",
         scope="reportees",
@@ -181,7 +181,7 @@ def test_cube_without_scope_is_unaffected_by_registry() -> None:
     a populated scope_fns registry."""
     open_cube = Cube(
         name="public",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="public_data",
         alias="p",
         measures=[Measure(name="count", sql="*", agg="count")],

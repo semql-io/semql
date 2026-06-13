@@ -14,7 +14,7 @@ from typing import cast
 
 import duckdb
 import pytest
-from semql.model import Backend, Cube
+from semql.model import Cube, Dialect
 from semql_introspect import (
     InformationSchemaProbe,
     introspect,
@@ -56,27 +56,27 @@ def _setup_orders_customers(c: duckdb.DuckDBPyConnection) -> None:
 
 def test_introspect_lists_each_table_as_a_cube(conn: duckdb.DuckDBPyConnection) -> None:
     _setup_orders_customers(conn)
-    cubes = introspect_catalog(conn, backend=Backend.DUCKDB, schema="main")
+    cubes = introspect_catalog(conn, backend=Dialect.DUCKDB, schema="main")
     names = {c.name for c in cubes}
     assert names == {"orders", "customers"}
 
 
 def test_cube_emits_table_name_alias_and_backend(conn: duckdb.DuckDBPyConnection) -> None:
     _setup_orders_customers(conn)
-    cubes = {c.name: c for c in introspect_catalog(conn, backend=Backend.DUCKDB, schema="main")}
+    cubes = {c.name: c for c in introspect_catalog(conn, backend=Dialect.DUCKDB, schema="main")}
     assert cubes["orders"].table == "orders"
-    assert cubes["orders"].backend is Backend.DUCKDB
+    assert cubes["orders"].backend is Dialect.DUCKDB
     # Alias for ``orders`` falls to the single-token shorthand.
     assert cubes["orders"].alias == "o"
     # Multi-token alias path: change the table name and re-run.
     conn.execute("CREATE TABLE user_events (id INTEGER PRIMARY KEY, kind VARCHAR)")
-    cubes = {c.name: c for c in introspect_catalog(conn, backend=Backend.DUCKDB, schema="main")}
+    cubes = {c.name: c for c in introspect_catalog(conn, backend=Dialect.DUCKDB, schema="main")}
     assert cubes["user_events"].alias == "ue"
 
 
 def test_date_column_becomes_time_dimension(conn: duckdb.DuckDBPyConnection) -> None:
     _setup_orders_customers(conn)
-    cubes = {c.name: c for c in introspect_catalog(conn, backend=Backend.DUCKDB, schema="main")}
+    cubes = {c.name: c for c in introspect_catalog(conn, backend=Dialect.DUCKDB, schema="main")}
     td_names = {td.name for td in cubes["orders"].time_dimensions}
     assert "created_at" in td_names
     # Same for customers.signup_date.
@@ -86,7 +86,7 @@ def test_date_column_becomes_time_dimension(conn: duckdb.DuckDBPyConnection) -> 
 
 def test_amount_column_becomes_sum_measure(conn: duckdb.DuckDBPyConnection) -> None:
     _setup_orders_customers(conn)
-    cubes = {c.name: c for c in introspect_catalog(conn, backend=Backend.DUCKDB, schema="main")}
+    cubes = {c.name: c for c in introspect_catalog(conn, backend=Dialect.DUCKDB, schema="main")}
     measure_names = {m.name for m in cubes["orders"].measures}
     assert "amount" in measure_names
     amount = next(m for m in cubes["orders"].measures if m.name == "amount")
@@ -105,7 +105,7 @@ def test_id_columns_become_count_distinct_measures(conn: duckdb.DuckDBPyConnecti
         "  kind VARCHAR"
         ")"
     )
-    cubes = {c.name: c for c in introspect_catalog(conn, backend=Backend.DUCKDB, schema="main")}
+    cubes = {c.name: c for c in introspect_catalog(conn, backend=Dialect.DUCKDB, schema="main")}
     m_names = {m.name for m in cubes["events"].measures}
     assert "distinct_device_id" in m_names
     distinct = next(m for m in cubes["events"].measures if m.name == "distinct_device_id")
@@ -117,7 +117,7 @@ def test_pk_column_becomes_dimension_not_measure(conn: duckdb.DuckDBPyConnection
     fires before the ``_id`` heuristic — PKs are dimensions and the
     cube tracks identity via ``primary_key``."""
     _setup_orders_customers(conn)
-    cubes = {c.name: c for c in introspect_catalog(conn, backend=Backend.DUCKDB, schema="main")}
+    cubes = {c.name: c for c in introspect_catalog(conn, backend=Dialect.DUCKDB, schema="main")}
     orders = cubes["orders"]
     dim_names = {d.name for d in orders.dimensions}
     measure_names = {m.name for m in orders.measures}
@@ -136,7 +136,7 @@ def test_fk_emits_join_and_foreign_key_dimension(
     conn: duckdb.DuckDBPyConnection,
 ) -> None:
     _setup_orders_customers(conn)
-    cubes = {c.name: c for c in introspect_catalog(conn, backend=Backend.DUCKDB, schema="main")}
+    cubes = {c.name: c for c in introspect_catalog(conn, backend=Dialect.DUCKDB, schema="main")}
     orders = cubes["orders"]
     # FK source column is a Dimension with foreign_key= set.
     customer_id_dim = next((d for d in orders.dimensions if d.name == "customer_id"), None)
@@ -156,7 +156,7 @@ def test_fk_column_does_not_become_count_distinct_measure(
     """``orders.customer_id`` ends in ``_id`` but it's also an FK —
     the FK rule must win so the column isn't double-modelled."""
     _setup_orders_customers(conn)
-    cubes = {c.name: c for c in introspect_catalog(conn, backend=Backend.DUCKDB, schema="main")}
+    cubes = {c.name: c for c in introspect_catalog(conn, backend=Dialect.DUCKDB, schema="main")}
     measure_names = {m.name for m in cubes["orders"].measures}
     assert "distinct_customer_id" not in measure_names
 
@@ -170,7 +170,7 @@ def test_include_filter_drops_other_tables(conn: duckdb.DuckDBPyConnection) -> N
     _setup_orders_customers(conn)
     cubes = introspect_catalog(
         conn,
-        backend=Backend.DUCKDB,
+        backend=Dialect.DUCKDB,
         schema="main",
         include_tables=["orders"],
     )
@@ -187,7 +187,7 @@ def test_exclude_filter_drops_named_tables(conn: duckdb.DuckDBPyConnection) -> N
     _setup_orders_customers(conn)
     cubes = introspect_catalog(
         conn,
-        backend=Backend.DUCKDB,
+        backend=Dialect.DUCKDB,
         schema="main",
         exclude_tables=["customers"],
     )
@@ -203,7 +203,7 @@ def test_amount_measure_carries_heuristic_annotation(
     conn: duckdb.DuckDBPyConnection,
 ) -> None:
     _setup_orders_customers(conn)
-    result = introspect_to_result(conn, backend=Backend.DUCKDB, schema="main")
+    result = introspect_to_result(conn, backend=Dialect.DUCKDB, schema="main")
     reasons = {(a.cube, a.field): a.reason for a in result.annotations}
     assert ("orders", "amount") in reasons
     assert "measure-name token" in reasons[("orders", "amount")]
@@ -215,7 +215,7 @@ def test_id_count_distinct_carries_heuristic_annotation(
     conn.execute(
         "CREATE TABLE events (  event_id BIGINT PRIMARY KEY,  device_id BIGINT,  kind VARCHAR)"
     )
-    result = introspect_to_result(conn, backend=Backend.DUCKDB, schema="main")
+    result = introspect_to_result(conn, backend=Dialect.DUCKDB, schema="main")
     reasons = {(a.cube, a.field): a.reason for a in result.annotations}
     assert ("events", "distinct_device_id") in reasons
     assert "_id" in reasons[("events", "distinct_device_id")]
@@ -230,7 +230,7 @@ def test_emitted_python_imports_and_compiles(conn: duckdb.DuckDBPyConnection) ->
     """The emitted module should be valid Python — import it via exec
     and verify the CUBES list contains the expected cubes."""
     _setup_orders_customers(conn)
-    src = introspect_to_python(conn, backend=Backend.DUCKDB, schema="main")
+    src = introspect_to_python(conn, backend=Dialect.DUCKDB, schema="main")
     ns: dict[str, object] = {}
     exec(compile(src, "<introspected>", "exec"), ns)
     cubes = ns["CUBES"]
@@ -241,7 +241,7 @@ def test_emitted_python_imports_and_compiles(conn: duckdb.DuckDBPyConnection) ->
 
 def test_emitted_python_carries_todo_comments(conn: duckdb.DuckDBPyConnection) -> None:
     _setup_orders_customers(conn)
-    src = introspect_to_python(conn, backend=Backend.DUCKDB, schema="main")
+    src = introspect_to_python(conn, backend=Dialect.DUCKDB, schema="main")
     assert "# TODO: review" in src
     assert "measure-name token" in src
 
@@ -250,7 +250,7 @@ def test_emitted_python_wires_foreign_key_and_join(
     conn: duckdb.DuckDBPyConnection,
 ) -> None:
     _setup_orders_customers(conn)
-    src = introspect_to_python(conn, backend=Backend.DUCKDB, schema="main")
+    src = introspect_to_python(conn, backend=Dialect.DUCKDB, schema="main")
     assert "foreign_key='customers'" in src
     assert "Join(to='customers'" in src
 
@@ -259,7 +259,7 @@ def test_emitted_python_accepts_custom_header(conn: duckdb.DuckDBPyConnection) -
     _setup_orders_customers(conn)
     src = introspect_to_python(
         conn,
-        backend=Backend.DUCKDB,
+        backend=Dialect.DUCKDB,
         schema="main",
         header="Generated from staging.duckdb",
     )
@@ -278,7 +278,7 @@ def test_aliases_dedupe_when_initials_collide(
 ) -> None:
     conn.execute("CREATE TABLE user_events (id INTEGER PRIMARY KEY)")
     conn.execute("CREATE TABLE user_eligibility (id INTEGER PRIMARY KEY)")
-    cubes = introspect_catalog(conn, backend=Backend.DUCKDB, schema="main")
+    cubes = introspect_catalog(conn, backend=Dialect.DUCKDB, schema="main")
     aliases = {c.alias for c in cubes}
     # Both tables would naturally alias to "ue"; the dedupe step adds a suffix.
     assert len(aliases) == 2
@@ -294,5 +294,5 @@ def test_probe_can_be_passed_directly_to_introspect(
 ) -> None:
     _setup_orders_customers(conn)
     probe = InformationSchemaProbe(conn, schema="main")
-    result = introspect(probe, backend=Backend.DUCKDB)
+    result = introspect(probe, backend=Dialect.DUCKDB)
     assert {c.name for c in result.cubes} == {"orders", "customers"}

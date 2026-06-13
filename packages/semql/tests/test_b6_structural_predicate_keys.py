@@ -24,7 +24,7 @@ import pytest
 from semql._resolve import walk_where_leaves
 from semql.compile import _CompileEnv
 from semql.errors import CompileError
-from semql.model import Backend, Cube, Dimension, Measure
+from semql.model import Cube, Dialect, Dimension, Measure
 from semql.spec import BoolExpr, Filter, SemanticQuery
 
 
@@ -33,7 +33,7 @@ def _catalog() -> dict[str, Cube]:
         name="orders",
         alias="o",
         table="prod.orders",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         measures=[Measure(name="revenue", sql="{o}.amount", agg="sum")],
         dimensions=[
             Dimension(name="region", sql="{o}.region", type="string"),

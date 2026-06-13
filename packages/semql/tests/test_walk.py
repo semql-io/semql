@@ -20,8 +20,8 @@ from semql.introspect import (
     resolve_query,
 )
 from semql.model import (
-    Backend,
     Cube,
+    Dialect,
     Dimension,
     Join,
     Measure,
@@ -35,7 +35,7 @@ from semql.spec import SemanticQuery, TimeWindow
 def _orders() -> Cube:
     return Cube(
         name="orders",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="orders",
         alias="o",
         measures=[Measure(name="revenue", sql="{o}.amount", agg="sum")],
@@ -49,7 +49,7 @@ def _orders() -> Cube:
 def _customers() -> Cube:
     return Cube(
         name="customers",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="customers",
         alias="c",
         primary_key="id",
@@ -132,8 +132,8 @@ def test_iter_joins_excludes_meta_cubes_by_default() -> None:
     """META cubes have no joins so this is a structural check — the
     triple iteration shouldn't walk them at all."""
     triples = list(iter_joins(_catalog()))
-    assert all(src.backend is not Backend.META for src, _, _ in triples)
-    assert all(tgt.backend is not Backend.META for _, _, tgt in triples)
+    assert all(src.backend is not Dialect.META for src, _, _ in triples)
+    assert all(tgt.backend is not Dialect.META for _, _, tgt in triples)
 
 
 # ---------------------------------------------------------------------------

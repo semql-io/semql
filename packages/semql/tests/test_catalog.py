@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 from semql.catalog import Catalog
 from semql.introspect import META_CUBES
-from semql.model import Backend, Cube, Dimension, Join, Measure
+from semql.model import Cube, Dialect, Dimension, Join, Measure
 from semql.spec import SemanticQuery
 from semql_prompt import planner_prompt
 
@@ -13,7 +13,7 @@ from semql_prompt import planner_prompt
 def _orders() -> Cube:
     return Cube(
         name="orders",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="orders",
         alias="o",
         measures=[Measure(name="revenue", sql="{o}.amount", agg="sum", unit="currency")],
@@ -24,7 +24,7 @@ def _orders() -> Cube:
 def _customers() -> Cube:
     return Cube(
         name="customers",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="customers",
         alias="c",
         dimensions=[Dimension(name="name", sql="{c}.name", type="string")],
@@ -64,7 +64,7 @@ def test_compile_refuses_query_joining_alias_colliding_cubes() -> None:
 
     orders = Cube(
         name="orders",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="orders",
         alias="t",
         primary_key="id",
@@ -76,7 +76,7 @@ def test_compile_refuses_query_joining_alias_colliding_cubes() -> None:
     )
     customers = Cube(
         name="customers",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="customers",
         alias="t",  # collides with orders
         primary_key="id",
@@ -104,7 +104,7 @@ def test_compile_allows_alias_colliding_cubes_not_co_queried() -> None:
 def test_catalog_rejects_unknown_join_target() -> None:
     orphan = Cube(
         name="orphan",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="orphan",
         alias="x",
         joins=[Join(to="ghost", relationship="many_to_one", on="{x}.id = {g}.id")],
@@ -148,7 +148,7 @@ def test_catalog_prompt_returns_fragment() -> None:
 def test_catalog_prompt_only_exposed_default() -> None:
     hidden = Cube(
         name="hidden",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="hidden",
         alias="h",
         expose_in_prompt=False,
@@ -166,7 +166,7 @@ def test_catalog_prompt_only_exposed_default() -> None:
 def test_catalog_compile_threads_context() -> None:
     schema_orders = Cube(
         name="orders",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="{schema}.orders",
         alias="o",
         measures=[Measure(name="count", sql="*", agg="count", unit="count")],
@@ -200,7 +200,7 @@ def test_catalog_rejects_display_unit_without_unit() -> None:
     renderer has nothing to convert from otherwise."""
     bad = Cube(
         name="orders",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="orders",
         alias="o",
         measures=[
@@ -221,7 +221,7 @@ def test_catalog_rejects_unknown_unit_pair() -> None:
     construction so the bug doesn't only surface at render time."""
     bad = Cube(
         name="orders",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="orders",
         alias="o",
         measures=[
@@ -242,7 +242,7 @@ def test_catalog_accepts_known_unit_pair() -> None:
     """Properly registered (unit, display_unit) pair must not raise."""
     good = Cube(
         name="orders",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="orders",
         alias="o",
         measures=[
@@ -263,7 +263,7 @@ def test_catalog_validation_also_runs_on_dimensions() -> None:
     """Dimensions carry the same unit fields; the same checks apply."""
     bad = Cube(
         name="events",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="events",
         alias="e",
         dimensions=[
@@ -290,7 +290,7 @@ def test_catalog_validation_uses_custom_registry() -> None:
 
     cube = Cube(
         name="parts",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="parts",
         alias="p",
         measures=[

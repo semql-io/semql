@@ -17,9 +17,9 @@ from typing import Any
 
 import pytest
 from semql import (
-    Backend,
     Catalog,
     Cube,
+    Dialect,
     Dimension,
     GlossaryEntry,
     HybridRetriever,
@@ -33,7 +33,7 @@ from semql import (
 
 def _cube(name: str, **kwargs: Any) -> Cube:  # noqa: ANN401 — test factory
     defaults: dict[str, Any] = {
-        "backend": Backend.POSTGRES,
+        "backend": Dialect.POSTGRES,
         "table": f"public.{name}",
         "alias": name[0],
         "measures": [Measure(name="cnt", sql="*", agg="count")],

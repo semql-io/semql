@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from semql.model import Backend, Cube
+from semql.model import Cube, Dialect
 
 from semql_introspect._emit import emit_python
 from semql_introspect._introspect import (
@@ -31,7 +31,7 @@ from semql_introspect._probe import (
 def introspect_catalog(
     connection: Any,  # noqa: ANN401 — any DB-API 2.0 conn
     *,
-    backend: Backend,
+    backend: Dialect,
     schema: str,
     include_tables: list[str] | None = None,
     exclude_tables: list[str] | None = None,
@@ -54,7 +54,7 @@ def introspect_catalog(
 def introspect_to_result(
     connection: Any,  # noqa: ANN401
     *,
-    backend: Backend,
+    backend: Dialect,
     schema: str,
     include_tables: list[str] | None = None,
     exclude_tables: list[str] | None = None,
@@ -72,7 +72,7 @@ def introspect_to_result(
 def introspect_to_python(
     connection: Any,  # noqa: ANN401
     *,
-    backend: Backend,
+    backend: Dialect,
     schema: str,
     include_tables: list[str] | None = None,
     exclude_tables: list[str] | None = None,

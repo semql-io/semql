@@ -19,9 +19,9 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 from semql import (
-    Backend,
     Catalog,
     Cube,
+    Dialect,
     Dimension,
     Filter,
     Measure,
@@ -37,7 +37,7 @@ from semql.spec import CompareWindow
 def _orders_cube(*, rollups: list[Rollup] | None = None) -> Cube:
     return Cube(
         name="orders",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="orders",
         alias="o",
         measures=[
@@ -96,7 +96,7 @@ def test_rollup_non_distributive_agg_rejected() -> None:
     with pytest.raises(ValidationError, match=r"(?i)agg='count_distinct'"):
         Cube(
             name="orders",
-            backend=Backend.POSTGRES,
+            backend=Dialect.POSTGRES,
             table="orders",
             alias="o",
             measures=[
@@ -144,7 +144,7 @@ def test_rollup_granularity_not_allowed_on_time_dim_rejected() -> None:
     with pytest.raises(ValidationError, match=r"(?i)granularity 'hour' not permitted"):
         Cube(
             name="orders",
-            backend=Backend.POSTGRES,
+            backend=Dialect.POSTGRES,
             table="orders",
             alias="o",
             measures=[Measure(name="revenue", sql="{o}.amount", agg="sum")],
@@ -482,7 +482,7 @@ def test_multi_cube_query_skips_rollup_routing() -> None:
     # Add a second cube + FK so the join graph resolves.
     customers = Cube(
         name="customers",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="customers",
         alias="c",
         primary_key="id",

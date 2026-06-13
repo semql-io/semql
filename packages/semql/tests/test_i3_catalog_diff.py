@@ -21,9 +21,9 @@ diff, not the catalog. We exercise every severity path.
 from __future__ import annotations
 
 from semql import (
-    Backend,
     CatalogDiff,
     Cube,
+    Dialect,
     Dimension,
     Join,
     Measure,
@@ -35,7 +35,7 @@ from semql import (
 def _orders() -> Cube:
     return Cube(
         name="orders",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="orders",
         alias="o",
         primary_key="id",

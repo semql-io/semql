@@ -1,7 +1,7 @@
 """Tests for percentile aggregations (F6).
 
 ``median`` / ``p75`` / ``p90`` / ``p95`` extend ``AggLiteral`` and
-route through ``BackendDialect.emit_percentile`` so each dialect can
+route through ``DialectStrategy.emit_percentile`` so each dialect can
 emit its native shape:
 
 - Postgres / DuckDB / Snowflake: ``PERCENTILE_CONT(q) WITHIN GROUP (ORDER BY ...)``
@@ -18,9 +18,9 @@ from __future__ import annotations
 
 import pytest
 from semql import (
-    Backend,
     Catalog,
     Cube,
+    Dialect,
     Dimension,
     Measure,
     SemanticQuery,
@@ -29,7 +29,7 @@ from semql.errors import FederationError
 from semql.federate import compile_federated_query
 
 
-def _cube(backend: Backend, name: str = "orders") -> Cube:
+def _cube(backend: Dialect, name: str = "orders") -> Cube:
     return Cube(
         name=name,
         backend=backend,
@@ -52,9 +52,9 @@ def _cube(backend: Backend, name: str = "orders") -> Cube:
 
 @pytest.mark.parametrize(
     "backend",
-    [Backend.POSTGRES, Backend.DUCKDB, Backend.SNOWFLAKE],
+    [Dialect.POSTGRES, Dialect.DUCKDB, Dialect.SNOWFLAKE],
 )
-def test_percentile_emits_ansi_within_group(backend: Backend) -> None:
+def test_percentile_emits_ansi_within_group(backend: Dialect) -> None:
     """The ANSI shape compiles via sqlglot's ``WithinGroup`` node.
     Postgres + Snowflake render the textbook form ``PERCENTILE_CONT(q)
     WITHIN GROUP (ORDER BY ...)``; DuckDB renders its accepted
@@ -74,7 +74,7 @@ def test_percentile_emits_ansi_within_group(backend: Backend) -> None:
 
 def test_percentile_q_values_per_agg() -> None:
     """Each agg literal maps to the right quantile (0.5/0.75/0.9/0.95)."""
-    cat = Catalog([_cube(Backend.DUCKDB)])
+    cat = Catalog([_cube(Dialect.DUCKDB)])
     for measure, q_str in [
         ("amount_median", "0.5"),
         ("amount_p75", "0.75"),
@@ -93,7 +93,7 @@ def test_percentile_q_values_per_agg() -> None:
 
 
 def test_percentile_on_clickhouse_uses_quantile_curried_form() -> None:
-    cat = Catalog([_cube(Backend.CLICKHOUSE)])
+    cat = Catalog([_cube(Dialect.CLICKHOUSE)])
     q = SemanticQuery(measures=["orders.amount_median"], dimensions=["orders.region"])
     out = cat.compile(q)
     # ClickHouse: quantile(0.5)(expr)
@@ -108,7 +108,7 @@ def test_percentile_on_clickhouse_uses_quantile_curried_form() -> None:
 
 
 def test_percentile_on_bigquery_uses_approx_quantiles() -> None:
-    cat = Catalog([_cube(Backend.BIGQUERY)])
+    cat = Catalog([_cube(Dialect.BIGQUERY)])
     q = SemanticQuery(measures=["orders.amount_p90"], dimensions=["orders.region"])
     out = cat.compile(q)
     upper = out.sql.upper()
@@ -124,7 +124,7 @@ def test_percentile_on_bigquery_uses_approx_quantiles() -> None:
 
 
 def _federated_catalog_with_percentiles() -> dict[str, Cube]:
-    orders = _cube(Backend.POSTGRES).model_copy(
+    orders = _cube(Dialect.POSTGRES).model_copy(
         update={
             "primary_key": "id",
             "dimensions": [
@@ -141,7 +141,7 @@ def _federated_catalog_with_percentiles() -> dict[str, Cube]:
     )
     customers = Cube(
         name="customers",
-        backend=Backend.BIGQUERY,
+        backend=Dialect.BIGQUERY,
         table="customers",
         alias="c",
         primary_key="id",

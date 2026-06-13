@@ -11,7 +11,7 @@ import pytest
 import sqlglot
 from semql.dialect import dialect_for, placeholder_for
 from semql.introspect import META_CUBES
-from semql.model import Backend, Cube, Dimension, Measure, TimeDimension
+from semql.model import Cube, Dialect, Dimension, Measure, TimeDimension
 from sqlglot import exp
 
 # ---------------------------------------------------------------------------
@@ -22,17 +22,17 @@ from sqlglot import exp
 @pytest.mark.parametrize(
     ("backend", "expected"),
     [
-        (Backend.POSTGRES, "postgres"),
-        (Backend.CLICKHOUSE, "clickhouse"),
-        (Backend.DUCKDB, "duckdb"),
-        (Backend.BIGQUERY, "bigquery"),
-        (Backend.SNOWFLAKE, "snowflake"),
+        (Dialect.POSTGRES, "postgres"),
+        (Dialect.CLICKHOUSE, "clickhouse"),
+        (Dialect.DUCKDB, "duckdb"),
+        (Dialect.BIGQUERY, "bigquery"),
+        (Dialect.SNOWFLAKE, "snowflake"),
         # META cubes are rendered as portable VALUES literals — pick a
         # neutral dialect rather than invent a new one.
-        (Backend.META, "postgres"),
+        (Dialect.META, "postgres"),
     ],
 )
-def test_dialect_for_returns_canonical_string(backend: Backend, expected: str) -> None:
+def test_dialect_for_returns_canonical_string(backend: Dialect, expected: str) -> None:
     assert dialect_for(backend) == expected
 
 
@@ -43,29 +43,29 @@ def test_dialect_for_returns_canonical_string(backend: Backend, expected: str) -
 
 @pytest.mark.parametrize("dim_type", ["string", "number", "time", "bool", "uuid"])
 def test_postgres_placeholder_matches_current_convention(dim_type: str) -> None:
-    p = placeholder_for("p0", dim_type, Backend.POSTGRES)
+    p = placeholder_for("p0", dim_type, Dialect.POSTGRES)
     assert isinstance(p, exp.Placeholder)
     assert p.sql(dialect="postgres") == "%(p0)s"
 
 
 def test_clickhouse_placeholder_typed_suffix() -> None:
     assert (
-        placeholder_for("p0", "string", Backend.CLICKHOUSE).sql(dialect="clickhouse")
+        placeholder_for("p0", "string", Dialect.CLICKHOUSE).sql(dialect="clickhouse")
         == "{p0:String}"
     )
     assert (
-        placeholder_for("p1", "number", Backend.CLICKHOUSE).sql(dialect="clickhouse")
+        placeholder_for("p1", "number", Dialect.CLICKHOUSE).sql(dialect="clickhouse")
         == "{p1:Float64}"
     )
     assert (
-        placeholder_for("p2", "time", Backend.CLICKHOUSE).sql(dialect="clickhouse")
+        placeholder_for("p2", "time", Dialect.CLICKHOUSE).sql(dialect="clickhouse")
         == "{p2:DateTime}"
     )
     assert (
-        placeholder_for("p3", "bool", Backend.CLICKHOUSE).sql(dialect="clickhouse") == "{p3:UInt8}"
+        placeholder_for("p3", "bool", Dialect.CLICKHOUSE).sql(dialect="clickhouse") == "{p3:UInt8}"
     )
     assert (
-        placeholder_for("p4", "uuid", Backend.CLICKHOUSE).sql(dialect="clickhouse") == "{p4:String}"
+        placeholder_for("p4", "uuid", Dialect.CLICKHOUSE).sql(dialect="clickhouse") == "{p4:String}"
     )
 
 
@@ -90,7 +90,7 @@ def _make_test_cubes() -> list[Cube]:
     return [
         Cube(
             name="orders",
-            backend=Backend.POSTGRES,
+            backend=Dialect.POSTGRES,
             table="orders",
             alias="o",
             measures=[
@@ -107,7 +107,7 @@ def _make_test_cubes() -> list[Cube]:
         ),
         Cube(
             name="sessions",
-            backend=Backend.CLICKHOUSE,
+            backend=Dialect.CLICKHOUSE,
             table="sessions",
             alias="s",
             measures=[

@@ -24,8 +24,8 @@ from __future__ import annotations
 import pytest
 from semql import (
     AuthContext,
-    Backend,
     Cube,
+    Dialect,
     Dimension,
     Measure,
 )
@@ -40,7 +40,7 @@ from semql_prompt import (
 def _orders(description: str = "Orders table — the main fact table") -> Cube:
     return Cube(
         name="orders",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="orders",
         alias="o",
         primary_key="id",
@@ -69,7 +69,7 @@ def _orders(description: str = "Orders table — the main fact table") -> Cube:
 def _customers(description: str = "Customer dimension") -> Cube:
     return Cube(
         name="customers",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="customers",
         alias="c",
         primary_key="id",

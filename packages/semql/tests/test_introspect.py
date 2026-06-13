@@ -26,7 +26,7 @@ from semql.introspect import (
     build_meta_values,
     quote_literal,
 )
-from semql.model import Backend, Cube, Dimension, Measure, TimeDimension
+from semql.model import Cube, Dialect, Dimension, Measure, TimeDimension
 
 # ---------------------------------------------------------------------------
 # quote_literal()
@@ -67,7 +67,7 @@ def test_quote_literal_unicode_pass_through() -> None:
 def sample_catalog() -> dict[str, Cube]:
     orders = Cube(
         name="orders",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="orders",
         alias="o",
         description="Order lines",
@@ -143,7 +143,7 @@ def test_meta_values_for_catalog_measures_with_no_measures() -> None:
     """A catalog with cubes but no measures produces the empty-shape
     VALUES literal."""
     empty = {
-        "x": Cube(name="x", backend=Backend.POSTGRES, table="x", alias="x"),
+        "x": Cube(name="x", backend=Dialect.POSTGRES, table="x", alias="x"),
     }
     sql = build_meta_values("catalog_measures", empty)
     assert "WHERE FALSE" in sql.upper()
@@ -151,7 +151,7 @@ def test_meta_values_for_catalog_measures_with_no_measures() -> None:
 
 def test_meta_values_for_catalog_dimensions_with_no_dimensions() -> None:
     empty = {
-        "x": Cube(name="x", backend=Backend.POSTGRES, table="x", alias="x"),
+        "x": Cube(name="x", backend=Dialect.POSTGRES, table="x", alias="x"),
     }
     sql = build_meta_values("catalog_dimensions", empty)
     assert "WHERE FALSE" in sql.upper()
@@ -209,7 +209,7 @@ def test_meta_cubes_list_contains_all_three() -> None:
 
 def test_meta_cubes_are_meta_backend() -> None:
     for cube in META_CUBES:
-        assert cube.backend is Backend.META
+        assert cube.backend is Dialect.META
 
 
 def test_meta_cubes_hidden_from_prompt() -> None:

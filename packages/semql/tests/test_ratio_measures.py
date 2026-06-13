@@ -19,14 +19,14 @@ from __future__ import annotations
 
 import pytest
 from pydantic import ValidationError
-from semql import Backend, Catalog, CompileError, Cube, Dimension, Measure, SemanticQuery
+from semql import Catalog, CompileError, Cube, Dialect, Dimension, Measure, SemanticQuery
 from semql_prompt import planner_prompt
 
 
 def _funnel() -> Cube:
     return Cube(
         name="funnel",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="funnel",
         alias="f",
         measures=[
@@ -144,7 +144,7 @@ def test_ratio_alongside_component_measures() -> None:
 def test_ratio_with_unknown_numerator_raises_compile_error() -> None:
     cube = Cube(
         name="funnel",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="funnel",
         alias="f",
         measures=[
@@ -165,7 +165,7 @@ def test_ratio_with_unknown_numerator_raises_compile_error() -> None:
 def test_ratio_with_unknown_denominator_raises_compile_error() -> None:
     cube = Cube(
         name="funnel",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="funnel",
         alias="f",
         measures=[
@@ -188,7 +188,7 @@ def test_ratio_cannot_reference_another_ratio() -> None:
     different feature (deferred) and would need cycle detection."""
     cube = Cube(
         name="funnel",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="funnel",
         alias="f",
         measures=[

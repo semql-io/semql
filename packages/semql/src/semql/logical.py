@@ -36,8 +36,8 @@ from typing import TYPE_CHECKING, Literal
 
 from semql.errors import CompileError, JoinPathError
 from semql.model import (
-    Backend,
     Cube,
+    Dialect,
     Dimension,
     GranularityLiteral,
     Measure,
@@ -685,10 +685,10 @@ def apply_rollup_to_plan(
     return replace(plan, scans=new_scans, joins=new_joins)
 
 
-def partition_scans(plan: LogicalPlan) -> dict[Backend, LogicalPlan]:
+def partition_scans(plan: LogicalPlan) -> dict[Dialect, LogicalPlan]:
     """Partition a ``LogicalPlan`` by the backend of each ``Scan``'s cube.
 
-    Returns a dict keyed by ``Backend`` whose values are fresh
+    Returns a dict keyed by ``Dialect`` whose values are fresh
     ``LogicalPlan`` instances, each containing only the scans /
     joins that touch cubes on that backend.  Cross-backend joins in
     the original plan are dropped from the per-partition output
@@ -704,7 +704,7 @@ def partition_scans(plan: LogicalPlan) -> dict[Backend, LogicalPlan]:
     independently, replacing the ad-hoc ``_build_partition_sub_query``
     path that duplicates join-graph + filter logic today.
     """
-    by_backend: dict[Backend, list[Scan]] = {}
+    by_backend: dict[Dialect, list[Scan]] = {}
     for scan in plan.scans:
         by_backend.setdefault(scan.cube.backend, []).append(scan)
 
@@ -713,7 +713,7 @@ def partition_scans(plan: LogicalPlan) -> dict[Backend, LogicalPlan]:
         # Single-backend: no partitioning needed.
         return {single[0].cube.backend: plan}
 
-    out: dict[Backend, LogicalPlan] = {}
+    out: dict[Dialect, LogicalPlan] = {}
     for backend, scans in by_backend.items():
         scanned_names = {s.cube.name for s in scans}
         # Joins touching this partition: only ones whose BOTH sides

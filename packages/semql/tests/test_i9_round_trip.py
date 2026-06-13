@@ -17,7 +17,7 @@ from __future__ import annotations
 import json
 
 from semql.compile import CompiledQuery, compile_query
-from semql.model import Backend
+from semql.model import Dialect
 from semql.spec import CompareWindow, Filter, SemanticQuery, TimeWindow
 
 from .conftest import CONTEXT
@@ -56,7 +56,7 @@ def test_compiled_query_round_trip_through_json(catalog: dict) -> None:
     assert restored.sql == cq.sql
     assert restored.params == cq.params
     assert restored.columns == cq.columns
-    assert restored.backend is Backend.POSTGRES
+    assert restored.backend is Dialect.POSTGRES
     assert restored.column_meta == cq.column_meta
 
 

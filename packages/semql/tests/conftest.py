@@ -16,8 +16,8 @@ from __future__ import annotations
 import pytest
 from semql.introspect import META_CUBES
 from semql.model import (
-    Backend,
     Cube,
+    Dialect,
     Dimension,
     Join,
     Measure,
@@ -31,7 +31,7 @@ CONTEXT = {"schema": "test_schema"}
 def catalog() -> dict[str, Cube]:
     orders = Cube(
         name="orders",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="{schema}.orders",
         alias="o",
         base_predicate="{o}.deleted_at IS NULL",
@@ -63,7 +63,7 @@ def catalog() -> dict[str, Cube]:
     # the column-collision prefixing logic.
     customers = Cube(
         name="customers",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="{schema}.customers",
         alias="c",
         expose_in_prompt=False,
@@ -77,7 +77,7 @@ def catalog() -> dict[str, Cube]:
 
     products = Cube(
         name="products",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="{schema}.products",
         alias="p",
         expose_in_prompt=False,
@@ -90,7 +90,7 @@ def catalog() -> dict[str, Cube]:
 
     sessions = Cube(
         name="sessions",
-        backend=Backend.CLICKHOUSE,
+        backend=Dialect.CLICKHOUSE,
         table="{schema}.sessions",
         alias="s",
         base_predicate="{s}.event_type = 'active'",
@@ -109,7 +109,7 @@ def catalog() -> dict[str, Cube]:
     # required_filters forces callers to always filter on `flag_type`.
     restricted = Cube(
         name="restricted",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="{schema}.restricted",
         alias="r",
         expose_in_prompt=False,

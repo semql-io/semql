@@ -14,13 +14,13 @@ catalog fails fast instead of producing a broken UI affordance.
 from __future__ import annotations
 
 import pytest
-from semql import Backend, Cube, Dimension
+from semql import Cube, Dialect, Dimension
 
 
 def _geo_cube(drills: list[list[str]] | None = None) -> Cube:
     return Cube(
         name="sales",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="sales",
         alias="s",
         dimensions=[
@@ -33,7 +33,7 @@ def _geo_cube(drills: list[list[str]] | None = None) -> Cube:
 
 
 def test_drill_paths_defaults_to_empty_list() -> None:
-    cube = Cube(name="x", backend=Backend.POSTGRES, table="x", alias="x")
+    cube = Cube(name="x", backend=Dialect.POSTGRES, table="x", alias="x")
     assert cube.drill_paths == []
 
 

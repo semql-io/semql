@@ -13,7 +13,7 @@ import semql
 def test_public_surface_includes_core_types() -> None:
     expected = {
         # model
-        "Backend",
+        "Dialect",
         "Cube",
         "Measure",
         "Dimension",
@@ -36,7 +36,7 @@ def test_public_surface_includes_core_types() -> None:
         "JoinPathError",
         "FilterTypeError",
         "PlaceholderError",
-        "CrossBackendError",
+        "CrossDialectError",
         "PhaseDeferredError",
         # introspect
         "META_CUBES",
@@ -75,7 +75,7 @@ def test_quick_start_import_shape_works() -> None:
 
     orders = Cube(
         name="orders",
-        backend=semql.Backend.POSTGRES,
+        backend=semql.Dialect.POSTGRES,
         table="orders",
         alias="o",
         measures=[Measure(name="revenue", sql="{o}.amount", agg="sum", unit="currency")],

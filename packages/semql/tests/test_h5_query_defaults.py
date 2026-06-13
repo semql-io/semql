@@ -9,9 +9,9 @@ from __future__ import annotations
 
 import pytest
 from semql import (
-    Backend,
     Catalog,
     Cube,
+    Dialect,
     Dimension,
     Measure,
     SemanticQuery,
@@ -23,7 +23,7 @@ from semql.spec import SemanticQueryDefaults, TimeWindow
 def _catalog() -> Catalog:
     cube = Cube(
         name="orders",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="public.orders",
         alias="o",
         measures=[Measure(name="revenue", sql="{o}.amount", agg="sum")],

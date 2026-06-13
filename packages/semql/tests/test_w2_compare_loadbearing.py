@@ -17,7 +17,7 @@ from __future__ import annotations
 from dataclasses import replace
 
 from semql.compile import _CompileEnv, _emit_compare_query
-from semql.model import Backend, Cube, Measure, TimeDimension
+from semql.model import Cube, Dialect, Measure, TimeDimension
 from semql.spec import CompareWindow, SemanticQuery, TimeWindow
 
 
@@ -26,7 +26,7 @@ def _catalog() -> dict[str, Cube]:
         name="orders",
         alias="o",
         table="prod.orders",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         measures=[Measure(name="revenue", sql="{o}.amount", agg="sum")],
         time_dimensions=[TimeDimension(name="created_at", sql="{o}.created_at")],
     )

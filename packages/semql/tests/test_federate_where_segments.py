@@ -15,8 +15,8 @@ from collections.abc import Mapping
 
 import duckdb
 from semql import (
-    Backend,
     Cube,
+    Dialect,
     Dimension,
     Filter,
     Join,
@@ -33,7 +33,7 @@ from semql_engine import AdapterResult, Engine
 # ---------------------------------------------------------------------------
 
 
-def _orders(backend: Backend = Backend.POSTGRES) -> Cube:
+def _orders(backend: Dialect = Dialect.POSTGRES) -> Cube:
     return Cube(
         name="orders",
         backend=backend,
@@ -57,7 +57,7 @@ def _orders(backend: Backend = Backend.POSTGRES) -> Cube:
     )
 
 
-def _customers(backend: Backend = Backend.BIGQUERY) -> Cube:
+def _customers(backend: Dialect = Dialect.BIGQUERY) -> Cube:
     return Cube(
         name="customers",
         backend=backend,
@@ -182,8 +182,8 @@ def test_distributive_where_engine_end_to_end_matches_reference() -> None:
             )
 
     engine = Engine()
-    engine.register(Backend.POSTGRES, _Adapter(pg_con))
-    engine.register(Backend.BIGQUERY, _Adapter(bq_con))
+    engine.register(Dialect.POSTGRES, _Adapter(pg_con))
+    engine.register(Dialect.BIGQUERY, _Adapter(bq_con))
     result = engine.run(plan)
     # Reference: hand-rolled baseline via a single DuckDB query.
     baseline_con = duckdb.connect(":memory:")

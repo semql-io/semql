@@ -14,7 +14,7 @@ target backend's dialect. Per-cube fragments (dim SQL, measure SQL,
 ``base_predicate``, ``Join.on``) are parsed by sqlglot under the
 catalog cube's declared backend; dialect-specific shapes
 (``placeholder``, ``trunc``, ``contains``, ``emit_source``) come from
-the ``BackendDialect`` and slot into the AST as nodes.
+the ``DialectStrategy`` and slot into the AST as nodes.
 
 Scope (Phase 1):
 - Single-backend queries (cross-backend rejected).
@@ -51,14 +51,14 @@ from semql._resolve import (
 from semql._resolve import (
     resolve_field as _resolve_field_raw,
 )
-from semql.backend import BackendDialect, dialect_for
+from semql.backend import DialectStrategy, dialect_for
 
 # Importing from semql.dialect also registers the ClickHouse placeholder
 # override against the ``clickhouse`` dialect name (side effect on import).
 from semql.dialect import dialect_for as sqlglot_dialect_for
 from semql.errors import (
     CompileError,
-    CrossBackendError,
+    CrossDialectError,
     FilterTypeError,
     JoinPathError,
     PhaseDeferredError,
@@ -71,9 +71,9 @@ from semql.logical import LogicalPlan, output_alias, output_column_collisions
 from semql.model import (
     AggLiteral,
     AuthContext,
-    Backend,
     Cube,
     DerivedTable,
+    Dialect,
     Dimension,
     FormatLiteral,
     Measure,
@@ -173,7 +173,7 @@ class ColumnMeta:
 
 @dataclass
 class CompiledQuery:
-    backend: Backend
+    backend: Dialect
     sql: str
     params: dict[str, Any]
     columns: list[str]
@@ -231,7 +231,7 @@ class CompiledQuery:
         """
         backend = data["backend"]
         if isinstance(backend, str):
-            backend = Backend(backend)
+            backend = Dialect(backend)
         column_meta = [ColumnMeta.model_validate(m) for m in data.get("column_meta", [])]
         return cls(
             backend=backend,
@@ -324,7 +324,7 @@ def _collect_hoisted_ctes(
 def _apply_with_clause(
     select_node: exp.Select,
     ctes: list[tuple[str, str]],
-    backend: Backend,
+    backend: Dialect,
 ) -> exp.Select:
     """Attach a ``WITH`` clause hoisting every ``ctes`` entry to the front
     of ``select_node``.
@@ -665,7 +665,7 @@ def _filter_node(
     f: Filter,
     field: exp.Expression,
     field_type: str,
-    dialect: BackendDialect,
+    dialect: DialectStrategy,
     bind: Callable[[Any, str], exp.Placeholder],
 ) -> exp.Expression:
     """Build a predicate node for a Filter.
@@ -1290,14 +1290,14 @@ def _check_fan_out(
             )
 
 
-def _pick_single_backend(touched: list[Cube]) -> Backend:
+def _pick_single_dialect(touched: list[Cube]) -> Dialect:
     """Single-backend gate. Cross-backend queries route to
     :func:`semql.compile_federated_query` — non-federated compile is
     one-backend-only."""
     backends = {c.backend for c in touched}
     if len(backends) > 1:
         backend_names = sorted(b.value for b in backends)
-        raise CrossBackendError(
+        raise CrossDialectError(
             "Cross-backend queries are not yet supported (Phase 2). "
             f"Touched backends: {backend_names}.",
             backends=backend_names,
@@ -1325,7 +1325,7 @@ class _CompileEnv:
         context: dict[str, str] | None,
         group_by_alias: bool,
         having_alias: bool,
-        dialects: dict[Backend, BackendDialect] | None,
+        dialects: dict[Dialect, DialectStrategy] | None,
         views: dict[str, View] | None,
         viewer: AuthContext | None,
         policy: PolicyFn | None,
@@ -1405,7 +1405,7 @@ class _CompileEnv:
         _check_required_filters(self.touched, q)
         _check_alias_uniqueness(self.touched)
 
-        self.backend = _pick_single_backend(self.touched)
+        self.backend = _pick_single_dialect(self.touched)
         self.left_join_cubes: set[str] = set(q.left_joins)
 
         # Anti-join support: cubes named in ``q.left_joins`` get
@@ -1997,7 +1997,7 @@ class _CompileEnv:
         where_terms: list[exp.Expression] = []
 
         for cube_w in self.cubes_in_from:
-            if cube_w.base_predicate and cube_w.backend is not Backend.META:
+            if cube_w.base_predicate and cube_w.backend is not Dialect.META:
                 where_terms.append(self.parse(cube_w.base_predicate))
 
         for pred in self.plan.filters:
@@ -2638,7 +2638,7 @@ def compile_plan(
     context: dict[str, str] | None = None,
     group_by_alias: bool = True,
     having_alias: bool = False,
-    dialects: dict[Backend, BackendDialect] | None = None,
+    dialects: dict[Dialect, DialectStrategy] | None = None,
     views: dict[str, View] | None = None,
     viewer: AuthContext | None = None,
     policy: PolicyFn | None = None,
@@ -2781,7 +2781,7 @@ def compile_query(
     context: dict[str, str] | None = None,
     group_by_alias: bool = True,
     having_alias: bool = False,
-    dialects: dict[Backend, BackendDialect] | None = None,
+    dialects: dict[Dialect, DialectStrategy] | None = None,
     views: dict[str, View] | None = None,
     viewer: AuthContext | None = None,
     policy: PolicyFn | None = None,
@@ -2832,7 +2832,7 @@ def compile_query(
 __all__ = [
     "CompiledQuery",
     "CompileError",
-    "CrossBackendError",
+    "CrossDialectError",
     "FilterTypeError",
     "JoinPathError",
     "MAX_UNGROUPED_ROWS",

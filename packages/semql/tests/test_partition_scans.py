@@ -2,7 +2,7 @@
 
 The current ``compile_federated_query`` walks the catalog and
 partitions cubes by backend in an ad-hoc way.  ``partition_scans``
-takes a ``LogicalPlan`` and returns a dict of ``Backend -> sub-plan``
+takes a ``LogicalPlan`` and returns a dict of ``Dialect -> sub-plan``
 where each sub-plan contains only the scans / joins that touch
 cubes on that backend.
 
@@ -17,7 +17,7 @@ without that follow-up having to redo the partition math.
 from __future__ import annotations
 
 from semql.logical import LogicalPlan, partition_scans
-from semql.model import Backend, Cube, Dimension, Join, Measure
+from semql.model import Cube, Dialect, Dimension, Join, Measure
 from semql.spec import SemanticQuery
 
 
@@ -27,7 +27,7 @@ def _orders_and_customers() -> dict[str, Cube]:
             name="orders",
             alias="o",
             table="prod.orders",
-            backend=Backend.POSTGRES,
+            backend=Dialect.POSTGRES,
             dimensions=[Dimension(name="region", sql="{o}.region", type="string")],
             measures=[Measure(name="revenue", sql="{o}.amount", agg="sum")],
         ),
@@ -35,14 +35,14 @@ def _orders_and_customers() -> dict[str, Cube]:
             name="customers",
             alias="c",
             table="prod.customers",
-            backend=Backend.BIGQUERY,
+            backend=Dialect.BIGQUERY,
             dimensions=[Dimension(name="name", sql="{c}.name", type="string")],
         ),
         "clickhouse_logs": Cube(
             name="clickhouse_logs",
             alias="cl",
             table="events.log",
-            backend=Backend.CLICKHOUSE,
+            backend=Dialect.CLICKHOUSE,
             dimensions=[Dimension(name="event", sql="{cl}.event", type="string")],
         ),
     }
@@ -57,8 +57,8 @@ def test_partition_scans_single_backend() -> None:
     plan = to_logical_plan(query, catalog)
     partitions = partition_scans(plan)
 
-    assert set(partitions.keys()) == {Backend.POSTGRES}
-    assert partitions[Backend.POSTGRES].scans[0].cube.backend is Backend.POSTGRES
+    assert set(partitions.keys()) == {Dialect.POSTGRES}
+    assert partitions[Dialect.POSTGRES].scans[0].cube.backend is Dialect.POSTGRES
 
 
 def test_partition_scans_multi_backend() -> None:
@@ -84,12 +84,12 @@ def test_partition_scans_multi_backend() -> None:
     plan = to_logical_plan(query, catalog)
     partitions = partition_scans(plan)
 
-    assert set(partitions.keys()) == {Backend.POSTGRES, Backend.BIGQUERY}
+    assert set(partitions.keys()) == {Dialect.POSTGRES, Dialect.BIGQUERY}
     # Each partition contains scans only for cubes on its backend.
-    pg = partitions[Backend.POSTGRES]
-    bq = partitions[Backend.BIGQUERY]
-    assert all(s.cube.backend is Backend.POSTGRES for s in pg.scans)
-    assert all(s.cube.backend is Backend.BIGQUERY for s in bq.scans)
+    pg = partitions[Dialect.POSTGRES]
+    bq = partitions[Dialect.BIGQUERY]
+    assert all(s.cube.backend is Dialect.POSTGRES for s in pg.scans)
+    assert all(s.cube.backend is Dialect.BIGQUERY for s in bq.scans)
 
 
 def test_partition_scans_three_backends() -> None:
@@ -127,9 +127,9 @@ def test_partition_scans_three_backends() -> None:
     partitions = partition_scans(plan)
 
     assert set(partitions.keys()) == {
-        Backend.POSTGRES,
-        Backend.BIGQUERY,
-        Backend.CLICKHOUSE,
+        Dialect.POSTGRES,
+        Dialect.BIGQUERY,
+        Dialect.CLICKHOUSE,
     }
 
 

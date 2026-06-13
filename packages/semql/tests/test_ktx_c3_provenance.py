@@ -11,13 +11,13 @@ from __future__ import annotations
 
 import pytest
 from semql.logical import ColumnRef
-from semql.model import Backend, Cube, Dimension, Measure, Provenance
+from semql.model import Cube, Dialect, Dimension, Measure, Provenance
 
 
 def _cube() -> Cube:
     return Cube(
         name="t",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="s.t",
         alias="t",
         measures=[Measure(name="m", sql="{t}.x", agg="sum", unit="count")],

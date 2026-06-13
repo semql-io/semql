@@ -19,9 +19,9 @@ from typing import Any
 
 from fastmcp import Client
 from semql import (
-    Backend,
     Catalog,
     Cube,
+    Dialect,
     Dimension,
     Measure,
     TimeDimension,
@@ -36,7 +36,7 @@ def _run[T](coro: Awaitable[T]) -> T:
 def _cat() -> Catalog:
     orders = Cube(
         name="orders",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="orders",
         alias="o",
         description="One row per order; revenue/count grouped by region.",
@@ -52,7 +52,7 @@ def _cat() -> Catalog:
     )
     hidden = Cube(
         name="internal_only",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="internal",
         alias="i",
         expose_in_prompt=False,

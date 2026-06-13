@@ -9,7 +9,7 @@ before it ships.
 
 from __future__ import annotations
 
-from semql.model import Backend, Cube, Dimension, Join, Measure, TimeDimension, View
+from semql.model import Cube, Dialect, Dimension, Join, Measure, TimeDimension, View
 from semql_prompt import (
     build_planner_prompt_fragment,
     build_router_prompt_fragment,
@@ -24,7 +24,7 @@ from semql_prompt import (
 def _orders(*, expose: bool = True, required: list[str] | None = None) -> Cube:
     return Cube(
         name="orders",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="orders",
         alias="o",
         expose_in_prompt=expose,
@@ -62,7 +62,7 @@ def _orders(*, expose: bool = True, required: list[str] | None = None) -> Cube:
 def _hidden() -> Cube:
     return Cube(
         name="internal",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="internal",
         alias="i",
         expose_in_prompt=False,

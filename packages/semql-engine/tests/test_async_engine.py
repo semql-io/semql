@@ -22,8 +22,8 @@ from typing import Any
 import duckdb
 import pytest
 from semql import (
-    Backend,
     Cube,
+    Dialect,
     Dimension,
     Join,
     Measure,
@@ -71,7 +71,7 @@ class _AsyncDialectTranslatingAdapter:
 # ---------------------------------------------------------------------------
 
 
-def _orders_cube(backend: Backend = Backend.POSTGRES) -> Cube:
+def _orders_cube(backend: Dialect = Dialect.POSTGRES) -> Cube:
     return Cube(
         name="orders",
         backend=backend,
@@ -99,7 +99,7 @@ def _orders_cube(backend: Backend = Backend.POSTGRES) -> Cube:
     )
 
 
-def _customers_cube(backend: Backend = Backend.BIGQUERY) -> Cube:
+def _customers_cube(backend: Dialect = Dialect.BIGQUERY) -> Cube:
     return Cube(
         name="customers",
         backend=backend,
@@ -161,8 +161,8 @@ def test_async_engine_runs_two_fragment_plan(
         catalog,
     )
     engine = AsyncEngine()
-    engine.register(Backend.POSTGRES, _AsyncDialectTranslatingAdapter(pg_con))
-    engine.register(Backend.BIGQUERY, _AsyncDialectTranslatingAdapter(bq_con))
+    engine.register(Dialect.POSTGRES, _AsyncDialectTranslatingAdapter(pg_con))
+    engine.register(Dialect.BIGQUERY, _AsyncDialectTranslatingAdapter(bq_con))
 
     result = _run(engine.run(plan))
     assert result.columns == ["region", "revenue"]
@@ -182,7 +182,7 @@ def test_async_engine_single_fragment_plan(
         catalog,
     )
     engine = AsyncEngine()
-    engine.register(Backend.POSTGRES, AsyncDuckDBAdapter(pg_con))
+    engine.register(Dialect.POSTGRES, AsyncDuckDBAdapter(pg_con))
     result = _run(engine.run(plan))
     rows = {r[0]: r[1] for r in result.rows}
     assert rows == {"paid": 650.0, "pending": 25.0}
@@ -200,7 +200,7 @@ def test_async_engine_refuses_unregistered_backend(
         catalog,
     )
     engine = AsyncEngine()
-    engine.register(Backend.POSTGRES, AsyncDuckDBAdapter(pg_con))
+    engine.register(Dialect.POSTGRES, AsyncDuckDBAdapter(pg_con))
     with pytest.raises(EngineError, match="No adapter registered"):
         _run(engine.run(plan))
 
@@ -241,8 +241,8 @@ def test_async_engine_runs_fragments_in_parallel(
     engine = AsyncEngine()
     pg_inner = _AsyncDialectTranslatingAdapter(pg_con)
     bq_inner = _AsyncDialectTranslatingAdapter(bq_con)
-    engine.register(Backend.POSTGRES, _SleepyAdapter(pg_inner, delay=0.1))  # type: ignore[arg-type]
-    engine.register(Backend.BIGQUERY, _SleepyAdapter(bq_inner, delay=0.1))  # type: ignore[arg-type]
+    engine.register(Dialect.POSTGRES, _SleepyAdapter(pg_inner, delay=0.1))  # type: ignore[arg-type]
+    engine.register(Dialect.BIGQUERY, _SleepyAdapter(bq_inner, delay=0.1))  # type: ignore[arg-type]
 
     t0 = time.perf_counter()
     _run(engine.run(plan))
@@ -270,8 +270,8 @@ def test_iter_run_yields_chunks_summing_to_full_result(
         catalog,
     )
     engine = AsyncEngine()
-    engine.register(Backend.POSTGRES, _AsyncDialectTranslatingAdapter(pg_con))
-    engine.register(Backend.BIGQUERY, _AsyncDialectTranslatingAdapter(bq_con))
+    engine.register(Dialect.POSTGRES, _AsyncDialectTranslatingAdapter(pg_con))
+    engine.register(Dialect.BIGQUERY, _AsyncDialectTranslatingAdapter(bq_con))
 
     async def collect() -> list[tuple[Any, ...]]:
         out: list[tuple[Any, ...]] = []
@@ -296,8 +296,8 @@ def test_iter_run_chunk_size_one_yields_one_row_per_chunk(
         catalog,
     )
     engine = AsyncEngine()
-    engine.register(Backend.POSTGRES, _AsyncDialectTranslatingAdapter(pg_con))
-    engine.register(Backend.BIGQUERY, _AsyncDialectTranslatingAdapter(bq_con))
+    engine.register(Dialect.POSTGRES, _AsyncDialectTranslatingAdapter(pg_con))
+    engine.register(Dialect.BIGQUERY, _AsyncDialectTranslatingAdapter(bq_con))
 
     async def collect() -> list[int]:
         sizes: list[int] = []
@@ -321,7 +321,7 @@ def test_iter_run_rejects_non_positive_chunk_rows(
         catalog,
     )
     engine = AsyncEngine()
-    engine.register(Backend.POSTGRES, AsyncDuckDBAdapter(pg_con))
+    engine.register(Dialect.POSTGRES, AsyncDuckDBAdapter(pg_con))
 
     async def call() -> None:
         async for _ in engine.iter_run(plan, chunk_rows=0):
@@ -346,7 +346,7 @@ def test_to_async_adapter_bridges_sync_into_async_engine(
     )
     engine = AsyncEngine()
     # DuckDBAdapter is sync; wrap it for AsyncEngine.
-    engine.register(Backend.POSTGRES, to_async_adapter(DuckDBAdapter(pg_con)))
+    engine.register(Dialect.POSTGRES, to_async_adapter(DuckDBAdapter(pg_con)))
     result = _run(engine.run(plan))
     rows = {r[0]: r[1] for r in result.rows}
     assert rows == {"paid": 650.0, "pending": 25.0}
@@ -391,7 +391,7 @@ def test_iter_run_single_fragment_takes_fast_path(
     assert len(plan.fragments) == 1
 
     engine = AsyncEngine()
-    engine.register(Backend.POSTGRES, AsyncDuckDBAdapter(pg_con))
+    engine.register(Dialect.POSTGRES, AsyncDuckDBAdapter(pg_con))
 
     async def collect() -> list[tuple[Any, ...]]:
         out: list[tuple[Any, ...]] = []
@@ -415,7 +415,7 @@ def test_iter_run_single_fragment_fast_path_uses_merge_spec(
     plan = replace(plan, merge=replace(plan.merge, sql="not valid sql"))
 
     engine = AsyncEngine()
-    engine.register(Backend.POSTGRES, AsyncDuckDBAdapter(pg_con))
+    engine.register(Dialect.POSTGRES, AsyncDuckDBAdapter(pg_con))
 
     async def collect() -> list[tuple[Any, ...]]:
         out: list[tuple[Any, ...]] = []
@@ -444,8 +444,8 @@ def test_iter_run_multi_fragment_skips_fast_path(
     assert len(plan.fragments) == 2
 
     engine = AsyncEngine()
-    engine.register(Backend.POSTGRES, _AsyncDialectTranslatingAdapter(pg_con))
-    engine.register(Backend.BIGQUERY, _AsyncDialectTranslatingAdapter(bq_con))
+    engine.register(Dialect.POSTGRES, _AsyncDialectTranslatingAdapter(pg_con))
+    engine.register(Dialect.BIGQUERY, _AsyncDialectTranslatingAdapter(bq_con))
 
     async def collect() -> list[tuple[Any, ...]]:
         out: list[tuple[Any, ...]] = []
@@ -474,7 +474,7 @@ def test_iter_run_fast_path_applies_order_by_and_limit(
         catalog,
     )
     engine = AsyncEngine()
-    engine.register(Backend.POSTGRES, AsyncDuckDBAdapter(pg_con))
+    engine.register(Dialect.POSTGRES, AsyncDuckDBAdapter(pg_con))
 
     async def collect() -> list[tuple[Any, ...]]:
         out: list[tuple[Any, ...]] = []
@@ -506,7 +506,7 @@ def test_iter_run_fast_path_handles_avg_decomposition(
     )
     assert len(plan.fragments) == 1
     engine = AsyncEngine()
-    engine.register(Backend.POSTGRES, AsyncDuckDBAdapter(pg_con))
+    engine.register(Dialect.POSTGRES, AsyncDuckDBAdapter(pg_con))
 
     async def collect() -> list[tuple[Any, ...]]:
         out: list[tuple[Any, ...]] = []
@@ -533,7 +533,7 @@ def test_iter_run_fast_path_streams_in_requested_chunks(
         catalog,
     )
     engine = AsyncEngine()
-    engine.register(Backend.POSTGRES, AsyncDuckDBAdapter(pg_con))
+    engine.register(Dialect.POSTGRES, AsyncDuckDBAdapter(pg_con))
 
     async def collect() -> list[int]:
         sizes: list[int] = []

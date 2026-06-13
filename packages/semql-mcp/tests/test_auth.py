@@ -20,7 +20,7 @@ from typing import Any
 
 import pytest
 from fastmcp import Client
-from semql import Backend, Catalog, Cube, Dimension, Measure, SemanticQuery
+from semql import Catalog, Cube, Dialect, Dimension, Measure, SemanticQuery
 from semql.model import AuthContext
 from semql_mcp import MCPServer
 
@@ -33,7 +33,7 @@ def _gated_catalog() -> Catalog:
     """A cube only viewers with the ``admin`` role may see."""
     secret = Cube(
         name="secret",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="secret",
         alias="s",
         required_roles=["admin"],

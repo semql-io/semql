@@ -32,8 +32,8 @@ from typing import Any
 import duckdb
 import pytest
 from semql import (
-    Backend,
     Cube,
+    Dialect,
     Dimension,
     Filter,
     Measure,
@@ -287,7 +287,7 @@ def test_async_bq_adapter_runs_through_async_engine_via_duckdb_stand_in() -> Non
 
     cube = Cube(
         name="orders",
-        backend=Backend.BIGQUERY,
+        backend=Dialect.BIGQUERY,
         table="orders",
         alias="o",
         primary_key="id",
@@ -306,7 +306,7 @@ def test_async_bq_adapter_runs_through_async_engine_via_duckdb_stand_in() -> Non
         {cube.name: cube},
     )
     engine = AsyncEngine()
-    engine.register(Backend.BIGQUERY, adapter)
+    engine.register(Dialect.BIGQUERY, adapter)
     result = _run(engine.run(plan))
     rows = {r[0]: r[1] for r in result.rows}
     assert rows == {"paid": 100.0}

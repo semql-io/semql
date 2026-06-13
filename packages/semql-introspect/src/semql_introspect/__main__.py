@@ -12,11 +12,11 @@ import argparse
 import sys
 from typing import Any, cast
 
-from semql.model import Backend
+from semql.model import Dialect
 
 from semql_introspect import introspect_to_python
 
-_BACKENDS_BY_NAME = {b.value: b for b in Backend}
+_BACKENDS_BY_NAME = {b.value: b for b in Dialect}
 
 
 def _connect(backend_name: str, conn_string: str) -> Any:  # noqa: ANN401
@@ -67,7 +67,7 @@ def main(argv: list[str] | None = None) -> int:
         "--backend",
         required=True,
         choices=sorted(_BACKENDS_BY_NAME),
-        help="semql Backend tag stamped onto every emitted cube.",
+        help="semql Dialect tag stamped onto every emitted cube.",
     )
     parser.add_argument(
         "--schema",

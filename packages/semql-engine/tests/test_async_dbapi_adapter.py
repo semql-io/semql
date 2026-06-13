@@ -25,8 +25,8 @@ from typing import Any
 import duckdb
 import pytest
 from semql import (
-    Backend,
     Cube,
+    Dialect,
     Dimension,
     Measure,
     SemanticQuery,
@@ -107,7 +107,7 @@ def duckdb_as_pg() -> duckdb.DuckDBPyConnection:
 def _orders_cube() -> Cube:
     return Cube(
         name="orders",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="orders",
         alias="o",
         primary_key="id",
@@ -204,7 +204,7 @@ def test_async_dbapi_adapter_runs_through_async_engine(
     )
     engine = AsyncEngine()
     engine.register(
-        Backend.POSTGRES,
+        Dialect.POSTGRES,
         _AsyncDialectTranslatingAdapter(_DBAPIConn(duckdb_as_pg)),
     )
     result = _run(engine.run(plan))

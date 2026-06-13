@@ -10,9 +10,9 @@ from __future__ import annotations
 
 import pytest
 from semql import (
-    Backend,
     Catalog,
     Cube,
+    Dialect,
     Dimension,
     Join,
     Measure,
@@ -24,7 +24,7 @@ from semql_erd import render_dot
 def _orders() -> Cube:
     return Cube(
         name="orders",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="orders",
         alias="o",
         display_name="Customer Orders",
@@ -46,7 +46,7 @@ def _orders() -> Cube:
 def _customers() -> Cube:
     return Cube(
         name="customers",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="customers",
         alias="c",
         dimensions=[Dimension(name="name", sql="{c}.name", type="string")],
@@ -127,7 +127,7 @@ def test_node_label_renders_display_unit_when_set() -> None:
     ERD shows the conversion arrow ``unit → display_unit``."""
     cube = Cube(
         name="sessions",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="sessions",
         alias="s",
         measures=[
@@ -157,7 +157,7 @@ def test_node_label_lists_time_dimensions() -> None:
 def test_node_label_omits_empty_sections() -> None:
     cube = Cube(
         name="lonely",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="lonely",
         alias="l",
         dimensions=[Dimension(name="x", sql="{l}.x", type="string")],
@@ -184,7 +184,7 @@ def test_many_to_one_uses_crow_tail_tee_head() -> None:
 def test_one_to_many_mirrors_many_to_one() -> None:
     a = Cube(
         name="a",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="a",
         alias="a",
         joins=[Join(to="b", relationship="one_to_many", on="{a}.id = {b}.aid")],
@@ -192,7 +192,7 @@ def test_one_to_many_mirrors_many_to_one() -> None:
     )
     b = Cube(
         name="b",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="b",
         alias="b",
         dimensions=[Dimension(name="x", sql="{b}.x", type="string")],
@@ -205,7 +205,7 @@ def test_one_to_many_mirrors_many_to_one() -> None:
 def test_one_to_one_uses_tee_on_both_sides() -> None:
     a = Cube(
         name="a",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="a",
         alias="a",
         joins=[Join(to="b", relationship="one_to_one", on="{a}.id = {b}.id")],
@@ -213,7 +213,7 @@ def test_one_to_one_uses_tee_on_both_sides() -> None:
     )
     b = Cube(
         name="b",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="b",
         alias="b",
         dimensions=[Dimension(name="x", sql="{b}.x", type="string")],
@@ -243,7 +243,7 @@ def test_edge_uses_safe_node_ids() -> None:
 def test_only_exposed_default_hides_internal_cubes() -> None:
     hidden = Cube(
         name="hidden",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="hidden",
         alias="h",
         expose_in_prompt=False,
@@ -256,7 +256,7 @@ def test_only_exposed_default_hides_internal_cubes() -> None:
 def test_only_exposed_false_shows_hidden_cubes() -> None:
     hidden = Cube(
         name="hidden",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="hidden",
         alias="h",
         expose_in_prompt=False,
@@ -279,7 +279,7 @@ def test_edges_to_filtered_out_cubes_are_dropped() -> None:
     """A Join into a hidden cube shouldn't render as a dangling edge."""
     hidden = Cube(
         name="hidden",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="hidden",
         alias="h",
         expose_in_prompt=False,
@@ -315,7 +315,7 @@ def test_single_cube_no_edges_renders_clean() -> None:
 def test_catalog_with_only_hidden_cubes_renders_empty_graph() -> None:
     hidden = Cube(
         name="hidden",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="hidden",
         alias="h",
         expose_in_prompt=False,
@@ -344,7 +344,7 @@ def test_catalog_with_only_hidden_cubes_renders_empty_graph() -> None:
 def test_record_label_escapes_special_characters(weird: str) -> None:
     cube = Cube(
         name="ugly",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="ugly",
         alias="u",
         display_name=weird,

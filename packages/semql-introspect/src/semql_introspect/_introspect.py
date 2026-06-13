@@ -17,8 +17,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from semql.model import (
-    Backend,
     Cube,
+    Dialect,
     Dimension,
     Join,
     Measure,
@@ -86,10 +86,10 @@ def _dedupe_aliases(cubes: list[Cube]) -> list[Cube]:
     return out
 
 
-def introspect(probe: SchemaProbe, *, backend: Backend) -> IntrospectionResult:
+def introspect(probe: SchemaProbe, *, backend: Dialect) -> IntrospectionResult:
     """Build a catalog from a probe + a target backend.
 
-    ``backend`` is the semql ``Backend`` enum tag stamped onto every
+    ``backend`` is the semql ``Dialect`` enum tag stamped onto every
     emitted cube — the introspector doesn't try to detect the dialect
     itself because a single probe shape often spans multiple backends
     (ANSI ``information_schema`` works against PG, DuckDB, and

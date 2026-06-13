@@ -22,8 +22,8 @@ from typing import Any
 
 import duckdb
 from semql import (
-    Backend,
     Cube,
+    Dialect,
     Dimension,
     Filter,
     Measure,
@@ -189,7 +189,7 @@ def test_async_ch_adapter_runs_through_async_engine_via_duckdb_stand_in() -> Non
 
     cube = Cube(
         name="orders",
-        backend=Backend.CLICKHOUSE,
+        backend=Dialect.CLICKHOUSE,
         table="orders",
         alias="o",
         primary_key="id",
@@ -208,7 +208,7 @@ def test_async_ch_adapter_runs_through_async_engine_via_duckdb_stand_in() -> Non
         {cube.name: cube},
     )
     engine = AsyncEngine()
-    engine.register(Backend.CLICKHOUSE, adapter)
+    engine.register(Dialect.CLICKHOUSE, adapter)
     result = _run(engine.run(plan))
     rows = {r[0]: r[1] for r in result.rows}
     assert rows == {"paid": 100.0}

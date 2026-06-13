@@ -16,7 +16,7 @@ post-query summing, which the compiler doesn't perform.
 
 from __future__ import annotations
 
-from semql import Backend, Catalog, Cube, Dimension, Measure
+from semql import Catalog, Cube, Dialect, Dimension, Measure
 from semql_prompt import planner_prompt
 
 
@@ -44,7 +44,7 @@ def test_measure_accepts_non_additive_true() -> None:
 def test_non_additive_flag_appears_in_prompt() -> None:
     cube = Cube(
         name="users",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="users",
         alias="u",
         measures=[
@@ -77,7 +77,7 @@ def test_non_additive_flag_appears_in_prompt() -> None:
 def test_non_additive_measure_still_compiles_at_a_grain() -> None:
     cube = Cube(
         name="users",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="users",
         alias="u",
         measures=[

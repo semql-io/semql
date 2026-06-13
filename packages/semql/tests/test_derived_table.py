@@ -12,10 +12,10 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 from semql import (
-    Backend,
     Catalog,
     Cube,
     DerivedTable,
+    Dialect,
     Dimension,
     Measure,
     NamedCTE,
@@ -29,7 +29,7 @@ from semql.model import PhysicalTable
 
 
 def test_cube_table_shorthand_resolves_to_tableref() -> None:
-    cube = Cube(name="c", backend=Backend.POSTGRES, table="schema.t", alias="c")
+    cube = Cube(name="c", backend=Dialect.POSTGRES, table="schema.t", alias="c")
     assert isinstance(cube.resolved_source, PhysicalTable)
     assert cube.resolved_source.table == "schema.t"
 
@@ -38,7 +38,7 @@ def test_cube_explicit_source_takes_effect() -> None:
     src = DerivedTable(sql="SELECT id, value FROM raw WHERE active")
     cube = Cube(
         name="c",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         source=src,
         alias="c",
         dimensions=[Dimension(name="id", sql="{c}.id", type="string")],
@@ -48,14 +48,14 @@ def test_cube_explicit_source_takes_effect() -> None:
 
 def test_cube_rejects_neither_table_nor_source() -> None:
     with pytest.raises(ValidationError, match=r"(?i)must declare one source"):
-        Cube(name="c", backend=Backend.POSTGRES, alias="c")
+        Cube(name="c", backend=Dialect.POSTGRES, alias="c")
 
 
 def test_cube_rejects_table_plus_derived_source() -> None:
     with pytest.raises(ValidationError, match=r"(?i)cannot set both"):
         Cube(
             name="c",
-            backend=Backend.POSTGRES,
+            backend=Dialect.POSTGRES,
             table="foo",
             source=DerivedTable(sql="SELECT * FROM bar"),
             alias="c",
@@ -65,7 +65,7 @@ def test_cube_rejects_table_plus_derived_source() -> None:
 def test_cube_accepts_redundant_tableref_when_equal() -> None:
     Cube(
         name="c",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="schema.t",
         source=PhysicalTable(table="schema.t"),
         alias="c",
@@ -76,7 +76,7 @@ def test_cube_rejects_conflicting_table_and_tableref() -> None:
     with pytest.raises(ValidationError, match=r"(?i)disagrees"):
         Cube(
             name="c",
-            backend=Backend.POSTGRES,
+            backend=Dialect.POSTGRES,
             table="foo",
             source=PhysicalTable(table="bar"),
             alias="c",
@@ -87,7 +87,7 @@ def test_cube_discriminator_rejects_tenant_schema_in_derived_sql() -> None:
     with pytest.raises(ValidationError, match=r"(?i)tenant_schema"):
         Cube(
             name="c",
-            backend=Backend.POSTGRES,
+            backend=Dialect.POSTGRES,
             source=DerivedTable(sql="SELECT * FROM {tenant_schema}.raw"),
             alias="c",
             tenancy="discriminator",
@@ -106,7 +106,7 @@ def _make_derived_cube() -> Cube:
     + friends as dimensions / measures)."""
     return Cube(
         name="user_events",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         source=DerivedTable(
             sql=(
                 "SELECT user_id, "
@@ -144,7 +144,7 @@ def test_compiled_surfaces_derived_sources() -> None:
 def test_plain_cube_has_empty_derived_sources() -> None:
     cube = Cube(
         name="orders",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="public.orders",
         alias="o",
         measures=[Measure(name="revenue", sql="{o}.amount", agg="sum")],
@@ -164,7 +164,7 @@ def test_plain_cube_has_empty_derived_sources() -> None:
 def test_derived_cube_resolves_tenant_schema_placeholder() -> None:
     cube = Cube(
         name="rollup",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         source=DerivedTable(sql="SELECT * FROM {tenant_schema}.raw_rollup"),
         alias="r",
         measures=[Measure(name="cnt", sql="*", agg="count")],
@@ -185,7 +185,7 @@ def test_discriminator_wraps_derived_source() -> None:
     so a malformed outer ``OR`` can't bypass it."""
     cube = Cube(
         name="events",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         source=DerivedTable(sql="SELECT id, tenant_id, kind FROM events_raw"),
         alias="e",
         tenancy="discriminator",
@@ -205,7 +205,7 @@ def test_discriminator_wraps_derived_source() -> None:
 def test_security_sql_wraps_derived_source() -> None:
     cube = Cube(
         name="rows",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         source=DerivedTable(sql="SELECT id, owner_id, value FROM raw_rows"),
         alias="r",
         security_sql="{r}.owner_id = {ctx.viewer_id}",
@@ -227,7 +227,7 @@ def test_security_sql_wraps_derived_source() -> None:
 def test_join_from_plain_cube_to_derived_cube() -> None:
     facts = Cube(
         name="orders",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="public.orders",
         alias="o",
         measures=[Measure(name="revenue", sql="{o}.amount", agg="sum")],
@@ -242,7 +242,7 @@ def test_join_from_plain_cube_to_derived_cube() -> None:
     )
     segments = Cube(
         name="user_segments",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         source=DerivedTable(
             sql=(
                 "SELECT user_id, "
@@ -276,7 +276,7 @@ def _layered_cube() -> Cube:
     """A two-CTE preamble feeding the main cube body — the zenai shape."""
     return Cube(
         name="user_activity",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         source=DerivedTable(
             with_ctes=[
                 NamedCTE(
@@ -336,7 +336,7 @@ def test_with_ctes_rejects_duplicate_names_within_cube() -> None:
 def test_with_ctes_rejects_cross_cube_name_collision() -> None:
     c1 = Cube(
         name="cube_a",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         source=DerivedTable(
             with_ctes=[NamedCTE(name="shared", sql="SELECT 1 AS x")],
             sql="SELECT * FROM shared",
@@ -346,7 +346,7 @@ def test_with_ctes_rejects_cross_cube_name_collision() -> None:
     )
     c2 = Cube(
         name="cube_b",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         source=DerivedTable(
             with_ctes=[NamedCTE(name="shared", sql="SELECT 2 AS y")],
             sql="SELECT * FROM shared",
@@ -361,7 +361,7 @@ def test_with_ctes_rejects_cross_cube_name_collision() -> None:
 def test_with_ctes_resolves_tenant_schema_placeholder() -> None:
     cube = Cube(
         name="rollup",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         source=DerivedTable(
             with_ctes=[
                 NamedCTE(
@@ -388,7 +388,7 @@ def test_with_ctes_rejected_with_tenant_schema_under_discriminator() -> None:
     with pytest.raises(ValidationError, match=r"(?i)tenant_schema"):
         Cube(
             name="bad",
-            backend=Backend.POSTGRES,
+            backend=Dialect.POSTGRES,
             source=DerivedTable(
                 with_ctes=[NamedCTE(name="raw", sql="SELECT * FROM {tenant_schema}.raw")],
                 sql="SELECT * FROM raw",
@@ -402,7 +402,7 @@ def test_with_ctes_rejected_with_tenant_schema_under_discriminator() -> None:
 def test_plain_cube_emits_no_with_clause() -> None:
     cube = Cube(
         name="orders",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="public.orders",
         alias="o",
         measures=[Measure(name="revenue", sql="{o}.amount", agg="sum")],
@@ -420,7 +420,7 @@ def test_with_ctes_join_path_plain_to_layered() -> None:
     same FROM ... JOIN clause."""
     facts = Cube(
         name="orders",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="public.orders",
         alias="o",
         measures=[Measure(name="revenue", sql="{o}.amount", agg="sum")],

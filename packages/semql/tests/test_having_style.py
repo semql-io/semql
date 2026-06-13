@@ -17,13 +17,13 @@ from semql import (
     Measure,
     SemanticQuery,
 )
-from semql.model import Backend
+from semql.model import Dialect
 
 
 def _cat() -> Catalog:
     orders = Cube(
         name="orders",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="orders",
         alias="o",
         measures=[Measure(name="revenue", sql="{o}.amount", agg="sum", unit="currency")],

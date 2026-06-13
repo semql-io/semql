@@ -21,7 +21,7 @@ pip install semql
 
 ```python
 from semql import (
-    Backend,
+    Dialect,
     Catalog,
     Cube,
     Dimension,
@@ -31,7 +31,7 @@ from semql import (
 
 orders = Cube(
     name="orders",
-    backend=Backend.POSTGRES,
+    backend=Dialect.POSTGRES,
     table="orders",
     alias="o",
     measures=[
@@ -64,7 +64,7 @@ resolves it (along with `{schema}`-style context placeholders and
 | Collect-all static validator | `semql.validate` |
 | Reflection cubes (catalog_cubes, ...) | `semql.introspect` |
 | Planner / router prompt fragments | `semql.prompt` |
-| Backend strategies + sqlglot dialect adapter | `semql.backend`, `semql.dialect` |
+| Dialect strategies + sqlglot dialect adapter | `semql.backend`, `semql.dialect` |
 | Visualisation decision (chart type, axes, formats) | `semql.visualize` |
 | `is_read_only_statement` post-hoc SQL guard | `semql.safe` |
 | Structured error hierarchy | `semql.errors` |

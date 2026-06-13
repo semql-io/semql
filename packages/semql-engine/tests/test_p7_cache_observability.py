@@ -28,7 +28,7 @@ from typing import Any
 
 import duckdb
 import pytest
-from semql import Backend, Cube, Dimension, Measure, SemanticQuery, compile_federated_query
+from semql import Cube, Dialect, Dimension, Measure, SemanticQuery, compile_federated_query
 from semql_engine import (
     AdapterResult,
     DuckDBAdapter,
@@ -39,7 +39,7 @@ from semql_engine import (
 def _orders() -> Cube:
     return Cube(
         name="orders",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="orders",
         alias="o",
         primary_key="id",
@@ -74,7 +74,7 @@ def test_engine_without_cache_runs_normally() -> None:
         catalog,
     )
     engine = Engine()
-    engine.register(Backend.POSTGRES, DuckDBAdapter(pg_con_for_test()))
+    engine.register(Dialect.POSTGRES, DuckDBAdapter(pg_con_for_test()))
     result = engine.run(plan)
     assert result.columns == ["status", "revenue"]
 
@@ -96,7 +96,7 @@ def test_engine_result_cache_misses_first_time() -> None:
         catalog,
     )
     engine = Engine(cache_size=8)
-    engine.register(Backend.POSTGRES, DuckDBAdapter(pg_con_for_test()))
+    engine.register(Dialect.POSTGRES, DuckDBAdapter(pg_con_for_test()))
     engine.run(plan)
     assert engine.cache_hits == 0
     assert engine.cache_misses == 1
@@ -110,7 +110,7 @@ def test_engine_result_cache_hits_second_time() -> None:
         catalog,
     )
     engine = Engine(cache_size=8)
-    engine.register(Backend.POSTGRES, DuckDBAdapter(pg_con_for_test()))
+    engine.register(Dialect.POSTGRES, DuckDBAdapter(pg_con_for_test()))
     engine.run(plan)
     engine.run(plan)
     assert engine.cache_hits == 1
@@ -137,7 +137,7 @@ def test_engine_result_cache_skips_adapter_on_hit() -> None:
     )
     engine = Engine(cache_size=8)
     adapter = CountingAdapter(DuckDBAdapter(pg_con_for_test()))
-    engine.register(Backend.POSTGRES, adapter)
+    engine.register(Dialect.POSTGRES, adapter)
     engine.run(plan)  # miss
     engine.run(plan)  # hit
     assert adapter.calls == 1
@@ -155,7 +155,7 @@ def test_engine_result_cache_different_plans_different_keys() -> None:
         catalog,
     )
     engine = Engine(cache_size=8)
-    engine.register(Backend.POSTGRES, DuckDBAdapter(pg_con_for_test()))
+    engine.register(Dialect.POSTGRES, DuckDBAdapter(pg_con_for_test()))
     engine.run(plan1)
     engine.run(plan2)
     assert engine.cache_misses == 2
@@ -171,7 +171,7 @@ def test_engine_result_cache_clear() -> None:
         catalog,
     )
     engine = Engine(cache_size=8)
-    engine.register(Backend.POSTGRES, DuckDBAdapter(pg_con_for_test()))
+    engine.register(Dialect.POSTGRES, DuckDBAdapter(pg_con_for_test()))
     engine.run(plan)
     engine.run(plan)
     assert engine.cache_hits == 1
@@ -189,7 +189,7 @@ def test_engine_cache_size_zero_disables_cache() -> None:
         catalog,
     )
     engine = Engine(cache_size=0)
-    engine.register(Backend.POSTGRES, DuckDBAdapter(pg_con_for_test()))
+    engine.register(Dialect.POSTGRES, DuckDBAdapter(pg_con_for_test()))
     engine.run(plan)
     engine.run(plan)
     assert engine.cache_misses == 2
@@ -212,7 +212,7 @@ def test_engine_observability_hook_fires_on_run() -> None:
         catalog,
     )
     engine = Engine(cache_size=8, on_execute=on_execute)
-    engine.register(Backend.POSTGRES, DuckDBAdapter(pg_con_for_test()))
+    engine.register(Dialect.POSTGRES, DuckDBAdapter(pg_con_for_test()))
     engine.run(plan)  # miss
     engine.run(plan)  # hit
     assert len(events) == 2
@@ -237,7 +237,7 @@ def test_engine_observability_hook_swallows_exceptions() -> None:
         catalog,
     )
     engine = Engine(cache_size=8, on_execute=bad_hook)
-    engine.register(Backend.POSTGRES, DuckDBAdapter(pg_con_for_test()))
+    engine.register(Dialect.POSTGRES, DuckDBAdapter(pg_con_for_test()))
     # Should not raise.
     result = engine.run(plan)
     assert result.columns == ["status", "revenue"]

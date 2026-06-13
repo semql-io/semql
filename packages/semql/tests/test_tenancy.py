@@ -17,10 +17,10 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 from semql import (
-    Backend,
     Catalog,
     CompileError,
     Cube,
+    Dialect,
     Dimension,
     Measure,
     SemanticQuery,
@@ -34,7 +34,7 @@ from semql import (
 def test_cube_defaults_to_schema_tenancy() -> None:
     """Back-compat: existing catalogs without an explicit tenancy field
     must behave exactly as before (SCHEMA via ``{tenant_schema}``)."""
-    cube = Cube(name="c", backend=Backend.POSTGRES, table="{tenant_schema}.t", alias="c")
+    cube = Cube(name="c", backend=Dialect.POSTGRES, table="{tenant_schema}.t", alias="c")
     assert cube.tenancy == "schema"
     assert cube.tenancy_column is None
 
@@ -42,7 +42,7 @@ def test_cube_defaults_to_schema_tenancy() -> None:
 def test_cube_accepts_explicit_discriminator_mode() -> None:
     cube = Cube(
         name="events",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="events",
         alias="e",
         tenancy="discriminator",
@@ -53,7 +53,7 @@ def test_cube_accepts_explicit_discriminator_mode() -> None:
 
 
 def test_cube_accepts_none_for_meta_backend() -> None:
-    cube = Cube(name="m", backend=Backend.META, table="m", alias="m", tenancy="none")
+    cube = Cube(name="m", backend=Dialect.META, table="m", alias="m", tenancy="none")
     assert cube.tenancy == "none"
 
 
@@ -61,7 +61,7 @@ def test_cube_rejects_unknown_tenancy_value() -> None:
     with pytest.raises(ValidationError):
         Cube(
             name="c",
-            backend=Backend.POSTGRES,
+            backend=Dialect.POSTGRES,
             table="t",
             alias="c",
             tenancy="rowlevel",  # type: ignore[arg-type]
@@ -77,7 +77,7 @@ def test_discriminator_requires_tenancy_column() -> None:
     with pytest.raises(ValidationError, match=r"(?i)tenancy_column"):
         Cube(
             name="events",
-            backend=Backend.POSTGRES,
+            backend=Dialect.POSTGRES,
             table="events",
             alias="e",
             tenancy="discriminator",
@@ -91,7 +91,7 @@ def test_discriminator_table_must_not_contain_tenant_schema_placeholder() -> Non
     with pytest.raises(ValidationError, match=r"(?i)tenant_schema"):
         Cube(
             name="events",
-            backend=Backend.POSTGRES,
+            backend=Dialect.POSTGRES,
             table="{tenant_schema}.events",
             alias="e",
             tenancy="discriminator",
@@ -103,7 +103,7 @@ def test_schema_mode_does_not_require_tenancy_column() -> None:
     """SCHEMA mode encodes isolation in the table name; no column needed."""
     cube = Cube(
         name="c",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="{tenant_schema}.t",
         alias="c",
         tenancy="schema",
@@ -119,7 +119,7 @@ def test_schema_mode_does_not_require_tenancy_column() -> None:
 def _disc_catalog() -> Catalog:
     events = Cube(
         name="events",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="events",
         alias="e",
         tenancy="discriminator",
@@ -176,7 +176,7 @@ def test_discriminator_tenant_value_is_bound_parameter() -> None:
 def test_schema_mode_substitutes_tenant_schema_via_context() -> None:
     cube = Cube(
         name="orders",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="{tenant_schema}.orders",
         alias="o",
         measures=[Measure(name="count", sql="*", agg="count", unit="count")],
@@ -201,7 +201,7 @@ def test_none_mode_meta_cube_unchanged() -> None:
     not carry any tenancy predicate."""
     cube = Cube(
         name="public_lookup",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="lookup_table",
         alias="l",
         tenancy="none",
@@ -224,7 +224,7 @@ def test_cross_mode_join_carries_both_predicates() -> None:
     apply tenant isolation independently to each."""
     schema_cube = Cube(
         name="orders",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="{tenant_schema}.orders",
         alias="o",
         measures=[Measure(name="count", sql="*", agg="count", unit="count")],
@@ -239,7 +239,7 @@ def test_cross_mode_join_carries_both_predicates() -> None:
     )
     disc_cube = Cube(
         name="events",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="events",
         alias="e",
         tenancy="discriminator",

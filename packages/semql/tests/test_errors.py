@@ -11,7 +11,7 @@ import pytest
 from semql.compile import compile_query
 from semql.errors import (
     CompileError,
-    CrossBackendError,
+    CrossDialectError,
     FilterTypeError,
     JoinPathError,
     PhaseDeferredError,
@@ -21,7 +21,7 @@ from semql.errors import (
     UnknownIdentifierError,
     closest_match,
 )
-from semql.model import Backend, Cube, Dimension, Join, Measure
+from semql.model import Cube, Dialect, Dimension, Join, Measure
 from semql.spec import Filter, SemanticQuery
 
 
@@ -33,7 +33,7 @@ def test_hierarchy_root_is_semqlerror() -> None:
         JoinPathError,
         FilterTypeError,
         PlaceholderError,
-        CrossBackendError,
+        CrossDialectError,
         PhaseDeferredError,
     ):
         assert issubclass(leaf, CompileError)
@@ -89,7 +89,7 @@ def test_unknown_cube_suggests_closest_match(catalog: dict[str, Cube]) -> None:
 
 def test_cross_backend_raises_structured_error(catalog: dict[str, Cube]) -> None:
     q = SemanticQuery(measures=["orders.revenue", "sessions.duration"])
-    with pytest.raises(CrossBackendError) as exc_info:
+    with pytest.raises(CrossDialectError) as exc_info:
         compile_query(q, catalog)
     err = exc_info.value
     assert set(err.backends) == {"postgres", "clickhouse"}
@@ -111,7 +111,7 @@ def test_filter_type_mismatch_raises_filter_type_error(catalog: dict[str, Cube])
 def test_placeholder_error_carries_name() -> None:
     bad = Cube(
         name="bad",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="{nope}.bad",
         alias="b",
         measures=[Measure(name="count", sql="*", agg="count", unit="count")],
@@ -126,14 +126,14 @@ def test_placeholder_error_carries_name() -> None:
 def test_join_path_error_carries_cube_names() -> None:
     a = Cube(
         name="a",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="a",
         alias="a",
         measures=[Measure(name="count", sql="*", agg="count", unit="count")],
     )
     b = Cube(
         name="b",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="b",
         alias="b",
         dimensions=[Dimension(name="x", sql="{b}.x", type="string")],
@@ -169,7 +169,7 @@ def test_unused_join_not_treated_as_unreachable() -> None:
     JoinPathError rather than a bare CompileError string."""
     a = Cube(
         name="a",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="a",
         alias="a",
         measures=[Measure(name="count", sql="*", agg="count", unit="count")],

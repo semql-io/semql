@@ -30,14 +30,14 @@ Initial rule set:
 from __future__ import annotations
 
 from semql.lint import LintFinding, LintReport, lint_catalog
-from semql.model import Backend, Cube, Dimension, Join, Measure, Segment
+from semql.model import Cube, Dialect, Dimension, Join, Measure, Segment
 
 
 def _make_cube(**overrides: object) -> Cube:
     """Minimal cube; tests override the fields they care about."""
     defaults: dict = {
         "name": "orders",
-        "backend": Backend.POSTGRES,
+        "backend": Dialect.POSTGRES,
         "table": "{schema}.orders",
         "alias": "o",
         "measures": [Measure(name="count", sql="*", agg="count")],
@@ -171,7 +171,7 @@ def test_lint_passes_cube_with_pk_and_joins() -> None:
     """A cube with primary_key AND joins is connected."""
     customers = Cube(
         name="customers",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="{schema}.customers",
         alias="c",
         primary_key="id",

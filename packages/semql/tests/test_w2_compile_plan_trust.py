@@ -23,7 +23,7 @@ from dataclasses import replace
 
 from semql.compile import compile_plan, compile_query
 from semql.logical import to_logical_plan
-from semql.model import Backend, Cube, Dimension, Measure
+from semql.model import Cube, Dialect, Dimension, Measure
 from semql.spec import Filter, SemanticQuery
 
 from .conftest import CONTEXT
@@ -34,7 +34,7 @@ def _catalog() -> dict[str, Cube]:
         name="orders",
         alias="o",
         table="prod.orders",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         measures=[Measure(name="revenue", sql="{o}.amount", agg="sum")],
         dimensions=[
             Dimension(name="region", sql="{o}.region", type="string"),

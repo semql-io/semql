@@ -24,8 +24,8 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 from semql import (
-    Backend,
     Cube,
+    Dialect,
     Dimension,
     Measure,
     SemanticQuery,
@@ -39,7 +39,7 @@ from semql_prompt import render_catalog_block
 def _orders(*, customer_id_type: str = "uuid", coerce_to: str | None = None) -> Cube:
     return Cube(
         name="orders",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="orders",
         alias="o",
         primary_key="id",
@@ -61,7 +61,7 @@ def _orders(*, customer_id_type: str = "uuid", coerce_to: str | None = None) -> 
 def _customers(*, id_type: str = "string") -> Cube:
     return Cube(
         name="customers",
-        backend=Backend.BIGQUERY,
+        backend=Dialect.BIGQUERY,
         table="customers",
         alias="c",
         primary_key="id",

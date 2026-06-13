@@ -16,9 +16,9 @@ from __future__ import annotations
 
 from semql import (
     AuthContext,
-    Backend,
     Catalog,
     Cube,
+    Dialect,
     Dimension,
     Measure,
     TimeDimension,
@@ -33,7 +33,7 @@ from semql_prompt import (
 def _public_orders() -> Cube:
     return Cube(
         name="orders",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="public.orders",
         alias="o",
         description="Customer orders.",
@@ -55,7 +55,7 @@ def _public_orders() -> Cube:
 def _admin_audit() -> Cube:
     return Cube(
         name="audit_events",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="public.audit",
         alias="a",
         required_roles=["admin"],
@@ -68,7 +68,7 @@ def _admin_audit() -> Cube:
 def _support_tickets() -> Cube:
     return Cube(
         name="tickets",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="public.tickets",
         alias="t",
         required_roles=["support"],
@@ -183,7 +183,7 @@ def test_description_includes_dimensions_and_time_dims() -> None:
 def test_description_uses_default_when_cube_lacks_description() -> None:
     cube = Cube(
         name="bare",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="bare",
         alias="b",
         measures=[Measure(name="count", sql="*", agg="count")],

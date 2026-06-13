@@ -13,11 +13,11 @@ from __future__ import annotations
 
 import pytest
 from semql.compile import compile_query
-from semql.model import Backend, Cube, Dimension, Measure
+from semql.model import Cube, Dialect, Dimension, Measure
 from semql.spec import SemanticQuery
 
 
-def _cube(backend: Backend) -> Cube:
+def _cube(backend: Dialect) -> Cube:
     return Cube(
         name="t",
         backend=backend,
@@ -33,8 +33,8 @@ def _cube(backend: Backend) -> Cube:
     )
 
 
-@pytest.mark.parametrize("backend", [Backend.POSTGRES, Backend.DUCKDB])
-def test_reserved_identifiers_are_quoted(backend: Backend) -> None:
+@pytest.mark.parametrize("backend", [Dialect.POSTGRES, Dialect.DUCKDB])
+def test_reserved_identifiers_are_quoted(backend: Dialect) -> None:
     cat = {"t": _cube(backend)}
     q = SemanticQuery(
         measures=["t.n"],
@@ -46,8 +46,8 @@ def test_reserved_identifiers_are_quoted(backend: Backend) -> None:
     assert 't."group"' in sql, sql
 
 
-@pytest.mark.parametrize("backend", [Backend.POSTGRES, Backend.DUCKDB])
-def test_ordinary_identifiers_are_not_quoted(backend: Backend) -> None:
+@pytest.mark.parametrize("backend", [Dialect.POSTGRES, Dialect.DUCKDB])
+def test_ordinary_identifiers_are_not_quoted(backend: Dialect) -> None:
     cat = {"t": _cube(backend)}
     q = SemanticQuery(measures=["t.n"], dimensions=["t.plain"])
     sql = compile_query(q, cat, context={}).sql

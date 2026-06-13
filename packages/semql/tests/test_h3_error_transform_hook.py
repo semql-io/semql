@@ -11,9 +11,9 @@ from __future__ import annotations
 
 import pytest
 from semql import (
-    Backend,
     Catalog,
     Cube,
+    Dialect,
     Dimension,
     Measure,
     SemanticQuery,
@@ -24,7 +24,7 @@ from semql.errors import CompileError
 def _catalog(error_transform: object = None) -> Catalog:
     cube = Cube(
         name="orders",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="public.orders",
         alias="o",
         measures=[Measure(name="revenue", sql="{o}.amount", agg="sum")],

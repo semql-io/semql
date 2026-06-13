@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import pytest
 from semql.introspect import resolve_field
-from semql.model import Backend, Cube, Dimension, Measure
+from semql.model import Cube, Dialect, Dimension, Measure
 from semql_prompt import build_planner_prompt_fragment
 
 
@@ -29,7 +29,7 @@ def _cube_with_aliases() -> dict:
     return {
         "orders": Cube(
             name="orders",
-            backend=Backend.POSTGRES,
+            backend=Dialect.POSTGRES,
             table="{schema}.orders",
             alias="o",
             measures=[Measure(name="revenue", sql="{o}.amount", agg="sum")],

@@ -10,7 +10,7 @@ disappearing from view.
 from __future__ import annotations
 
 from semql import Cube, Dimension, Measure, TimeDimension
-from semql.model import Backend
+from semql.model import Dialect
 from semql_prompt import (
     build_planner_prompt_fragment,
     build_router_prompt_fragment,
@@ -21,7 +21,7 @@ from semql_prompt import (
 def _cat() -> dict[str, Cube]:
     orders = Cube(
         name="orders",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="orders",
         alias="o",
         display_name="Customer Orders",

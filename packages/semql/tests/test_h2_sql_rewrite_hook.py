@@ -11,7 +11,7 @@ Reference impls:
 from __future__ import annotations
 
 import pytest
-from semql import Backend, Catalog, Cube, Dimension, Measure, SemanticQuery
+from semql import Catalog, Cube, Dialect, Dimension, Measure, SemanticQuery
 from semql.compile import CompiledQuery
 from semql.hooks import CompileHook, SqlRewriteHook
 from semql.model import AuthContext
@@ -24,7 +24,7 @@ def _catalog(
 ) -> Catalog:
     cube = Cube(
         name="orders",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="public.orders",
         alias="o",
         measures=[Measure(name="revenue", sql="{o}.amount", agg="sum")],

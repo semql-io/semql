@@ -18,9 +18,9 @@ from __future__ import annotations
 
 import pytest
 from semql import (
-    Backend,
     Catalog,
     Cube,
+    Dialect,
     Dimension,
     Filter,
     Measure,
@@ -31,7 +31,7 @@ from semql import (
 def _orders() -> Cube:
     return Cube(
         name="orders",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="orders",
         alias="o",
         measures=[
@@ -149,15 +149,15 @@ def test_filtered_measure_composes_with_outer_where() -> None:
 @pytest.mark.parametrize(
     ("backend", "expected_marker"),
     [
-        (Backend.POSTGRES, "FILTER"),
-        (Backend.CLICKHOUSE, "FILTER"),
-        (Backend.DUCKDB, "FILTER"),
-        (Backend.BIGQUERY, "FILTER"),
+        (Dialect.POSTGRES, "FILTER"),
+        (Dialect.CLICKHOUSE, "FILTER"),
+        (Dialect.DUCKDB, "FILTER"),
+        (Dialect.BIGQUERY, "FILTER"),
         # Snowflake has no native FILTER — sqlglot transpiles to IFF.
-        (Backend.SNOWFLAKE, "IFF"),
+        (Dialect.SNOWFLAKE, "IFF"),
     ],
 )
-def test_filter_renders_per_dialect(backend: Backend, expected_marker: str) -> None:
+def test_filter_renders_per_dialect(backend: Dialect, expected_marker: str) -> None:
     cube = Cube(
         name="orders",
         backend=backend,
@@ -187,7 +187,7 @@ def test_filtered_measure_in_compare_window() -> None:
 
     cube = Cube(
         name="orders",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="orders",
         alias="o",
         measures=[

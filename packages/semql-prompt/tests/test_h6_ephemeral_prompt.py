@@ -92,13 +92,13 @@ def test_full_equals_joined_plus_ephemeral() -> None:
 
 
 def test_catalog_prompt_accepts_current_date_kwarg() -> None:
-    from semql import Backend, Catalog, Cube, Measure
+    from semql import Catalog, Cube, Dialect, Measure
 
     cat = Catalog(
         [
             Cube(
                 name="orders",
-                backend=Backend.POSTGRES,
+                backend=Dialect.POSTGRES,
                 table="public.orders",
                 alias="o",
                 measures=[Measure(name="cnt", sql="*", agg="count")],
@@ -110,13 +110,13 @@ def test_catalog_prompt_accepts_current_date_kwarg() -> None:
 
 
 def test_catalog_prompt_no_date_unchanged() -> None:
-    from semql import Backend, Catalog, Cube, Measure
+    from semql import Catalog, Cube, Dialect, Measure
 
     cat = Catalog(
         [
             Cube(
                 name="orders",
-                backend=Backend.POSTGRES,
+                backend=Dialect.POSTGRES,
                 table="public.orders",
                 alias="o",
                 measures=[Measure(name="cnt", sql="*", agg="count")],

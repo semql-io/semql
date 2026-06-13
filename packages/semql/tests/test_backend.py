@@ -1,5 +1,5 @@
 # pyright: reportPrivateImportUsage=false
-"""Per-strategy unit tests for the BackendDialect Protocol.
+"""Per-strategy unit tests for the DialectStrategy Protocol.
 
 Strategies return sqlglot AST nodes; tests render them via ``.sql()``
 under the dialect we'd emit at, and assert against the exact bytes the
@@ -12,15 +12,15 @@ from typing import Any
 
 import pytest
 from semql.backend import (
-    BackendDialect,
     ClickHouseDialect,
+    DialectStrategy,
     MetaDialect,
     PostgresDialect,
     dialect_for,
     render,
 )
 from semql.introspect import META_CUBES
-from semql.model import Backend, Cube, Dimension, Measure
+from semql.model import Cube, Dialect, Dimension, Measure
 from sqlglot import exp
 
 # ---------------------------------------------------------------------------
@@ -31,30 +31,30 @@ from sqlglot import exp
 @pytest.mark.parametrize("dim_type", ["string", "number", "time", "bool", "uuid"])
 def test_postgres_placeholder_always_percent_paren(dim_type: str) -> None:
     s = PostgresDialect()
-    assert render(s.placeholder("p0", dim_type), Backend.POSTGRES) == "%(p0)s"
+    assert render(s.placeholder("p0", dim_type), Dialect.POSTGRES) == "%(p0)s"
 
 
 def test_postgres_placeholder_uses_given_name() -> None:
     s = PostgresDialect()
-    assert render(s.placeholder("p7", "string"), Backend.POSTGRES) == "%(p7)s"
-    assert render(s.placeholder("start_ts", "time"), Backend.POSTGRES) == "%(start_ts)s"
+    assert render(s.placeholder("p7", "string"), Dialect.POSTGRES) == "%(p7)s"
+    assert render(s.placeholder("start_ts", "time"), Dialect.POSTGRES) == "%(start_ts)s"
 
 
 def test_clickhouse_placeholder_carries_typed_suffix() -> None:
     s = ClickHouseDialect()
-    assert render(s.placeholder("p0", "string"), Backend.CLICKHOUSE) == "{p0:String}"
-    assert render(s.placeholder("p1", "number"), Backend.CLICKHOUSE) == "{p1:Float64}"
-    assert render(s.placeholder("p2", "time"), Backend.CLICKHOUSE) == "{p2:DateTime}"
-    assert render(s.placeholder("p3", "bool"), Backend.CLICKHOUSE) == "{p3:UInt8}"
+    assert render(s.placeholder("p0", "string"), Dialect.CLICKHOUSE) == "{p0:String}"
+    assert render(s.placeholder("p1", "number"), Dialect.CLICKHOUSE) == "{p1:Float64}"
+    assert render(s.placeholder("p2", "time"), Dialect.CLICKHOUSE) == "{p2:DateTime}"
+    assert render(s.placeholder("p3", "bool"), Dialect.CLICKHOUSE) == "{p3:UInt8}"
     # uuid binds as String — CH UUIDs are quoted strings on the wire.
-    assert render(s.placeholder("p4", "uuid"), Backend.CLICKHOUSE) == "{p4:String}"
+    assert render(s.placeholder("p4", "uuid"), Dialect.CLICKHOUSE) == "{p4:String}"
 
 
 def test_meta_strategy_placeholder_matches_postgres() -> None:
     """META cubes are materialised as VALUES literals — when params do
     appear (rare), they should follow the Postgres convention."""
     s = MetaDialect()
-    assert render(s.placeholder("p0", "string"), Backend.META) == "%(p0)s"
+    assert render(s.placeholder("p0", "string"), Dialect.META) == "%(p0)s"
 
 
 # ---------------------------------------------------------------------------
@@ -66,17 +66,17 @@ def test_meta_strategy_placeholder_matches_postgres() -> None:
 def test_postgres_trunc_uses_date_trunc(granularity: str) -> None:
     s = PostgresDialect()
     expr = exp.column("ts", table="x")
-    out = render(s.trunc(granularity, expr), Backend.POSTGRES)
+    out = render(s.trunc(granularity, expr), Dialect.POSTGRES)
     assert out == f"date_trunc('{granularity}', x.ts)"
 
 
 def test_clickhouse_trunc_uses_toStartOf_family() -> None:
     s = ClickHouseDialect()
     expr = exp.column("ts", table="x")
-    assert render(s.trunc("hour", expr), Backend.CLICKHOUSE) == "toStartOfHour(x.ts)"
-    assert render(s.trunc("day", expr), Backend.CLICKHOUSE) == "toStartOfDay(x.ts)"
-    assert render(s.trunc("week", expr), Backend.CLICKHOUSE) == "toStartOfWeek(x.ts)"
-    assert render(s.trunc("month", expr), Backend.CLICKHOUSE) == "toStartOfMonth(x.ts)"
+    assert render(s.trunc("hour", expr), Dialect.CLICKHOUSE) == "toStartOfHour(x.ts)"
+    assert render(s.trunc("day", expr), Dialect.CLICKHOUSE) == "toStartOfDay(x.ts)"
+    assert render(s.trunc("week", expr), Dialect.CLICKHOUSE) == "toStartOfWeek(x.ts)"
+    assert render(s.trunc("month", expr), Dialect.CLICKHOUSE) == "toStartOfMonth(x.ts)"
 
 
 # ---------------------------------------------------------------------------
@@ -93,7 +93,7 @@ def test_postgres_emit_contains_bakes_percent_wildcards() -> None:
 
     s = PostgresDialect()
     field = exp.column("email", table="x")
-    sql = render(s.emit_contains(field, "@acme.com", bind), Backend.POSTGRES)
+    sql = render(s.emit_contains(field, "@acme.com", bind), Dialect.POSTGRES)
     assert sql == "x.email ILIKE %(p0)s"
     # PG bakes the wildcards INTO the bound value, so the placeholder
     # body is just the user's input wrapped.
@@ -111,7 +111,7 @@ def test_clickhouse_emit_contains_passes_value_literally() -> None:
 
     s = ClickHouseDialect()
     field = exp.column("email", table="x")
-    sql = render(s.emit_contains(field, "@acme.com", bind), Backend.CLICKHOUSE)
+    sql = render(s.emit_contains(field, "@acme.com", bind), Dialect.CLICKHOUSE)
     assert sql == "positionCaseInsensitive(x.email, {p0:String}) > 0"
     # CH expects the raw substring — no wildcard wrapping.
     assert bound == [("@acme.com", "string")]
@@ -125,7 +125,7 @@ def test_clickhouse_emit_contains_passes_value_literally() -> None:
 def test_postgres_emit_source_vanilla_cube_returns_table_as_alias() -> None:
     cube = Cube(
         name="orders",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="public.orders",
         alias="o",
         measures=[Measure(name="count", sql="*", agg="count", unit="count")],
@@ -135,7 +135,7 @@ def test_postgres_emit_source_vanilla_cube_returns_table_as_alias() -> None:
     def resolve(s: str) -> str:
         return s  # nothing to resolve in this fixture
 
-    out = render(PostgresDialect().emit_source(cube, {"orders": cube}, resolve), Backend.POSTGRES)
+    out = render(PostgresDialect().emit_source(cube, {"orders": cube}, resolve), Dialect.POSTGRES)
     assert out == "public.orders AS o"
 
 
@@ -145,7 +145,7 @@ def test_postgres_emit_source_threads_resolver_over_table_name() -> None:
     substituted before the table is wrapped with ``AS alias``."""
     cube = Cube(
         name="orders",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="{schema}.orders",
         alias="o",
         measures=[Measure(name="count", sql="*", agg="count", unit="count")],
@@ -155,7 +155,7 @@ def test_postgres_emit_source_threads_resolver_over_table_name() -> None:
     def resolve(s: str) -> str:
         return s.replace("{schema}", "prod")
 
-    out = render(PostgresDialect().emit_source(cube, {"orders": cube}, resolve), Backend.POSTGRES)
+    out = render(PostgresDialect().emit_source(cube, {"orders": cube}, resolve), Dialect.POSTGRES)
     assert out == "prod.orders AS o"
 
 
@@ -164,13 +164,13 @@ def test_postgres_emit_source_quotes_reserved_word_table_name() -> None:
     double-quoted so the generated SQL parses as a valid SELECT."""
     cube = Cube(
         name="evt",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="using",
         alias="u",
         measures=[Measure(name="count", sql="*", agg="count", unit="count")],
         dimensions=[],
     )
-    out = render(PostgresDialect().emit_source(cube, {"evt": cube}, lambda x: x), Backend.POSTGRES)
+    out = render(PostgresDialect().emit_source(cube, {"evt": cube}, lambda x: x), Dialect.POSTGRES)
     assert out == '"using" AS u'
 
 
@@ -179,7 +179,7 @@ def test_meta_emit_source_materialises_values_literal() -> None:
     subquery the strategy builds from the catalog snapshot."""
     catalog = {c.name: c for c in META_CUBES}
     s = MetaDialect()
-    out = render(s.emit_source(META_CUBES[0], catalog, lambda x: x), Backend.META)
+    out = render(s.emit_source(META_CUBES[0], catalog, lambda x: x), Dialect.META)
     # Should produce a SELECT-over-VALUES wrapped subquery aliased to
     # the META cube's alias.
     assert "VALUES" in out
@@ -193,7 +193,7 @@ def test_meta_emit_source_materialises_values_literal() -> None:
 
 def test_strategies_satisfy_protocol_at_runtime() -> None:
     for s in (PostgresDialect(), ClickHouseDialect(), MetaDialect()):
-        assert isinstance(s, BackendDialect)
+        assert isinstance(s, DialectStrategy)
 
 
 # ---------------------------------------------------------------------------
@@ -202,14 +202,14 @@ def test_strategies_satisfy_protocol_at_runtime() -> None:
 
 
 def test_dialect_for_returns_default_for_known_backend() -> None:
-    assert isinstance(dialect_for(Backend.POSTGRES), PostgresDialect)
-    assert isinstance(dialect_for(Backend.CLICKHOUSE), ClickHouseDialect)
-    assert isinstance(dialect_for(Backend.META), MetaDialect)
+    assert isinstance(dialect_for(Dialect.POSTGRES), PostgresDialect)
+    assert isinstance(dialect_for(Dialect.CLICKHOUSE), ClickHouseDialect)
+    assert isinstance(dialect_for(Dialect.META), MetaDialect)
 
 
 def test_dialect_for_accepts_overrides() -> None:
     fake = PostgresDialect()
-    result = dialect_for(Backend.POSTGRES, overrides={Backend.POSTGRES: fake})
+    result = dialect_for(Dialect.POSTGRES, overrides={Dialect.POSTGRES: fake})
     assert result is fake
 
 
@@ -219,4 +219,4 @@ def test_dialect_for_duckdb_uses_dedicated_strategy() -> None:
     landed."""
     from semql.backend import DuckDBDialect
 
-    assert isinstance(dialect_for(Backend.DUCKDB), DuckDBDialect)
+    assert isinstance(dialect_for(Dialect.DUCKDB), DuckDBDialect)

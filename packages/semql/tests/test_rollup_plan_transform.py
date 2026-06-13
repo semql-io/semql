@@ -24,7 +24,7 @@ from __future__ import annotations
 import pytest
 from semql.compile import compile_query
 from semql.logical import Scan, apply_rollup_to_plan, to_logical_plan
-from semql.model import Backend, Cube, Dimension, Measure, Rollup, TimeDimension
+from semql.model import Cube, Dialect, Dimension, Measure, Rollup, TimeDimension
 from semql.spec import SemanticQuery, TimeWindow
 
 
@@ -33,7 +33,7 @@ def _orders_with_rollup() -> tuple[dict[str, Cube], Cube, Rollup]:
         name="orders",
         alias="o",
         table="prod.orders",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         dimensions=[Dimension(name="region", sql="{o}.region", type="string")],
         time_dimensions=[
             TimeDimension(

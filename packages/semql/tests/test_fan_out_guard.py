@@ -11,7 +11,7 @@ from __future__ import annotations
 import pytest
 from semql.catalog import Catalog
 from semql.errors import CompileError
-from semql.model import Backend, Cube, Dimension, Join, Measure
+from semql.model import Cube, Dialect, Dimension, Join, Measure
 from semql.spec import SemanticQuery
 
 
@@ -19,7 +19,7 @@ def _customers(measures: list[Measure]) -> Cube:
     # customers is the "one" side: one customer, many orders.
     return Cube(
         name="customers",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="customers",
         alias="c",
         primary_key="id",
@@ -35,7 +35,7 @@ def _customers(measures: list[Measure]) -> Cube:
 def _orders() -> Cube:
     return Cube(
         name="orders",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="orders",
         alias="o",
         primary_key="id",

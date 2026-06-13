@@ -22,13 +22,13 @@ from semql import (
 )
 from semql._resolve import walk_query_fields
 from semql.errors import FilterTypeError, UnknownIdentifierError
-from semql.model import Backend, Segment
+from semql.model import Dialect, Segment
 
 
 def _cat() -> dict[str, Cube]:
     orders = Cube(
         name="orders",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="orders",
         alias="o",
         measures=[

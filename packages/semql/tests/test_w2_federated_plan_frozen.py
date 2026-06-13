@@ -19,8 +19,8 @@ import dataclasses
 
 import pytest
 from semql import (
-    Backend,
     Cube,
+    Dialect,
     Dimension,
     Measure,
     SemanticQuery,
@@ -35,7 +35,7 @@ def _single_backend_plan() -> FederatedPlan:
             name="orders",
             alias="o",
             table="orders",
-            backend=Backend.POSTGRES,
+            backend=Dialect.POSTGRES,
             measures=[Measure(name="revenue", sql="{o}.amount", agg="sum")],
             dimensions=[Dimension(name="region", sql="{o}.region", type="string")],
         )

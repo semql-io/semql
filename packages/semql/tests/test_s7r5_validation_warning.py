@@ -13,9 +13,9 @@ New behaviors in validate():
 from __future__ import annotations
 
 from semql import (
-    Backend,
     Catalog,
     Cube,
+    Dialect,
     Dimension,
     Measure,
     SemanticQuery,
@@ -30,7 +30,7 @@ def _cube(
 ) -> Cube:
     return Cube(
         name=name,
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table=f"public.{name}",
         alias=name[:2],
         measures=[Measure(name="cnt", sql=f"{{{name[:2]}}}.id", agg="count")],

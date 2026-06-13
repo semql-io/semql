@@ -22,12 +22,12 @@ def _make_test_catalog_importable(  # pyright: ignore[reportUnusedFunction] -- a
     catalog_module = tmp_path / "_semql_cli_test_catalog.py"
     catalog_module.write_text(
         """
-from semql import Backend, Catalog, Cube, Dimension, Measure
+from semql import Dialect, Catalog, Cube, Dimension, Measure
 
 default = Catalog([
     Cube(
         name="orders",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="orders",
         alias="o",
         measures=[Measure(name="revenue", sql="{o}.amount", agg="sum", unit="currency")],

@@ -31,7 +31,7 @@ def emit_python(result: IntrospectionResult, *, header: str | None = None) -> st
     lines.append("from __future__ import annotations\n")
     lines.append("")
     lines.append("from semql.model import (")
-    lines.append("    Backend,")
+    lines.append("    Dialect,")
     lines.append("    Cube,")
     lines.append("    Dimension,")
     lines.append("    Join,")
@@ -80,7 +80,7 @@ def _render_cube(
     lines: list[str] = []
     lines.append(f"{var} = Cube(")
     lines.append(f"    name={cube.name!r},")
-    lines.append(f"    backend=Backend.{cube.backend.name},")
+    lines.append(f"    backend=Dialect.{cube.backend.name},")
     lines.append(f"    table={cube.table!r},")
     lines.append(f"    alias={cube.alias!r},")
     if cube.primary_key is not None:

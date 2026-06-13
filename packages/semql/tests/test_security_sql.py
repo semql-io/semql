@@ -12,10 +12,10 @@ from __future__ import annotations
 
 import pytest
 from semql import (
-    Backend,
     Catalog,
     CompileError,
     Cube,
+    Dialect,
     Dimension,
     Measure,
     SemanticQuery,
@@ -27,14 +27,14 @@ from semql import (
 
 
 def test_cube_security_sql_defaults_to_none() -> None:
-    cube = Cube(name="c", backend=Backend.POSTGRES, table="t", alias="c")
+    cube = Cube(name="c", backend=Dialect.POSTGRES, table="t", alias="c")
     assert cube.security_sql is None
 
 
 def test_cube_accepts_security_sql_string() -> None:
     cube = Cube(
         name="c",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="t",
         alias="c",
         security_sql="{c}.owner_id = {ctx.user_id}",
@@ -50,7 +50,7 @@ def test_cube_accepts_security_sql_string() -> None:
 def _orders_with_security() -> Cube:
     return Cube(
         name="orders",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="orders",
         alias="o",
         security_sql="{o}.owner_id = {ctx.user_id}",
@@ -115,7 +115,7 @@ def test_security_sql_without_ctx_value_rejects() -> None:
 def _events_with_both() -> Cube:
     return Cube(
         name="events",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="events",
         alias="e",
         tenancy="discriminator",
@@ -155,7 +155,7 @@ def test_security_sql_static_predicate_compiles() -> None:
     always-on filter — e.g. ``{o}.deleted_at IS NULL``."""
     cube = Cube(
         name="orders",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="orders",
         alias="o",
         security_sql="{o}.is_public = TRUE",

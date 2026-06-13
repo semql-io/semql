@@ -5,12 +5,12 @@ Phase A scope:
 - Per-query switch via ``TimeWindow.fill_nulls_with``.
 - Only when a query has a time_dimension with granularity and no
   non-time dimensions (cartesian fill with dims is Phase B).
-- Backend coverage: Postgres + DuckDB (the std-sql ``generate_series``
+- Dialect coverage: Postgres + DuckDB (the std-sql ``generate_series``
   shape). ClickHouse / BigQuery / Snowflake raise a clear "not yet
   supported" error.
 
 The compiler wraps the inner aggregation in a CTE, builds a parallel
-spine CTE via ``BackendDialect.emit_time_spine``, and the outer
+spine CTE via ``DialectStrategy.emit_time_spine``, and the outer
 SELECT does ``spine LEFT JOIN agg`` with ``COALESCE(measure, fill)``
 per measure.
 """
@@ -20,7 +20,7 @@ from __future__ import annotations
 import pytest
 from semql.compile import compile_query
 from semql.errors import CompileError
-from semql.model import Backend, Cube, Measure, TimeDimension
+from semql.model import Cube, Dialect, Measure, TimeDimension
 from semql.spec import SemanticQuery, TimeWindow
 
 CONTEXT = {"schema": "test"}
@@ -29,7 +29,7 @@ CONTEXT = {"schema": "test"}
 def _pg_orders() -> Cube:
     return Cube(
         name="orders",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="{schema}.orders",
         alias="o",
         measures=[
@@ -48,13 +48,13 @@ def _pg_orders() -> Cube:
 
 def _duckdb_orders() -> Cube:
     cube = _pg_orders()
-    return cube.model_copy(update={"backend": Backend.DUCKDB})
+    return cube.model_copy(update={"backend": Dialect.DUCKDB})
 
 
 def _ch_events() -> Cube:
     return Cube(
         name="events",
-        backend=Backend.CLICKHOUSE,
+        backend=Dialect.CLICKHOUSE,
         table="{schema}.events",
         alias="e",
         measures=[Measure(name="count", sql="*", agg="count")],
@@ -185,7 +185,7 @@ def test_fill_nulls_emits_spine_clickhouse() -> None:
 def test_fill_nulls_emits_spine_bigquery() -> None:
     cube = Cube(
         name="orders",
-        backend=Backend.BIGQUERY,
+        backend=Dialect.BIGQUERY,
         table="{schema}.orders",
         alias="o",
         measures=[Measure(name="count", sql="*", agg="count")],
@@ -208,7 +208,7 @@ def test_fill_nulls_emits_spine_bigquery() -> None:
 def test_fill_nulls_emits_spine_snowflake() -> None:
     cube = Cube(
         name="orders",
-        backend=Backend.SNOWFLAKE,
+        backend=Dialect.SNOWFLAKE,
         table="{schema}.orders",
         alias="o",
         measures=[Measure(name="count", sql="*", agg="count")],

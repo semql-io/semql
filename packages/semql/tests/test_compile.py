@@ -10,7 +10,7 @@ import pytest
 from pydantic import ValidationError
 from semql.compile import MAX_UNGROUPED_ROWS, CompiledQuery, CompileError, compile_query
 from semql.introspect import quote_literal
-from semql.model import Backend, Cube, Measure
+from semql.model import Cube, Dialect, Measure
 from semql.spec import CompareWindow, Filter, SemanticQuery, TimeWindow
 from semql.visualize import (
     BAR_MAX_BARS,
@@ -70,7 +70,7 @@ def test_compile_pg_measure_with_dimension(catalog: dict[str, Cube]) -> None:
         dimensions=["orders.region"],
     )
     out = compile_query(q, catalog, context=CONTEXT)
-    assert out.backend is Backend.POSTGRES
+    assert out.backend is Dialect.POSTGRES
     assert out.columns == ["region", "revenue"]
     assert "AS revenue" in out.sql
     assert "test_schema" in out.sql
@@ -120,7 +120,7 @@ def test_compile_ch_measure(catalog: dict[str, Cube]) -> None:
         dimensions=["sessions.app_name"],
     )
     out = compile_query(q, catalog, context=CONTEXT)
-    assert out.backend is Backend.CLICKHOUSE
+    assert out.backend is Dialect.CLICKHOUSE
     assert out.columns == ["app_name", "duration"]
     assert "s.event_type = 'active'" in out.sql  # base_predicate
 
@@ -174,7 +174,7 @@ def test_compile_join_emits_inner_join(catalog: dict[str, Cube]) -> None:
         dimensions=["customers.name"],
     )
     out = compile_query(q, catalog, context=CONTEXT)
-    assert out.backend is Backend.POSTGRES
+    assert out.backend is Dialect.POSTGRES
     assert "INNER JOIN" in out.sql.upper()
     assert "LEFT JOIN" not in out.sql.upper()
     assert "c.id" in out.sql
@@ -399,7 +399,7 @@ def test_required_filter_present_compiles(catalog: dict[str, Cube]) -> None:
         filters=[Filter(dimension="restricted.flag_type", op="eq", values=["fraud"])],
     )
     out = compile_query(q, catalog, context=CONTEXT)
-    assert out.backend is Backend.POSTGRES
+    assert out.backend is Dialect.POSTGRES
 
 
 def test_ungrouped_with_measures_rejected_at_spec_level(catalog: dict[str, Cube]) -> None:
@@ -486,14 +486,14 @@ def test_having_alias_true_references_name(catalog: dict[str, Cube]) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Introspection (Backend.META) cubes
+# Introspection (Dialect.META) cubes
 # ---------------------------------------------------------------------------
 
 
 def test_meta_cubes_registered_but_hidden(catalog: dict[str, Cube]) -> None:
     for name in ("catalog_cubes", "catalog_measures", "catalog_dimensions"):
         assert name in catalog
-        assert catalog[name].backend is Backend.META
+        assert catalog[name].backend is Dialect.META
         assert catalog[name].expose_in_prompt is False
 
 
@@ -504,7 +504,7 @@ def test_compile_meta_cubes_lists_self(catalog: dict[str, Cube]) -> None:
         limit=100,
     )
     out = compile_query(q, catalog, context=CONTEXT)
-    assert out.backend is Backend.META
+    assert out.backend is Dialect.META
     assert "'orders'" in out.sql
     assert "'catalog_cubes'" in out.sql
     assert "test_schema" not in out.sql  # META emits no tenant tables
@@ -529,7 +529,7 @@ def test_meta_backend_uses_pg_param_style(catalog: dict[str, Cube]) -> None:
         limit=10,
     )
     out = compile_query(q, catalog, context=CONTEXT)
-    assert out.backend is Backend.META
+    assert out.backend is Dialect.META
     assert "%(p0)s" in out.sql
     assert "{p0:" not in out.sql
 
@@ -543,7 +543,7 @@ def test_meta_value_escapes_apostrophes() -> None:
 def test_meta_cube_count_aggregates(catalog: dict[str, Cube]) -> None:
     q = SemanticQuery(measures=["catalog_cubes.count"])
     out = compile_query(q, catalog, context=CONTEXT)
-    assert out.backend is Backend.META
+    assert out.backend is Dialect.META
     assert "COUNT(*)" in out.sql
 
 

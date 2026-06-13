@@ -12,9 +12,9 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 from semql import (
-    Backend,
     Catalog,
     Cube,
+    Dialect,
     Dimension,
     Measure,
     SemanticQuery,
@@ -43,7 +43,7 @@ def _partitioned_orders_cube(
         enriched.append(TimePartitionedSource(**kw))
     return Cube(
         name="orders",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         alias="o",
         time_partition=TimePartition(time_dimension="placed_at"),
         physical_sources=enriched,
@@ -90,7 +90,7 @@ def test_physical_sources_requires_time_partition() -> None:
     with pytest.raises(ValidationError, match=r"(?i)physical_sources is non-empty"):
         Cube(
             name="orders",
-            backend=Backend.POSTGRES,
+            backend=Dialect.POSTGRES,
             table="orders",
             alias="o",
             physical_sources=[
@@ -103,7 +103,7 @@ def test_physical_sources_rejects_unknown_time_dimension() -> None:
     with pytest.raises(ValidationError, match=r"(?i)not a TimeDimension on this cube"):
         Cube(
             name="orders",
-            backend=Backend.POSTGRES,
+            backend=Dialect.POSTGRES,
             table="orders",
             alias="o",
             time_partition=TimePartition(time_dimension="nope"),
@@ -160,7 +160,7 @@ def test_physical_sources_mutually_exclusive_with_table() -> None:
     with pytest.raises(ValidationError, match=r"(?i)cannot set .*physical_sources.*together"):
         Cube(
             name="orders",
-            backend=Backend.POSTGRES,
+            backend=Dialect.POSTGRES,
             table="orders",
             alias="o",
             physical_sources=[

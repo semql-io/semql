@@ -11,10 +11,10 @@ from __future__ import annotations
 
 import semql
 from semql import (
-    Backend,
     Catalog,
     CompiledQuery,
     Cube,
+    Dialect,
     Dimension,
     Measure,
     Segment,
@@ -105,7 +105,7 @@ def test_documented_function_exports_are_callable() -> None:
 def _smoke_catalog() -> Catalog:
     orders = Cube(
         name="orders",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="orders",
         alias="o",
         base_predicate="{o}.deleted_at IS NULL",

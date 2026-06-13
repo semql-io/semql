@@ -19,8 +19,8 @@ from typing import Any
 import duckdb
 import pytest
 from semql import (
-    Backend,
     Cube,
+    Dialect,
     Dimension,
     Join,
     Measure,
@@ -63,7 +63,7 @@ class _DialectTranslatingAdapter:
 # ---------------------------------------------------------------------------
 
 
-def _orders_cube(backend: Backend = Backend.POSTGRES) -> Cube:
+def _orders_cube(backend: Dialect = Dialect.POSTGRES) -> Cube:
     return Cube(
         name="orders",
         backend=backend,
@@ -91,7 +91,7 @@ def _orders_cube(backend: Backend = Backend.POSTGRES) -> Cube:
     )
 
 
-def _customers_cube(backend: Backend = Backend.BIGQUERY) -> Cube:
+def _customers_cube(backend: Dialect = Dialect.BIGQUERY) -> Cube:
     return Cube(
         name="customers",
         backend=backend,
@@ -159,8 +159,8 @@ def test_engine_runs_two_fragment_plan_and_merges(
     assert isinstance(plan, FederatedPlan)
 
     engine = Engine()
-    engine.register(Backend.POSTGRES, _DialectTranslatingAdapter(pg_con))
-    engine.register(Backend.BIGQUERY, _DialectTranslatingAdapter(bq_con))
+    engine.register(Dialect.POSTGRES, _DialectTranslatingAdapter(pg_con))
+    engine.register(Dialect.BIGQUERY, _DialectTranslatingAdapter(bq_con))
 
     result = engine.run(plan)
 
@@ -191,8 +191,8 @@ def test_engine_handles_filter_pushdown_correctly(
     )
 
     engine = Engine()
-    engine.register(Backend.POSTGRES, _DialectTranslatingAdapter(pg_con))
-    engine.register(Backend.BIGQUERY, _DialectTranslatingAdapter(bq_con))
+    engine.register(Dialect.POSTGRES, _DialectTranslatingAdapter(pg_con))
+    engine.register(Dialect.BIGQUERY, _DialectTranslatingAdapter(bq_con))
 
     result = engine.run(plan)
     rows = {r[0]: r[1] for r in result.rows}
@@ -217,8 +217,8 @@ def test_engine_handles_avg_decomposition(
     )
 
     engine = Engine()
-    engine.register(Backend.POSTGRES, _DialectTranslatingAdapter(pg_con))
-    engine.register(Backend.BIGQUERY, _DialectTranslatingAdapter(bq_con))
+    engine.register(Dialect.POSTGRES, _DialectTranslatingAdapter(pg_con))
+    engine.register(Dialect.BIGQUERY, _DialectTranslatingAdapter(bq_con))
 
     result = engine.run(plan)
     rows = {r[0]: r[1] for r in result.rows}
@@ -240,8 +240,8 @@ def test_iter_rows_yields_dicts(
     )
 
     engine = Engine()
-    engine.register(Backend.POSTGRES, _DialectTranslatingAdapter(pg_con))
-    engine.register(Backend.BIGQUERY, _DialectTranslatingAdapter(bq_con))
+    engine.register(Dialect.POSTGRES, _DialectTranslatingAdapter(pg_con))
+    engine.register(Dialect.BIGQUERY, _DialectTranslatingAdapter(bq_con))
 
     rows = list(engine.iter_rows(plan))
     assert all(set(r.keys()) == {"region", "revenue"} for r in rows)
@@ -267,7 +267,7 @@ def test_engine_handles_degenerate_single_fragment_plan(
     )
 
     engine = Engine()
-    engine.register(Backend.POSTGRES, DuckDBAdapter(pg_con))
+    engine.register(Dialect.POSTGRES, DuckDBAdapter(pg_con))
 
     result = engine.run(plan)
     rows = {r[0]: r[1] for r in result.rows}
@@ -296,7 +296,7 @@ def test_engine_refuses_plan_with_unregistered_backend(
     )
 
     engine = Engine()
-    engine.register(Backend.POSTGRES, DuckDBAdapter(pg_con))
+    engine.register(Dialect.POSTGRES, DuckDBAdapter(pg_con))
     # BigQuery NOT registered.
 
     with pytest.raises(EngineError, match="No adapter registered"):
@@ -319,8 +319,8 @@ def test_engine_repeatable_runs_dont_leak_state(
     )
 
     engine = Engine()
-    engine.register(Backend.POSTGRES, _DialectTranslatingAdapter(pg_con))
-    engine.register(Backend.BIGQUERY, _DialectTranslatingAdapter(bq_con))
+    engine.register(Dialect.POSTGRES, _DialectTranslatingAdapter(pg_con))
+    engine.register(Dialect.BIGQUERY, _DialectTranslatingAdapter(bq_con))
 
     r1 = engine.run(plan)
     r2 = engine.run(plan)
@@ -358,7 +358,7 @@ def test_engine_runs_raw_rows_with_filtered_measure(
     by region' lands exactly as the user would write by hand."""
     orders = Cube(
         name="orders",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="orders",
         alias="o",
         primary_key="id",
@@ -394,8 +394,8 @@ def test_engine_runs_raw_rows_with_filtered_measure(
         mode="raw_rows",
     )
     engine = Engine()
-    engine.register(Backend.POSTGRES, _DialectTranslatingAdapter(pg_con))
-    engine.register(Backend.BIGQUERY, _DialectTranslatingAdapter(bq_con))
+    engine.register(Dialect.POSTGRES, _DialectTranslatingAdapter(pg_con))
+    engine.register(Dialect.BIGQUERY, _DialectTranslatingAdapter(bq_con))
     result = engine.run(plan)
     rows = {r[0]: r[1] for r in result.rows}
     # EU paid: 100+200+300=600; US paid: 50 (the pending 25 is filtered out).
@@ -428,8 +428,8 @@ def test_engine_runs_raw_rows_with_cross_partition_or(
         mode="raw_rows",
     )
     engine = Engine()
-    engine.register(Backend.POSTGRES, _DialectTranslatingAdapter(pg_con))
-    engine.register(Backend.BIGQUERY, _DialectTranslatingAdapter(bq_con))
+    engine.register(Dialect.POSTGRES, _DialectTranslatingAdapter(pg_con))
+    engine.register(Dialect.BIGQUERY, _DialectTranslatingAdapter(bq_con))
     result = engine.run(plan)
     rows = {r[0]: r[1] for r in result.rows}
     # EU customers (10, 12 are gold) match either branch. Orders 1+2
@@ -456,7 +456,7 @@ def test_engine_runs_raw_rows_plan_with_count_distinct(
     mode would refuse this query."""
     orders_with_distinct = Cube(
         name="orders",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="orders",
         alias="o",
         primary_key="id",
@@ -492,8 +492,8 @@ def test_engine_runs_raw_rows_plan_with_count_distinct(
     )
 
     engine = Engine()
-    engine.register(Backend.POSTGRES, _DialectTranslatingAdapter(pg_con))
-    engine.register(Backend.BIGQUERY, _DialectTranslatingAdapter(bq_con))
+    engine.register(Dialect.POSTGRES, _DialectTranslatingAdapter(pg_con))
+    engine.register(Dialect.BIGQUERY, _DialectTranslatingAdapter(bq_con))
 
     result = engine.run(plan)
     rows = {r[0]: r[1] for r in result.rows}
@@ -511,7 +511,7 @@ def test_engine_runs_raw_rows_plan_with_having(
     below the threshold."""
     orders_with_distinct = Cube(
         name="orders",
-        backend=Backend.POSTGRES,
+        backend=Dialect.POSTGRES,
         table="orders",
         alias="o",
         primary_key="id",
@@ -549,8 +549,8 @@ def test_engine_runs_raw_rows_plan_with_having(
     )
 
     engine = Engine()
-    engine.register(Backend.POSTGRES, _DialectTranslatingAdapter(pg_con))
-    engine.register(Backend.BIGQUERY, _DialectTranslatingAdapter(bq_con))
+    engine.register(Dialect.POSTGRES, _DialectTranslatingAdapter(pg_con))
+    engine.register(Dialect.BIGQUERY, _DialectTranslatingAdapter(bq_con))
 
     result = engine.run(plan)
     rows = {r[0]: r[1] for r in result.rows}
@@ -587,8 +587,8 @@ def test_engine_custom_merge_engine_receives_merge_spec(
             return AdapterResult(columns=plan.columns, rows=[("custom", 123.0)])
 
     engine = Engine(merge_engine=RecordingMergeEngine())
-    engine.register(Backend.POSTGRES, _DialectTranslatingAdapter(pg_con))
-    engine.register(Backend.BIGQUERY, _DialectTranslatingAdapter(bq_con))
+    engine.register(Dialect.POSTGRES, _DialectTranslatingAdapter(pg_con))
+    engine.register(Dialect.BIGQUERY, _DialectTranslatingAdapter(bq_con))
 
     result = engine.run(plan)
     assert seen_specs == [plan.merge_spec]

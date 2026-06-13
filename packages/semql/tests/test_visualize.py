@@ -11,7 +11,7 @@ that drift silently when someone re-orders the if-chain.
 from __future__ import annotations
 
 import pytest
-from semql.model import Backend, Cube, Dimension, Join, Measure, TimeDimension
+from semql.model import Cube, Dialect, Dimension, Join, Measure, TimeDimension
 from semql.spec import SemanticQuery, TimeWindow
 from semql.visualize import (
     BAR_MAX_BARS,
@@ -29,7 +29,7 @@ from semql.visualize import (
 def _orders(default_chart_type: object | None = None) -> Cube:
     kwargs: dict[str, object] = {
         "name": "orders",
-        "backend": Backend.POSTGRES,
+        "backend": Dialect.POSTGRES,
         "table": "orders",
         "alias": "o",
         "measures": [
@@ -63,7 +63,7 @@ def _orders(default_chart_type: object | None = None) -> Cube:
 def _customers(default_chart_type: object | None = None) -> Cube:
     kwargs: dict[str, object] = {
         "name": "customers",
-        "backend": Backend.POSTGRES,
+        "backend": Dialect.POSTGRES,
         "table": "customers",
         "alias": "c",
         "measures": [Measure(name="count", sql="*", agg="count", unit="count")],

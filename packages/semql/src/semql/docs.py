@@ -78,7 +78,7 @@ def _render_cube(cube: object) -> list[str]:  # cube: Cube
         else f"- **Table:** `{src.table}`"
     )
     facts: list[str] = [
-        f"- **Backend:** `{cube.backend.value}`",
+        f"- **Dialect:** `{cube.backend.value}`",
         source_line,
         f"- **Alias:** `{cube.alias}`",
     ]
