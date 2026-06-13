@@ -116,9 +116,12 @@ bump part="patch":
     #!/usr/bin/env -S python3
     import pathlib
     import re
-    import sys
 
-    part = sys.argv[1] if len(sys.argv) > 1 else "patch"
+    # just passes recipe params via brace-interpolation, not argv, so
+    # read the substituted parameter directly (was sys.argv[1], which is
+    # never populated for a shebang recipe — `just bump minor` silently
+    # did a patch bump).
+    part = "{{part}}"
     if part not in {"patch", "minor", "major"}:
         raise SystemExit("part must be one of: patch, minor, major")
 

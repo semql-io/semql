@@ -1,6 +1,6 @@
 [project]
 name = "semql-prompt"
-version = "0.2.1"
+version = "0.3.0"
 description = "LLM-facing prompt rendering for a semql Catalog: the four-role planner/router/presenter/drilldown fragments, cacheable prompt segments, tool-description projection, and prompt-token budgeting."
 readme = "README.md"
 license = "BSD-3-Clause"
@@ -10,7 +10,7 @@ authors = [
 ]
 requires-python = ">=3.12"
 dependencies = [
-    "semql>=0.2.1,<0.3",
+    "semql>=0.3.0,<0.4",
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",

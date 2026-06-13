@@ -1,6 +1,6 @@
 [project]
 name = "semql-engine"
-version = "0.2.1"
+version = "0.3.0"
 description = "In-process executor for semql FederatedPlans — runs per-backend fragments via caller-supplied adapters and merges results in DuckDB."
 readme = "README.md"
 license = "BSD-3-Clause"
@@ -11,7 +11,7 @@ authors = [
 requires-python = ">=3.12"
 dependencies = [
     "duckdb>=1.5.3",
-    "semql>=0.2.1,<0.3",
+    "semql>=0.3.0,<0.4",
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
