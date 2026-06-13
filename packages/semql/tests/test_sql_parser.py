@@ -29,8 +29,71 @@ warnings and continues.
 from __future__ import annotations
 
 import pytest
+from semql.compile import compile_query
 from semql.parse import ParserDecision, parse_sql_statement
 from semql.spec import SemanticQuery
+
+CONTEXT = {"schema": "test_schema"}
+
+
+# ---------------------------------------------------------------------------
+# Multi-cube JOIN (Malloy-style: the JOIN declares participation; the
+# catalog is the source of truth for how the cubes relate).
+# ---------------------------------------------------------------------------
+
+
+def test_join_resolves_qualified_columns_to_their_cubes(catalog: dict) -> None:
+    """``FROM orders o JOIN customers c`` resolves ``o.revenue`` and
+    ``c.name`` to the right cube via the table aliases — producing a
+    multi-cube SemanticQuery. The ON clause is not emitted; the catalog
+    join is the source of truth."""
+    out = parse_sql_statement(
+        "SELECT c.name, SUM(o.revenue) FROM orders o "
+        "JOIN customers c ON o.customer_id = c.id GROUP BY c.name",
+        catalog=catalog,
+    )
+    q = out.query
+    assert "orders.revenue" in q.measures
+    assert "customers.name" in q.dimensions
+    assert out.parse_errors == ()
+
+
+def test_join_query_compiles_to_join_sql(catalog: dict) -> None:
+    """The parsed multi-cube query compiles — the compiler infers the
+    join from the catalog (the parser emitted no join spec)."""
+    out = parse_sql_statement(
+        "SELECT c.name, SUM(o.revenue) FROM orders o "
+        "JOIN customers c ON o.customer_id = c.id GROUP BY c.name",
+        catalog=catalog,
+    )
+    sql = compile_query(out.query, catalog, context=CONTEXT).sql
+    assert "JOIN" in sql.upper()
+    assert "SUM(o.amount)" in sql
+
+
+def test_join_unqualified_column_resolves_by_unique_owner(catalog: dict) -> None:
+    """An unqualified column in a multi-cube query resolves to the one
+    cube that declares it (``name`` only exists on customers here)."""
+    out = parse_sql_statement(
+        "SELECT name, SUM(o.revenue) FROM orders o "
+        "JOIN customers c ON o.customer_id = c.id GROUP BY name",
+        catalog=catalog,
+    )
+    q = out.query
+    assert "customers.name" in q.dimensions
+
+
+def test_join_between_non_joinable_cubes_is_refused(catalog: dict) -> None:
+    """Joining cubes with no catalog relationship is refused — the
+    parser won't invent a join the catalog doesn't declare."""
+    with pytest.raises(Exception, match=r"(?i)join|relate|not.*catalog"):
+        parse_sql_statement(
+            "SELECT s.app_name, SUM(o.revenue) FROM orders o "
+            "JOIN sessions s ON o.x = s.y GROUP BY s.app_name",
+            catalog=catalog,
+            strict=True,
+        )
+
 
 # ---------------------------------------------------------------------------
 # Basic SELECT
@@ -136,8 +199,7 @@ def test_having_over_aggregate_becomes_measure_filter(catalog: dict) -> None:
     )
     q = out.query
     assert any(
-        f.dimension == "orders.revenue" and f.op == "gt" and f.values == [1000]
-        for f in q.having
+        f.dimension == "orders.revenue" and f.op == "gt" and f.values == [1000] for f in q.having
     ), q.having
 
 

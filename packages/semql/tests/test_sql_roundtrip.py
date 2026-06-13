@@ -22,17 +22,19 @@ deliberately deferred here as too slow; the SQL snapshot is the contract.)
 from __future__ import annotations
 
 import pytest
-from semql import Catalog, Cube, Dialect, Dimension, Measure, TimeDimension
+from semql import Catalog, Cube, Dialect, Dimension, Join, Measure, TimeDimension
 from semql.parse import parse_sql_statement
 from syrupy.assertion import SnapshotAssertion
 
 
 def _catalog() -> Catalog:
-    """A small single-cube catalog the fixtures are written against.
+    """The catalog the fixtures are written against.
 
-    Single cube keeps the semantic SQL unambiguous (the parser is
-    single-cube today); grow this — or add cubes + joins — as the
-    parser's surface grows.
+    ``orders`` (the many side) joins to ``customers`` (the one side) so
+    a Malloy-style ``FROM orders o JOIN customers c`` query can be
+    authored — the parser uses the JOIN only to learn which cubes
+    participate; the compiler derives the actual join from this catalog
+    definition (the SQL ON clause is not read).
     """
     orders = Cube(
         name="orders",
@@ -55,8 +57,19 @@ def _catalog() -> Catalog:
                 granularities=("day", "week", "month"),
             ),
         ],
+        joins=[Join(to="customers", relationship="many_to_one", on="{o}.customer_id = {c}.id")],
     )
-    return Catalog([orders])
+    customers = Cube(
+        name="customers",
+        dialect=Dialect.POSTGRES,
+        table="{schema}.customers",
+        alias="c",
+        dimensions=[
+            Dimension(name="name", sql="{c}.name", type="string"),
+            Dimension(name="tier", sql="{c}.tier", type="string"),
+        ],
+    )
+    return Catalog([orders, customers])
 
 
 CATALOG = _catalog()
@@ -86,6 +99,13 @@ CASES: list[str] = [
     "SELECT region, SUM(revenue) AS rev FROM orders GROUP BY region HAVING SUM(revenue) > 1000",
     "SELECT region, SUM(revenue) FROM orders GROUP BY region LIMIT 10",
     "SELECT region, SUM(revenue) FROM orders GROUP BY region LIMIT 10 OFFSET 20",
+    # --- Malloy-style JOIN: aggregate the many side (orders) by a
+    #     dimension on the one side (customers). The ON clause is
+    #     ignored; the compiler derives the join from the catalog. ---
+    "SELECT c.name, SUM(o.revenue) AS rev FROM orders o"
+    " JOIN customers c ON o.customer_id = c.id GROUP BY c.name ORDER BY rev DESC",
+    "SELECT c.tier, COUNT(*) AS n FROM orders o"
+    " JOIN customers c ON o.customer_id = c.id WHERE o.status = 'paid' GROUP BY c.tier",
 ]
 
 

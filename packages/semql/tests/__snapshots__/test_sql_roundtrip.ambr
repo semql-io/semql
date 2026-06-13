@@ -2,6 +2,12 @@
 # name: test_sql_fixture_compiles_to_snapshot[SELECT COUNT(*) FROM orders]
   'SELECT COUNT(*) AS count FROM prod.orders AS o WHERE o.deleted_at IS NULL'
 # ---
+# name: test_sql_fixture_compiles_to_snapshot[SELECT c.name, SUM(o.revenue) AS rev FROM orders o JOIN customers c ON o.customer_id = c.id GROUP BY c.name ORDER BY rev DESC]
+  'SELECT c.name AS name, SUM(o.amount) AS rev FROM prod.orders AS o INNER JOIN prod.customers AS c ON o.customer_id = c.id WHERE o.deleted_at IS NULL GROUP BY name ORDER BY rev DESC NULLS LAST'
+# ---
+# name: test_sql_fixture_compiles_to_snapshot[SELECT c.tier, COUNT(*) AS n FROM orders o JOIN customers c ON o.customer_id = c.id WHERE o.status = 'paid' GROUP BY c.tier]
+  'SELECT c.tier AS tier, COUNT(*) AS n FROM prod.orders AS o INNER JOIN prod.customers AS c ON o.customer_id = c.id WHERE o.deleted_at IS NULL AND o.status = %(p0)s GROUP BY tier'
+# ---
 # name: test_sql_fixture_compiles_to_snapshot[SELECT region, COUNT(*) AS n FROM orders GROUP BY region ORDER BY n DESC]
   'SELECT o.region AS region, COUNT(*) AS n FROM prod.orders AS o WHERE o.deleted_at IS NULL GROUP BY region ORDER BY n DESC NULLS LAST'
 # ---

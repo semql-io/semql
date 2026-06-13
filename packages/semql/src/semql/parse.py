@@ -24,10 +24,40 @@ The parser is intentionally narrow — it handles the well-trodden
 SQL shapes an LLM emits (``SELECT cols FROM cube WHERE ...``),
 not the full SQL grammar. Anything outside the supported set lands
 in ``parse_errors`` with a clear message.
+
+Multi-cube JOINs — the Malloy-style contract
+---------------------------------------------
+A ``JOIN`` in this SQL is a *semantic directive*, not a row-level
+join. It declares which cubes a query touches; the **catalog** is the
+single source of truth for how those cubes relate. Concretely:
+
+- The SQL ``ON`` clause is **not read**. The compiler derives the
+  actual join from ``Cube.joins`` (identifier resolution → join-graph
+  BFS), exactly as it does for a hand-built ``SemanticQuery`` that
+  simply references fields from two cubes. We only verify the catalog
+  *does* relate the cubes (``_cubes_joinable``) and refuse otherwise —
+  the parser never invents a join the catalog doesn't declare.
+- Table aliases resolve columns to cubes: ``FROM orders o JOIN
+  customers c`` makes ``o.revenue`` → ``orders.revenue`` and ``c.name``
+  → ``customers.name``. An unqualified column resolves to the one cube
+  that declares it, or is rejected as ambiguous.
+
+Why ``ON`` is ignored, and the caveat: a flat ``a JOIN b`` executed
+literally fans out — summing a measure across a one-to-many join
+multiplies it by the match count. Semantic layers (Malloy, Cube,
+LookML) avoid this by treating the join as a modelled relationship and
+aggregating safely, *not* by trusting the query's literal join. SemQL
+follows that model: the literal SQL semantics of a flat JOIN are NOT
+preserved — the catalog's relationship + the compiler's fan-out guard
+(``_check_fan_out``) define the meaning. If you want literal fidelity,
+the equivalent faithful SQL is aggregate-then-join on the conformed
+key (two grouped subqueries joined on the shared dimension), which is
+also what a cross-backend ``FederatedPlan`` emits.
 """
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any, Literal, cast
 
@@ -161,19 +191,6 @@ def _literal_value(node: exp.Expression) -> str | int | float | bool | None:
     return str(node.sql())
 
 
-def _cube_from_select(ast: exp.Select, catalog: dict[str, Cube] | None) -> str | None:
-    """Pick the cube name from the FROM clause. Single-cube only."""
-    # sqlglot's key is ``from_`` (trailing underscore — ``from`` is
-    # a Python reserved word).
-    from_clause = ast.args.get("from_")
-    if from_clause is None:
-        return None
-    table = from_clause.this
-    if not isinstance(table, exp.Table):
-        return None
-    return table.name
-
-
 def _agg_func_name(func: exp.Expression) -> str | None:
     """Return the uppercase function name if ``func`` is an aggregate."""
     if isinstance(func, exp.Anonymous):
@@ -191,21 +208,35 @@ def _agg_func_name(func: exp.Expression) -> str | None:
     return None
 
 
-def _count_measure_name(catalog: dict[str, Cube] | None, cube_name: str | None) -> str:
-    """Resolve ``COUNT(*)`` to the cube's count measure.
+def _count_measure_ref(catalog: dict[str, Cube] | None, ctx: ResolveCtx) -> str | None:
+    """Resolve ``COUNT(*)`` to a qualified count-measure ref.
 
     A ``COUNT(*)`` projection has no inner column, so it can't be matched
-    by name like ``SUM(amount)``. Find the measure declared as a row
-    count (``agg="count"``, ``sql="*"``) and use its name. Fall back to
-    the conventional ``"count"`` when uncatalogued or unmatched — the
-    post-parse validation pass surfaces it if no such field exists."""
-    if catalog is not None and cube_name is not None:
-        cube = catalog.get(cube_name)
-        if cube is not None:
+    by name like ``SUM(amount)``. Find the cube measure declared as a row
+    count (``agg="count"``, ``sql="*"``) among the query's cubes:
+
+    - exactly one participating cube declares one → use it;
+    - more than one (a JOIN where both sides count) → ambiguous, return
+      ``None`` so the caller surfaces it rather than guessing a grain;
+    - none found / uncatalogued → fall back to ``<cube>.count`` for the
+      single-cube case (the validation pass flags it if absent)."""
+    if catalog is not None:
+        owners: list[str] = []
+        for name in ctx.cubes:
+            cube = catalog.get(name)
+            if cube is None:
+                continue
             for m in cube.measures:
                 if m.agg == "count" and m.sql.strip() == "*":
-                    return m.name
-    return "count"
+                    owners.append(f"{name}.{m.name}")
+                    break
+        if len(owners) == 1:
+            return owners[0]
+        if len(owners) > 1:
+            return None  # ambiguous across joined cubes
+    if ctx.default_cube is not None:
+        return f"{ctx.default_cube}.count"
+    return None
 
 
 def _inside_subquery(node: exp.Expression, root: exp.Expression) -> bool:
@@ -240,6 +271,112 @@ def _collect_aggregates(expr: exp.Expression) -> list[exp.AggFunc | exp.Anonymou
             if name in _AGG_FUNCS and not _inside_subquery(node, expr):
                 out.append(node)
     return out
+
+
+def _cube_has_field(cube: Cube | None, name: str) -> bool:
+    if cube is None:
+        return False
+    return any(
+        f.name == name
+        for f in (*cube.measures, *cube.dimensions, *cube.time_dimensions, *cube.segments)
+    )
+
+
+@dataclass(frozen=True)
+class ResolveCtx:
+    """Resolves SQL column references to qualified ``cube.field`` refs.
+
+    A query's FROM / JOIN tables map table aliases — and bare cube names
+    — to cube names. ``resolve`` turns a column node into a qualified
+    ref three ways, in order:
+
+    1. by its table qualifier — ``o.region`` → ``orders.region``;
+    2. when unqualified and the query touches a single cube, by that
+       cube — ``region`` → ``orders.region``;
+    3. when unqualified in a multi-cube query, by the *one* cube that
+       declares the field. If two cubes declare it, it's ambiguous and
+       resolves to ``None`` (the caller surfaces it).
+
+    With no cube context at all (no FROM, no catalog), the bare name is
+    returned unchanged — an uncatalogued best-effort parse.
+    """
+
+    alias_to_cube: dict[str, str]
+    cubes: tuple[str, ...]
+    catalog: dict[str, Cube] | None
+
+    @property
+    def default_cube(self) -> str | None:
+        return self.cubes[0] if len(self.cubes) == 1 else None
+
+    def resolve(self, col: exp.Expression) -> str | None:
+        name = _column_name(col)
+        if name is None:
+            return None
+        qualifier = col.table if isinstance(col, exp.Column) else ""
+        if qualifier:
+            cube = self.alias_to_cube.get(qualifier, qualifier)
+            return f"{cube}.{name}"
+        if self.default_cube is not None:
+            return f"{self.default_cube}.{name}"
+        if self.catalog is not None and self.cubes:
+            owners = [c for c in self.cubes if _cube_has_field(self.catalog.get(c), name)]
+            if len(owners) == 1:
+                return f"{owners[0]}.{name}"
+            return None  # multi-cube ambiguous (or unknown) — caller surfaces it
+        if not self.cubes:
+            return name  # uncatalogued / no FROM — bare best-effort
+        return None
+
+
+def _build_resolve_ctx(ast: exp.Select, catalog: dict[str, Cube] | None) -> ResolveCtx:
+    """Map FROM / JOIN table aliases (and cube names) to cube names."""
+    alias_to_cube: dict[str, str] = {}
+    cubes: list[str] = []
+    tables: list[exp.Table] = []
+    from_node = ast.find(exp.From)
+    if from_node is not None:
+        tables.extend(from_node.find_all(exp.Table))
+    for join in ast.args.get("joins") or []:
+        tables.extend(join.find_all(exp.Table))
+    for t in tables:
+        cube = t.name
+        if not cube:
+            continue
+        if cube not in cubes:
+            cubes.append(cube)
+        alias_to_cube[cube] = cube
+        if t.alias:
+            alias_to_cube[t.alias] = cube
+    return ResolveCtx(alias_to_cube=alias_to_cube, cubes=tuple(cubes), catalog=catalog)
+
+
+def _cubes_joinable(catalog: dict[str, Cube], cubes: Sequence[str]) -> bool:
+    """True if every named cube sits in one connected component of the
+    catalog's (undirected) join graph.
+
+    The JOIN keyword in semantic SQL declares *participation*, not a row
+    predicate — the catalog is the source of truth for how cubes relate.
+    So we don't honour the SQL ``ON`` clause; we only verify the catalog
+    actually relates the cubes, and refuse if it doesn't (rather than
+    invent a join)."""
+    present = [c for c in cubes if c in catalog]
+    if len(present) <= 1:
+        return True
+    adj: dict[str, set[str]] = {}
+    for name, cube in catalog.items():
+        for j in cube.joins:
+            adj.setdefault(name, set()).add(j.to)
+            adj.setdefault(j.to, set()).add(name)
+    seen = {present[0]}
+    stack = [present[0]]
+    while stack:
+        cur = stack.pop()
+        for nb in adj.get(cur, ()):
+            if nb not in seen:
+                seen.add(nb)
+                stack.append(nb)
+    return all(c in seen for c in present)
 
 
 # ---------------------------------------------------------------------------
@@ -295,19 +432,33 @@ def parse_sql_statement(
             resolved_references=resolved_refs,
         )
 
-    cube_name = _cube_from_select(ast, catalog)
-    if cube_name is None and catalog:
+    ctx = _build_resolve_ctx(ast, catalog)
+    if not ctx.cubes and catalog:
         msg = "Could not determine cube name from FROM clause."
         if strict:
             raise ParseError(msg)
         errors.append(msg)
 
-    if cube_name is not None and catalog is not None and cube_name not in catalog:
-        msg = f"Unknown cube: {cube_name!r}. Known cubes: {sorted(catalog)}."
-        if strict:
-            raise ParseError(msg)
-        errors.append(msg)
-        # Continue — best-effort parse with the bare cube name.
+    if catalog is not None:
+        for cube in ctx.cubes:
+            if cube not in catalog:
+                msg = f"Unknown cube: {cube!r}. Known cubes: {sorted(catalog)}."
+                if strict:
+                    raise ParseError(msg)
+                errors.append(msg)
+        # Malloy-style: a JOIN declares which cubes participate; the
+        # catalog is the source of truth for how they relate. We do not
+        # read the SQL ``ON`` clause — we only require the catalog to
+        # actually connect the cubes, and refuse rather than invent a join.
+        if not _cubes_joinable(catalog, ctx.cubes):
+            msg = (
+                f"Cubes {sorted(ctx.cubes)!r} are not related in the catalog: "
+                "no join path connects them. Add a catalog join or query them "
+                "separately — the SQL JOIN's ON clause is not used to invent one."
+            )
+            if strict:
+                raise ParseError(msg)
+            errors.append(msg)
 
     measures: list[str] = []
     dimensions: list[str] = []
@@ -352,46 +503,49 @@ def parse_sql_statement(
             single = len(agg_nodes) == 1
             for agg in agg_nodes:
                 inner = agg.this if hasattr(agg, "this") else None
-                field_name = _column_name(inner) if inner is not None else None
-                if field_name is None and isinstance(agg, exp.Count):
-                    # COUNT(*) → the cube's row-count measure.
-                    field_name = _count_measure_name(catalog, cube_name)
-                if field_name:
-                    # Emit a qualified ``cube.field`` ref — the form the
-                    # compiler requires (bare refs raise a resolution error).
-                    ref = f"{cube_name}.{field_name}" if cube_name else field_name
-                    if cube_name:
-                        resolved_refs[field_name] = ref
+                # Resolve to a qualified ``cube.field`` ref — the form the
+                # compiler requires (bare refs raise a resolution error).
+                ref = ctx.resolve(inner) if inner is not None else None
+                if ref is None and isinstance(agg, exp.Count):
+                    # COUNT(*) → the row-count measure of the participating cube.
+                    ref = _count_measure_ref(catalog, ctx)
+                if ref:
+                    field_name = ref.rsplit(".", 1)[-1]
+                    resolved_refs[field_name] = ref
                     if ref not in measures:
                         measures.append(ref)
-                    if single and output_alias and output_alias != field_name and cube_name:
+                    if single and output_alias and output_alias != field_name:
                         aliases[output_alias] = ref
         else:
             # Plain column — dimension.
-            field_name = _column_name(expr)
-            if field_name:
-                ref = f"{cube_name}.{field_name}" if cube_name else field_name
-                if cube_name:
-                    resolved_refs[field_name] = ref
+            ref = ctx.resolve(expr)
+            if ref:
+                field_name = ref.rsplit(".", 1)[-1]
+                resolved_refs[field_name] = ref
                 if ref not in dimensions:
                     dimensions.append(ref)
-                if output_alias and output_alias != field_name and cube_name:
+                if output_alias and output_alias != field_name:
                     aliases[output_alias] = ref
+            elif _column_name(expr) is not None and ctx.cubes:
+                errors.append(
+                    f"Ambiguous or unknown column {_column_name(expr)!r} in SELECT: "
+                    "qualify it as cube.field."
+                )
 
     # --- WHERE / HAVING / GROUP BY / ORDER BY / LIMIT / OFFSET ---
     where_tree = ast.args.get("where")
     if where_tree is not None:
-        time_dim, filters, where = _parse_where(where_tree, cube_name, resolved_refs)
+        time_dim, filters, where = _parse_where(where_tree, ctx, resolved_refs)
 
     having_node = ast.args.get("having")
     if having_node is not None:
-        having = _parse_having(having_node, cube_name, resolved_refs)
+        having = _parse_having(having_node, ctx, resolved_refs)
 
     order_node = ast.args.get("order")
     if order_node is not None:
         # sqlglot stores the order clauses as a list of ``Ordered``
         # nodes on ``order_node.expressions``.
-        order = _parse_order(order_node, cube_name, resolved_refs, set(aliases))
+        order = _parse_order(order_node, ctx, resolved_refs, set(aliases))
 
     limit_node = ast.args.get("limit")
     if limit_node is not None:
@@ -416,17 +570,15 @@ def parse_sql_statement(
         compare = compare_node
 
     # --- Catalog validation pass (post-parse) ---
-    if catalog is not None and cube_name is not None:
+    if catalog is not None and ctx.cubes:
         _validate_refs(
             catalog=catalog,
-            cube_name=cube_name,
             measures=measures,
             dimensions=dimensions,
             filters=filters,
+            having=having,
             time_dim=time_dim,
             errors=errors,
-            warnings=warnings,
-            strict=strict,
         )
 
     query = SemanticQuery(
@@ -473,7 +625,7 @@ def _column_name(node: exp.Expression) -> str | None:
 
 def _parse_where(
     where_tree: exp.Where,
-    cube_name: str | None,
+    ctx: ResolveCtx,
     resolved: dict[str, str],
 ) -> tuple[TimeWindow | None, list[Filter], BoolExpr | None]:
     """Split a WHERE clause into time-window, flat filters, and a where-tree.
@@ -489,7 +641,7 @@ def _parse_where(
 
     if isinstance(predicate, exp.And):
         for child in _bool_children(predicate):
-            td, fs, wt = _classify_predicate(child, cube_name, resolved)
+            td, fs, wt = _classify_predicate(child, ctx, resolved)
             if td is not None:
                 time_dim = td
             if wt is not None:
@@ -498,44 +650,40 @@ def _parse_where(
             flat.extend(fs)
         return time_dim, flat, tree
 
-    td, fs, wt = _classify_predicate(predicate, cube_name, resolved)
+    td, fs, wt = _classify_predicate(predicate, ctx, resolved)
     return td, fs, wt
 
 
 def _classify_predicate(
     pred: exp.Expression,
-    cube_name: str | None,
+    ctx: ResolveCtx,
     resolved: dict[str, str],
 ) -> tuple[TimeWindow | None, list[Filter], BoolExpr | None]:
     """Classify one predicate: time-window, flat filter, or where-tree node."""
     if isinstance(pred, exp.Between):
         # ``dim BETWEEN low AND high`` → TimeWindow.
-        dim = _column_name(pred.this)
-        if dim is None:
+        ref = ctx.resolve(pred.this)
+        if ref is None:
             return None, [], None
         low = _literal_value(pred.args["low"])
         high = _literal_value(pred.args["high"])
-        if cube_name:
-            resolved[dim] = f"{cube_name}.{dim}"
-        td = TimeWindow(
-            dimension=f"{cube_name}.{dim}" if cube_name else dim,
-            range=(str(low), str(high)),
-        )
+        resolved[ref.rsplit(".", 1)[-1]] = ref
+        td = TimeWindow(dimension=ref, range=(str(low), str(high)))
         return td, [], None
     if isinstance(pred, exp.Paren):
         # Strip parens, recurse.
-        return _classify_predicate(pred.this, cube_name, resolved)
+        return _classify_predicate(pred.this, ctx, resolved)
     if isinstance(pred, (exp.Or, exp.And)):
         if isinstance(pred, exp.Or):
             # An OR anywhere in the WHERE becomes a where-tree.
-            return None, [], _build_bool_tree(pred, cube_name, resolved)
+            return None, [], _build_bool_tree(pred, ctx, resolved)
         # AND of mixed predicates — recurse and assemble.
         flat: list[Filter] = []
         tree: BoolExpr | None = None
         time_dim: TimeWindow | None = None
         for c in _bool_children(pred):
             time_dim, tree, flat = _merge_classified(
-                time_dim, tree, flat, _classify_predicate(c, cube_name, resolved)
+                time_dim, tree, flat, _classify_predicate(c, ctx, resolved)
             )
         return time_dim, flat, tree
     # Plain comparison.
@@ -543,13 +691,13 @@ def _classify_predicate(
     if isinstance(
         op_node, (exp.EQ, exp.NEQ, exp.GT, exp.GTE, exp.LT, exp.LTE, exp.In, exp.Like, exp.Is)
     ):
-        return _comparison_to_filter(op_node, cube_name, resolved)
+        return _comparison_to_filter(op_node, ctx, resolved)
     return None, [], None
 
 
 def _comparison_to_filter(
     op_node: exp.Expression,
-    cube_name: str | None,
+    ctx: ResolveCtx,
     resolved: dict[str, str],
 ) -> tuple[TimeWindow | None, list[Filter], BoolExpr | None]:
     """Convert a comparison node to a Filter (or zero filters)."""
@@ -576,12 +724,10 @@ def _comparison_to_filter(
     # otherwise the predicate has no column name and is dropped.
     if isinstance(col_node, (exp.Sum, exp.Count, exp.Avg, exp.Min, exp.Max, exp.Anonymous)):
         col_node = col_node.this
-    dim = _column_name(col_node)
+    dim = ctx.resolve(col_node)
     if dim is None:
         return None, [], None
-    if cube_name:
-        resolved[dim] = f"{cube_name}.{dim}"
-        dim = f"{cube_name}.{dim}"
+    resolved[dim.rsplit(".", 1)[-1]] = dim
     if op_str is None:
         return None, [], None
     return (
@@ -626,7 +772,7 @@ def _bool_children(pred: exp.Expression) -> list[exp.Expression]:
 
 def _build_bool_tree(
     pred: exp.Expression,
-    cube_name: str | None,
+    ctx: ResolveCtx,
     resolved: dict[str, str],
 ) -> BoolExpr:
     """Build a BoolExpr from a sqlglot OR / AND subtree."""
@@ -641,9 +787,9 @@ def _build_bool_tree(
     children: list[BoolExpr | Filter] = []
     for c in _bool_children(pred):
         if isinstance(c, (exp.Or, exp.And)):
-            children.append(_build_bool_tree(c, cube_name, resolved))
+            children.append(_build_bool_tree(c, ctx, resolved))
         else:
-            _, fs, _ = _classify_predicate(c, cube_name, resolved)
+            _, fs, _ = _classify_predicate(c, ctx, resolved)
             if fs:
                 children.extend(fs)
     if len(children) < 2:
@@ -694,24 +840,24 @@ def _merge_where_tree(
 
 def _parse_having(
     having_node: exp.Having,
-    cube_name: str | None,
+    ctx: ResolveCtx,
     resolved: dict[str, str],
 ) -> list[Filter]:
     out: list[Filter] = []
     pred = having_node.this
     if isinstance(pred, (exp.And, exp.Or)):
         for c in _bool_children(pred):
-            _, fs, _ = _classify_predicate(c, cube_name, resolved)
+            _, fs, _ = _classify_predicate(c, ctx, resolved)
             out.extend(fs)
     else:
-        _, fs, _ = _classify_predicate(pred, cube_name, resolved)
+        _, fs, _ = _classify_predicate(pred, ctx, resolved)
         out.extend(fs)
     return out
 
 
 def _parse_order(
     order_node: exp.Order,
-    cube_name: str | None,
+    ctx: ResolveCtx,
     resolved: dict[str, str],
     alias_keys: set[str],
 ) -> list[tuple[str, Literal["asc", "desc"]]]:
@@ -722,26 +868,24 @@ def _parse_order(
         col = o.this
         direction: Literal["asc", "desc"] = "desc" if o.args.get("desc") else "asc"
         if isinstance(col, exp.Column):
-            name = col.name
-            if name in alias_keys:
+            if col.name in alias_keys and not col.table:
                 # ORDER BY a SELECT alias — emit the bare alias key; the
                 # compiler resolves it against the output columns. Do NOT
                 # qualify it (``orders.rev``) — that field doesn't exist.
-                out.append((name, direction))
-            elif cube_name:
-                resolved[name] = f"{cube_name}.{name}"
-                out.append((f"{cube_name}.{name}", direction))
-            else:
-                out.append((name, direction))
+                out.append((col.name, direction))
+                continue
+            ref = ctx.resolve(col)
+            if ref is not None:
+                resolved[ref.rsplit(".", 1)[-1]] = ref
+                out.append((ref, direction))
         elif isinstance(col, (exp.Anonymous, exp.Sum, exp.Count, exp.Avg, exp.Min, exp.Max)):
             # ORDER BY SUM(amount) DESC — strip the aggregate wrapper
-            # and use the inner column name.
+            # and resolve the inner column to its measure ref.
             inner = getattr(col, "this", None)
-            if isinstance(inner, exp.Column):
-                name = inner.name
-                if cube_name:
-                    resolved[name] = f"{cube_name}.{name}"
-                    out.append((f"{cube_name}.{name}", direction))
+            ref = ctx.resolve(inner) if inner is not None else None
+            if ref is not None:
+                resolved[ref.rsplit(".", 1)[-1]] = ref
+                out.append((ref, direction))
     return out
 
 
@@ -767,44 +911,39 @@ def _extract_compare(ast: exp.Select) -> CompareWindow | None:
 
 def _validate_refs(
     catalog: dict[str, Cube],
-    cube_name: str,
     measures: list[str],
     dimensions: list[str],
     filters: list[Filter],
+    having: list[Filter],
     time_dim: TimeWindow | None,
     errors: list[str],
-    warnings: list[str],
-    strict: bool,
 ) -> None:
-    """Check that every referenced field exists on the catalog's cube.
+    """Check that every referenced ``cube.field`` exists on its cube.
 
-    Failures in strict mode raise; in lenient mode they go on
-    ``errors`` and the caller decides.
-    """
-    cube = catalog.get(cube_name)
-    if cube is None:
-        return  # Already flagged in the FROM pass.
-    declared = {
-        f.name for f in (*cube.measures, *cube.dimensions, *cube.time_dimensions, *cube.segments)
-    }
-    # Measures / dimensions are qualified ``cube.field`` refs — strip the
-    # cube prefix to compare against the cube's declared field names.
+    Refs are qualified, so each is validated against the cube it names —
+    correct for multi-cube JOIN queries, not just single-cube ones.
+    Unqualified refs (uncatalogued best-effort) are skipped."""
+
+    def check(ref: str, clause: str) -> None:
+        if "." not in ref:
+            return
+        cube_name, _, field = ref.rpartition(".")
+        cube = catalog.get(cube_name)
+        if cube is None:
+            return  # unknown cube already flagged in the FROM pass
+        if not _cube_has_field(cube, field):
+            errors.append(f"Unknown field {ref!r} in {clause}.")
+
     for m in measures:
-        bare = m.rsplit(".", 1)[-1]
-        if bare not in declared:
-            errors.append(f"Unknown field {m!r} in SELECT.")
+        check(m, "SELECT")
     for d in dimensions:
-        bare = d.rsplit(".", 1)[-1]
-        if bare not in declared:
-            errors.append(f"Unknown field {d!r} in SELECT.")
+        check(d, "SELECT")
     for f in filters:
-        bare = f.dimension.rsplit(".", 1)[-1]
-        if bare not in declared:
-            errors.append(f"Unknown field {f.dimension!r} in WHERE.")
+        check(f.dimension, "WHERE")
+    for h in having:
+        check(h.dimension, "HAVING")
     if time_dim is not None:
-        bare = time_dim.dimension.rsplit(".", 1)[-1]
-        if bare not in declared:
-            errors.append(f"Unknown field {time_dim.dimension!r} in WHERE (BETWEEN).")
+        check(time_dim.dimension, "WHERE (BETWEEN)")
 
 
 __all__ = ["ParserDecision", "ParseError", "parse_sql_statement"]
