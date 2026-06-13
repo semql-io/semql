@@ -1,3 +1,4 @@
+# pyright: reportPrivateImportUsage=false
 """Cross-source compilation: emit per-backend fragments + a DuckDB
 merge plan when a query's touched cubes span backends.
 
@@ -34,9 +35,12 @@ type is preferred whenever federation isn't needed.
 from __future__ import annotations
 
 import re
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from dataclasses import field as dc_field
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Literal, Protocol
+
+from sqlglot import exp
 
 from semql.cnf import to_cnf as core_to_cnf
 from semql.compile import ColumnMeta, CompiledQuery, compile_query
@@ -615,119 +619,36 @@ def _scoped_catalog(partition_cubes: list[Cube]) -> dict[str, Cube]:
 # ---------------------------------------------------------------------------
 
 
-def _quote_ident(name: str) -> str:
-    """DuckDB identifier quoting. Cube/dimension names already match
-    ``[a-z_][a-z0-9_]*`` so quoting is conservative-but-safe."""
-    return f'"{name}"'
+class _MergePartition(Protocol):
+    """The slice of a partition plan the merge assembler reads — shared by
+    the distributive and raw-rows plans so one assembler serves both."""
+
+    dialect: Dialect
+    cubes: list[Cube]
+    dim_columns: dict[str, str]
+    bridge_columns: dict[str, str]
 
 
-def _emit_merge_sql(
-    q: SemanticQuery,
-    catalog: dict[str, Cube],
-    primary_partition: Dialect,
-    partitions: list[_PartitionPlan],
+# A mode-specific SELECT contribution: the value expression plus the
+# MeasureOutput / (alias, source) metadata the MergeSpec records.
+_MeasureSelect = tuple[exp.Expression, MeasureOutput]
+_TimeSelect = tuple[exp.Expression, str, FragmentColumn]
+
+
+def _build_merge_joins(
+    partitions: Sequence[_MergePartition],
     bridges: list[_Bridge],
-    output_columns: list[str],
-    output_column_meta: list[ColumnMeta],
-    *,
-    cross_partition_clauses: _Cnf | None = None,
-) -> tuple[str, MergeSpec, dict[str, object]]:
-    """Generate the DuckDB merge SQL.
+    primary_idx: int,
+) -> tuple[list[tuple[int, int, str, str]], list[BridgeJoin]]:
+    """Resolve the bridge graph into an ordered list of LEFT JOINs.
 
-    Frags are aliased ``f0``, ``f1``, ... matching the partitions order.
-    The primary fragment is the FROM target; every other fragment
-    LEFT JOINs onto it via the appropriate bridge.
-
-    Returns ``(sql, spec, params)`` — the params map carries any
-    cross-partition filter values, bound as ``$name`` placeholders
-    rather than inlined as literals.
+    Returns ``(join_specs, bridge_joins)`` where each join spec is
+    ``(new_idx, host_idx, host_col, new_col)`` — the fragment being
+    joined in, the already-joined host, and the bridge key columns on
+    each side. Raises if the partitions don't form a connected graph.
     """
-    binder = _MergeBinder()
-    # Index the partitions by backend for join-key lookup.
-    by_dialect: dict[Dialect, tuple[int, _PartitionPlan]] = {
-        p.dialect: (i, p) for i, p in enumerate(partitions)
-    }
-    primary_idx, _primary_plan = by_dialect[primary_partition]
-
-    def frag_alias(idx: int) -> str:
-        return f"f{idx}"
-
-    # Map cube → fragment index, so we know which alias to reference
-    # for any (cube.field) ref in the final SELECT.
-    cube_to_idx: dict[str, int] = {}
-    for i, p in enumerate(partitions):
-        for c in p.cubes:
-            cube_to_idx[c.name] = i
-
-    # SELECT list — one expression per output column the user asked for.
-    select_exprs: list[str] = []
-    dimension_outputs: list[DimensionOutput] = []
-    for ref in q.dimensions:
-        owner = _resolve_field_to_cube(ref, catalog)
-        idx = cube_to_idx[owner.name]
-        plan = partitions[idx]
-        col = plan.dim_columns[ref]
-        alias = ref.rsplit(".", 1)[1]
-        select_exprs.append(f"{frag_alias(idx)}.{_quote_ident(col)} AS {_quote_ident(alias)}")
-        # In v1 distributive, a dimension always comes from exactly one source.
-        meta = next(m for m in output_column_meta if m.name == alias)
-        dimension_outputs.append(
-            DimensionOutput(output_name=alias, sources=[FragmentColumn(idx, col)], column_meta=meta)
-        )
-
-    if q.time_dimension is not None:
-        td_cube = _resolve_field_to_cube(q.time_dimension.dimension, catalog)
-        idx = cube_to_idx[td_cube.name]
-        plan = partitions[idx]
-        td_col = plan.dim_columns[q.time_dimension.dimension]
-        td_alias = td_col
-        select_exprs.append(f"{frag_alias(idx)}.{_quote_ident(td_col)} AS {_quote_ident(td_alias)}")
-        meta = next(m for m in output_column_meta if m.name == td_alias)
-        dimension_outputs.append(
-            DimensionOutput(
-                output_name=td_alias, sources=[FragmentColumn(idx, td_col)], column_meta=meta
-            )
-        )
-
-    # Measures (re-aggregation).
-    measure_outputs: list[MeasureOutput] = []
-    for ref in q.measures:
-        owner = _resolve_field_to_cube(ref, catalog)
-        idx = cube_to_idx[owner.name]
-        plan = partitions[idx]
-        m_name = ref.rsplit(".", 1)[1]
-        meta = next(m for m in output_column_meta if m.name == m_name)
-        if ref in plan.avg_columns:
-            sum_col, count_col = plan.avg_columns[ref]
-            expr = (
-                f"SUM({frag_alias(idx)}.{_quote_ident(sum_col)}) / "
-                f"NULLIF(SUM({frag_alias(idx)}.{_quote_ident(count_col)}), 0)"
-            )
-            measure_outputs.append(
-                MeasureOutput(
-                    output_name=m_name,
-                    merge_agg="avg_recomposed",
-                    sum_source=FragmentColumn(idx, sum_col),
-                    count_source=FragmentColumn(idx, count_col),
-                    column_meta=meta,
-                )
-            )
-        else:
-            col = plan.measure_columns[ref]
-            expr = f"SUM({frag_alias(idx)}.{_quote_ident(col)})"
-            measure_outputs.append(
-                MeasureOutput(
-                    output_name=m_name,
-                    merge_agg="sum",  # both sum and count reduce to SUM at merge
-                    source=FragmentColumn(idx, col),
-                    column_meta=meta,
-                )
-            )
-        select_exprs.append(f"{expr} AS {_quote_ident(m_name)}")
-
-    # FROM + JOINs.
-    from_clause = f"frag_{primary_idx} AS {frag_alias(primary_idx)}"
-    joins_sql: list[str] = []
+    cube_to_idx = {c.name: i for i, p in enumerate(partitions) for c in p.cubes}
+    join_specs: list[tuple[int, int, str, str]] = []
     bridge_joins: list[BridgeJoin] = []
     joined: set[int] = {primary_idx}
     pending = list(bridges)
@@ -735,41 +656,28 @@ def _emit_merge_sql(
         progress = False
         remaining: list[_Bridge] = []
         for b in pending:
-            left_idx = cube_to_idx[b.left_cube.name]
-            right_idx = cube_to_idx[b.right_cube.name]
+            left_idx, right_idx = cube_to_idx[b.left_cube.name], cube_to_idx[b.right_cube.name]
             if left_idx in joined and right_idx not in joined:
-                new_idx = right_idx
-                left_alias = frag_alias(left_idx)
-                right_alias = frag_alias(new_idx)
-                left_col = partitions[left_idx].bridge_columns[f"{b.left_cube.name}.{b.left_dim}"]
-                right_col = partitions[new_idx].bridge_columns[f"{b.right_cube.name}.{b.right_dim}"]
-                bridge_joins.append(
-                    BridgeJoin(
-                        left=FragmentColumn(left_idx, left_col),
-                        right=FragmentColumn(new_idx, right_col),
-                    )
-                )
+                new_idx, host_idx = right_idx, left_idx
             elif right_idx in joined and left_idx not in joined:
-                new_idx = left_idx
-                left_alias = frag_alias(right_idx)
-                right_alias = frag_alias(new_idx)
-                left_col = partitions[right_idx].bridge_columns[
-                    f"{b.right_cube.name}.{b.right_dim}"
-                ]
-                right_col = partitions[new_idx].bridge_columns[f"{b.left_cube.name}.{b.left_dim}"]
-                bridge_joins.append(
-                    BridgeJoin(
-                        left=FragmentColumn(right_idx, left_col),
-                        right=FragmentColumn(new_idx, right_col),
-                    )
-                )
+                new_idx, host_idx = left_idx, right_idx
             else:
                 remaining.append(b)
                 continue
-            joins_sql.append(
-                f"LEFT JOIN frag_{new_idx} AS {right_alias} "
-                f"ON {left_alias}.{_quote_ident(left_col)} = "
-                f"{right_alias}.{_quote_ident(right_col)}"
+            if host_idx == cube_to_idx[b.left_cube.name]:
+                h_cube, h_dim = b.left_cube.name, b.left_dim
+                n_cube, n_dim = b.right_cube.name, b.right_dim
+            else:
+                h_cube, h_dim = b.right_cube.name, b.right_dim
+                n_cube, n_dim = b.left_cube.name, b.left_dim
+            host_col = partitions[host_idx].bridge_columns[f"{h_cube}.{h_dim}"]
+            new_col = partitions[new_idx].bridge_columns[f"{n_cube}.{n_dim}"]
+            join_specs.append((new_idx, host_idx, host_col, new_col))
+            bridge_joins.append(
+                BridgeJoin(
+                    left=FragmentColumn(host_idx, host_col),
+                    right=FragmentColumn(new_idx, new_col),
+                )
             )
             joined.add(new_idx)
             progress = True
@@ -779,34 +687,107 @@ def _emit_merge_sql(
                 "Federated plan has disconnected backend partitions.",
                 reason="disconnected_partitions",
             )
+    return join_specs, bridge_joins
 
-    # GROUP BY all non-measure SELECT items.
-    n_group = len(q.dimensions) + (1 if q.time_dimension is not None else 0)
-    group_by = ", ".join(str(i + 1) for i in range(n_group))
 
-    sql = f"SELECT {', '.join(select_exprs)} FROM {from_clause}"
-    if joins_sql:
-        sql += " " + " ".join(joins_sql)
-    if cross_partition_clauses:
-        cube_to_idx_m = {c.name: i for i, p in enumerate(partitions) for c in p.cubes}
-        clauses_sql = " AND ".join(
-            _emit_cross_partition_clause(c, cube_to_idx_m, binder) for c in cross_partition_clauses
+def _assemble_merge_sql(
+    q: SemanticQuery,
+    catalog: dict[str, Cube],
+    primary_partition: Dialect,
+    partitions: Sequence[_MergePartition],
+    bridges: list[_Bridge],
+    output_column_meta: list[ColumnMeta],
+    *,
+    mode: Literal["distributive", "raw_rows"],
+    measure_selects: list[_MeasureSelect],
+    time_select: _TimeSelect | None,
+    cross_partition_clauses: _Cnf | None = None,
+) -> tuple[str, MergeSpec, dict[str, object]]:
+    """Build the DuckDB merge SELECT as a sqlglot AST and render it.
+
+    Universal across both federation modes: dimensions, FROM + bridge
+    LEFT JOINs, cross-partition WHERE, positional GROUP BY, HAVING,
+    ORDER BY, and LIMIT/OFFSET. The two mode-specific pieces — measure
+    re-aggregation and time bucketing — arrive pre-built as
+    ``measure_selects`` / ``time_select``.
+
+    Frags are aliased ``f0``, ``f1``, …; the primary fragment is the FROM
+    target. Cross-partition filter and HAVING values bind as ``$name``
+    placeholders, never inlined.
+    """
+    binder = _MergeBinder()
+    cube_to_idx = {c.name: i for i, p in enumerate(partitions) for c in p.cubes}
+    primary_idx = next(i for i, p in enumerate(partitions) if p.dialect == primary_partition)
+
+    # SELECT list: dimensions, then the time bucket, then measures —
+    # that order makes the positional GROUP BY (1..n_group) line up.
+    select_list: list[exp.Expression] = []
+    dimension_outputs: list[DimensionOutput] = []
+    for ref in q.dimensions:
+        idx = cube_to_idx[_resolve_field_to_cube(ref, catalog).name]
+        col = partitions[idx].dim_columns[ref]
+        alias = ref.rsplit(".", 1)[1]
+        select_list.append(_aliased(_frag_col(idx, col), alias))
+        meta = next(m for m in output_column_meta if m.name == alias)
+        dimension_outputs.append(
+            DimensionOutput(output_name=alias, sources=[FragmentColumn(idx, col)], column_meta=meta)
         )
-        sql += f" WHERE {clauses_sql}"
+
+    n_group = len(q.dimensions)
+    if time_select is not None:
+        time_expr, time_alias, time_source = time_select
+        select_list.append(_aliased(time_expr, time_alias))
+        meta = next(m for m in output_column_meta if m.name == time_alias)
+        dimension_outputs.append(
+            DimensionOutput(output_name=time_alias, sources=[time_source], column_meta=meta)
+        )
+        n_group += 1
+
+    measure_outputs: list[MeasureOutput] = []
+    for measure_expr, m_out in measure_selects:
+        select_list.append(_aliased(measure_expr, m_out.output_name))
+        measure_outputs.append(m_out)
+
+    select = exp.select(*select_list).from_(
+        exp.alias_(exp.to_table(f"frag_{primary_idx}"), f"f{primary_idx}")
+    )
+    join_specs, bridge_joins = _build_merge_joins(partitions, bridges, primary_idx)
+    for new_idx, host_idx, host_col, new_col in join_specs:
+        select = select.join(
+            exp.alias_(exp.to_table(f"frag_{new_idx}"), f"f{new_idx}"),
+            on=exp.EQ(this=_frag_col(host_idx, host_col), expression=_frag_col(new_idx, new_col)),
+            join_type="LEFT",
+        )
+
+    # Cross-partition residual predicates — each clause ANDs into WHERE.
+    for clause in cross_partition_clauses or []:
+        select = select.where(_emit_cross_partition_clause(clause, cube_to_idx, binder))
+
     if q.measures and n_group > 0:
-        sql += f" GROUP BY {group_by}"
+        select = select.group_by(*(exp.Literal.number(i + 1) for i in range(n_group)))
+
+    if q.having:
+        selected = {ref.rsplit(".", 1)[1] for ref in q.measures}
+        for hf in q.having:
+            alias = hf.dimension.rsplit(".", 1)[1]
+            if alias not in selected:
+                raise FederationError(
+                    f"HAVING references {hf.dimension!r}, which is not in query.measures.",
+                    reason="having_unknown_measure",
+                )
+            select = select.having(_emit_having_term(alias, hf, binder))
 
     if q.order:
-        order_terms: list[str] = []
         for ref, direction in q.order:
             alias = ref.rsplit(".", 1)[-1] if "." in ref else ref
-            order_terms.append(f"{_quote_ident(alias)} {'DESC' if direction == 'desc' else 'ASC'}")
-        sql += f" ORDER BY {', '.join(order_terms)}"
+            select = select.order_by(
+                exp.Ordered(this=exp.column(alias, quoted=True), desc=direction == "desc")
+            )
 
     if q.limit is not None:
-        sql += f" LIMIT {int(q.limit)}"
+        select = select.limit(int(q.limit))
     if q.offset is not None and q.offset > 0:
-        sql += f" OFFSET {int(q.offset)}"
+        select = select.offset(int(q.offset))
 
     spec = MergeSpec(
         primary_index=primary_idx,
@@ -817,10 +798,79 @@ def _emit_merge_sql(
         order_by=list(q.order),
         limit=q.limit,
         offset=q.offset,
-        mode="distributive",
+        mode=mode,
         cross_partition_clauses=_serialise_cnf(cross_partition_clauses or []),
     )
-    return sql, spec, binder.params
+    return select.sql(dialect="duckdb"), spec, binder.params
+
+
+def _emit_merge_sql(
+    q: SemanticQuery,
+    catalog: dict[str, Cube],
+    primary_partition: Dialect,
+    partitions: list[_PartitionPlan],
+    bridges: list[_Bridge],
+    output_column_meta: list[ColumnMeta],
+    *,
+    cross_partition_clauses: _Cnf | None = None,
+) -> tuple[str, MergeSpec, dict[str, object]]:
+    """Distributive merge: fragments pre-aggregate (SUM / decomposed AVG),
+    so the merge re-aggregates each measure with SUM (or SUM/NULLIF(SUM)
+    for recomposed averages). Delegates the shared scaffold to
+    :func:`_assemble_merge_sql`."""
+    cube_to_idx = {c.name: i for i, p in enumerate(partitions) for c in p.cubes}
+
+    time_select: _TimeSelect | None = None
+    if q.time_dimension is not None:
+        idx = cube_to_idx[_resolve_field_to_cube(q.time_dimension.dimension, catalog).name]
+        td_col = partitions[idx].dim_columns[q.time_dimension.dimension]
+        time_select = (_frag_col(idx, td_col), td_col, FragmentColumn(idx, td_col))
+
+    measure_selects: list[_MeasureSelect] = []
+    for ref in q.measures:
+        idx = cube_to_idx[_resolve_field_to_cube(ref, catalog).name]
+        plan = partitions[idx]
+        m_name = ref.rsplit(".", 1)[1]
+        meta = next(m for m in output_column_meta if m.name == m_name)
+        if ref in plan.avg_columns:
+            sum_col, count_col = plan.avg_columns[ref]
+            expr: exp.Expression = exp.Div(
+                this=exp.Sum(this=_frag_col(idx, sum_col)),
+                expression=exp.Anonymous(
+                    this="NULLIF",
+                    expressions=[exp.Sum(this=_frag_col(idx, count_col)), exp.Literal.number(0)],
+                ),
+            )
+            m_out = MeasureOutput(
+                output_name=m_name,
+                merge_agg="avg_recomposed",
+                sum_source=FragmentColumn(idx, sum_col),
+                count_source=FragmentColumn(idx, count_col),
+                column_meta=meta,
+            )
+        else:
+            col = plan.measure_columns[ref]
+            expr = exp.Sum(this=_frag_col(idx, col))
+            m_out = MeasureOutput(
+                output_name=m_name,
+                merge_agg="sum",  # both sum and count reduce to SUM at merge
+                source=FragmentColumn(idx, col),
+                column_meta=meta,
+            )
+        measure_selects.append((expr, m_out))
+
+    return _assemble_merge_sql(
+        q,
+        catalog,
+        primary_partition,
+        partitions,
+        bridges,
+        output_column_meta,
+        mode="distributive",
+        measure_selects=measure_selects,
+        time_select=time_select,
+        cross_partition_clauses=cross_partition_clauses,
+    )
 
 
 def _serialise_cnf(
@@ -1106,39 +1156,54 @@ class _MergeBinder:
     def __init__(self) -> None:
         self.params: dict[str, object] = {}
 
-    def bind(self, value: object) -> str:
+    def placeholder(self, value: object) -> exp.Placeholder:
+        """Register ``value`` and return the ``$m{n}`` placeholder node."""
         name = f"m{len(self.params)}"
         self.params[name] = value
-        return f"${name}"
+        return exp.Placeholder(this=name)
 
 
-def _emit_filter_predicate(col_expr: str, f: Filter, binder: _MergeBinder) -> str:
+def _frag_col(idx: int, col: str) -> exp.Column:
+    """Quoted ``"f{idx}"."col"`` reference into a fragment's result set."""
+    return exp.column(col, table=f"f{idx}", quoted=True)
+
+
+def _aliased(value: exp.Expression, name: str) -> exp.Alias:
+    """``value AS "name"`` with a quoted output identifier."""
+    return exp.Alias(this=value, alias=exp.to_identifier(name, quoted=True))
+
+
+# Concrete comparison-node classes keyed by Filter op. ``Callable[...,
+# exp.Expression]`` (not ``type[exp.Binary]``) because sqlglot's ``Binary``
+# is an *ancestor* of ``Expression``, not a subtype — see the sqlglot
+# type-node note in CLAUDE memory.
+_BINARY_OPS: dict[str, Callable[..., exp.Expression]] = {
+    "eq": exp.EQ,
+    "neq": exp.NEQ,
+    "gt": exp.GT,
+    "gte": exp.GTE,
+    "lt": exp.LT,
+    "lte": exp.LTE,
+}
+
+
+def _emit_filter_predicate(col: exp.Expression, f: Filter, binder: _MergeBinder) -> exp.Expression:
+    """Build a DuckDB predicate AST for ``f`` over the ``col`` expression,
+    binding every comparison value as a ``$m`` parameter."""
     op = f.op
     vals = list(f.values)
-    if op == "eq":
-        return f"{col_expr} = {binder.bind(vals[0])}"
-    if op == "neq":
-        return f"{col_expr} <> {binder.bind(vals[0])}"
-    if op == "gt":
-        return f"{col_expr} > {binder.bind(vals[0])}"
-    if op == "gte":
-        return f"{col_expr} >= {binder.bind(vals[0])}"
-    if op == "lt":
-        return f"{col_expr} < {binder.bind(vals[0])}"
-    if op == "lte":
-        return f"{col_expr} <= {binder.bind(vals[0])}"
+    if op in _BINARY_OPS:
+        return _BINARY_OPS[op](this=col, expression=binder.placeholder(vals[0]))
     if op == "in":
-        items = ", ".join(binder.bind(v) for v in vals)
-        return f"{col_expr} IN ({items})"
+        return exp.In(this=col, expressions=[binder.placeholder(v) for v in vals])
     if op == "not_in":
-        items = ", ".join(binder.bind(v) for v in vals)
-        return f"{col_expr} NOT IN ({items})"
+        return exp.Not(this=exp.In(this=col, expressions=[binder.placeholder(v) for v in vals]))
     if op == "is_null":
-        return f"{col_expr} IS NULL"
+        return exp.Is(this=col, expression=exp.Null())
     if op == "not_null":
-        return f"{col_expr} IS NOT NULL"
+        return exp.Not(this=exp.Is(this=col, expression=exp.Null()))
     if op == "contains":
-        return f"{col_expr} ILIKE {binder.bind('%' + str(vals[0]) + '%')}"
+        return exp.ILike(this=col, expression=binder.placeholder("%" + str(vals[0]) + "%"))
     raise FederationError(f"Filter op {op!r} unsupported.", reason="unsupported_op")
 
 
@@ -1146,19 +1211,17 @@ def _emit_cross_partition_clause(
     clause: _CnfClause,
     cube_to_idx: dict[str, int],
     binder: _MergeBinder,
-) -> str:
-    lits: list[str] = []
+) -> exp.Expression:
+    """One CNF clause → an OR of (optionally negated) predicate nodes."""
+    lits: list[exp.Expression] = []
     for negated, f in clause:
         cube_name, dim_name = f.dimension.split(".", 1)
-        idx = cube_to_idx[cube_name]
-        col_expr = f"f{idx}.{_quote_ident(dim_name)}"
-        pred = _emit_filter_predicate(col_expr, f, binder)
-        if negated:
-            pred = f"NOT ({pred})"
-        lits.append(pred)
-    if len(lits) == 1:
-        return lits[0]
-    return f"({' OR '.join(lits)})"
+        pred = _emit_filter_predicate(_frag_col(cube_to_idx[cube_name], dim_name), f, binder)
+        lits.append(exp.Not(this=pred) if negated else pred)
+    clause_expr = lits[0]
+    for lit in lits[1:]:
+        clause_expr = exp.Or(this=clause_expr, expression=lit)
+    return clause_expr
 
 
 _RAW_TIME_PREFIX = "__rt_"
@@ -1323,227 +1386,117 @@ def _emit_merge_sql_raw_rows(
     primary_partition: Dialect,
     partitions: list[_RawRowPartitionPlan],
     bridges: list[_Bridge],
-    output_columns: list[str],
     output_column_meta: list[ColumnMeta],
     *,
     cross_partition_clauses: _Cnf | None = None,
 ) -> tuple[str, MergeSpec, dict[str, object]]:
-    binder = _MergeBinder()
-    by_dialect: dict[Dialect, tuple[int, _RawRowPartitionPlan]] = {
-        p.dialect: (i, p) for i, p in enumerate(partitions)
-    }
-    primary_idx, _ = by_dialect[primary_partition]
+    """Raw-rows merge: fragments stream ungrouped rows, so the merge applies
+    the full aggregation (and time bucketing, and HAVING). Delegates the
+    shared scaffold to :func:`_assemble_merge_sql`."""
+    cube_to_idx = {c.name: i for i, p in enumerate(partitions) for c in p.cubes}
 
-    def frag_alias(idx: int) -> str:
-        return f"f{idx}"
-
-    cube_to_idx: dict[str, int] = {c.name: i for i, p in enumerate(partitions) for c in p.cubes}
-    select_exprs: list[str] = []
-    dimension_outputs: list[DimensionOutput] = []
-    n_group_dims = 0
-
-    for ref in q.dimensions:
-        owner = _resolve_field_to_cube(ref, catalog)
-        idx, plan = cube_to_idx[owner.name], partitions[cube_to_idx[owner.name]]
-        col, alias = plan.dim_columns[ref], ref.rsplit(".", 1)[1]
-        select_exprs.append(f"{frag_alias(idx)}.{_quote_ident(col)} AS {_quote_ident(alias)}")
-        meta = next(m for m in output_column_meta if m.name == alias)
-        dimension_outputs.append(
-            DimensionOutput(output_name=alias, sources=[FragmentColumn(idx, col)], column_meta=meta)
-        )
-        n_group_dims += 1
-
-    time_alias: str | None = None
+    time_select: _TimeSelect | None = None
     if q.time_dimension is not None:
-        td_cube = _resolve_field_to_cube(q.time_dimension.dimension, catalog)
-        idx, plan = cube_to_idx[td_cube.name], partitions[cube_to_idx[td_cube.name]]
+        idx = cube_to_idx[_resolve_field_to_cube(q.time_dimension.dimension, catalog).name]
+        plan = partitions[idx]
         assert plan.time_col is not None
-        raw_ref = f"{frag_alias(idx)}.{_quote_ident(plan.time_col)}"
+        raw_ref = _frag_col(idx, plan.time_col)
         td_name = q.time_dimension.dimension.rsplit(".", 1)[1]
-        bucket = f"date_trunc('{plan.time_grain}', {raw_ref})" if plan.time_grain else raw_ref
-        time_alias = f"{td_name}_{plan.time_grain}" if plan.time_grain else td_name
-        select_exprs.append(f"{bucket} AS {_quote_ident(time_alias)}")
-        meta = next(m for m in output_column_meta if m.name == time_alias)
-        dimension_outputs.append(
-            DimensionOutput(
-                output_name=time_alias,
-                sources=[FragmentColumn(idx, plan.time_col)],
-                column_meta=meta,
+        if plan.time_grain:
+            bucket: exp.Expression = exp.Anonymous(
+                this="date_trunc", expressions=[exp.Literal.string(plan.time_grain), raw_ref]
             )
-        )
-        n_group_dims += 1
+            time_alias = f"{td_name}_{plan.time_grain}"
+        else:
+            bucket, time_alias = raw_ref, td_name
+        time_select = (bucket, time_alias, FragmentColumn(idx, plan.time_col))
 
-    measure_outputs: list[MeasureOutput] = []
-    selected_measure_aliases = {ref.rsplit(".", 1)[1] for ref in q.measures}
-    for having_filter in q.having:
-        alias = having_filter.dimension.rsplit(".", 1)[1]
-        if alias not in selected_measure_aliases:
-            raise FederationError(
-                f"HAVING references {having_filter.dimension!r}, which is not in query.measures.",
-                reason="having_unknown_measure",
-            )
-
+    measure_selects: list[_MeasureSelect] = []
     for ref in q.measures:
-        owner = _resolve_field_to_cube(ref, catalog)
-        idx, plan = cube_to_idx[owner.name], partitions[cube_to_idx[owner.name]]
+        idx = cube_to_idx[_resolve_field_to_cube(ref, catalog).name]
+        plan = partitions[idx]
         m_name = ref.rsplit(".", 1)[1]
         meta = next(m for m in output_column_meta if m.name == m_name)
         if ref in plan.ratio_measure_columns:
             num_col, num_agg, den_col, den_agg = plan.ratio_measure_columns[ref]
-            num_expr, den_expr = (
-                _raw_agg_expr(num_agg, num_col, frag_alias(idx)),
-                _raw_agg_expr(den_agg, den_col, frag_alias(idx)),
+            expr: exp.Expression = exp.Div(
+                this=_raw_agg_expr(num_agg, num_col, idx),
+                expression=exp.Anonymous(
+                    this="NULLIF",
+                    expressions=[_raw_agg_expr(den_agg, den_col, idx), exp.Literal.number(0)],
+                ),
             )
-            expr = f"{num_expr} / NULLIF({den_expr}, 0)"
-            measure_outputs.append(
-                MeasureOutput(
-                    output_name=m_name,
-                    merge_agg="ratio",
-                    numerator=FragmentColumn(idx, num_col),
-                    denominator=FragmentColumn(idx, den_col),
-                    column_meta=meta,
-                )
+            m_out = MeasureOutput(
+                output_name=m_name,
+                merge_agg="ratio",
+                numerator=FragmentColumn(idx, num_col),
+                denominator=FragmentColumn(idx, den_col),
+                column_meta=meta,
             )
         else:
             col, agg = plan.raw_measure_columns[ref]
-            expr = _raw_agg_expr(agg, col, frag_alias(idx))
-            measure_outputs.append(
-                MeasureOutput(
-                    output_name=m_name,
-                    merge_agg=agg,  # type: ignore[arg-type]
-                    source=FragmentColumn(idx, col),
-                    column_meta=meta,
-                )
+            expr = _raw_agg_expr(agg, col, idx)
+            m_out = MeasureOutput(
+                output_name=m_name,
+                merge_agg=agg,  # type: ignore[arg-type]
+                source=FragmentColumn(idx, col),
+                column_meta=meta,
             )
-        select_exprs.append(f"{expr} AS {_quote_ident(m_name)}")
+        measure_selects.append((expr, m_out))
 
-    from_clause = f"frag_{primary_idx} AS {frag_alias(primary_idx)}"
-    joins_sql: list[str] = []
-    bridge_joins: list[BridgeJoin] = []
-    joined: set[int] = {primary_idx}
-    pending = list(bridges)
-    while pending:
-        progress = False
-        remaining: list[_Bridge] = []
-        for b in pending:
-            left_idx, right_idx = cube_to_idx[b.left_cube.name], cube_to_idx[b.right_cube.name]
-            if left_idx in joined and right_idx not in joined:
-                new_idx, host_idx = right_idx, left_idx
-            elif right_idx in joined and left_idx not in joined:
-                new_idx, host_idx = left_idx, right_idx
-            else:
-                remaining.append(b)
-                continue
-            host_alias, new_alias = frag_alias(host_idx), frag_alias(new_idx)
-
-            # Resolve which side of the bridge corresponds to which fragment
-            if host_idx == cube_to_idx[b.left_cube.name]:
-                h_cube, h_dim = b.left_cube.name, b.left_dim
-                n_cube, n_dim = b.right_cube.name, b.right_dim
-            else:
-                h_cube, h_dim = b.right_cube.name, b.right_dim
-                n_cube, n_dim = b.left_cube.name, b.left_dim
-
-            host_col = partitions[host_idx].bridge_columns[f"{h_cube}.{h_dim}"]
-            new_col = partitions[new_idx].bridge_columns[f"{n_cube}.{n_dim}"]
-
-            joins_sql.append(
-                f"LEFT JOIN frag_{new_idx} AS {new_alias} "
-                f"ON {host_alias}.{_quote_ident(host_col)} = "
-                f"{new_alias}.{_quote_ident(new_col)}"
-            )
-            bridge_joins.append(
-                BridgeJoin(
-                    left=FragmentColumn(host_idx, host_col),
-                    right=FragmentColumn(new_idx, new_col),
-                )
-            )
-            joined.add(new_idx)
-            progress = True
-        pending = remaining
-        if not progress and pending:
-            raise FederationError("Disconnected partitions.", reason="disconnected")
-
-    sql = f"SELECT {', '.join(select_exprs)} FROM {from_clause}"
-    if joins_sql:
-        sql += " " + " ".join(joins_sql)
-    if cross_partition_clauses:
-        clauses_sql = " AND ".join(
-            _emit_cross_partition_clause(c, cube_to_idx, binder) for c in cross_partition_clauses
-        )
-        sql += f" WHERE {clauses_sql}"
-    if q.measures and n_group_dims > 0:
-        group_cols = ", ".join(str(i + 1) for i in range(n_group_dims))
-        sql += f" GROUP BY {group_cols}"
-    if q.having:
-        having_sql = " AND ".join(
-            _emit_having_term(hf.dimension.rsplit(".", 1)[1], hf, binder) for hf in q.having
-        )
-        sql += f" HAVING {having_sql}"
-    if q.order:
-        order_terms: list[str] = []
-        for r, d in q.order:
-            alias = r.rsplit(".", 1)[-1]
-            dir_str = "DESC" if d == "desc" else "ASC"
-            order_terms.append(f"{_quote_ident(alias)} {dir_str}")
-        sql += f" ORDER BY {', '.join(order_terms)}"
-    if q.limit:
-        sql += f" LIMIT {int(q.limit)}"
-    if q.offset:
-        sql += f" OFFSET {int(q.offset)}"
-
-    spec = MergeSpec(
-        primary_index=primary_idx,
-        bridges=bridge_joins,
-        dimensions=dimension_outputs,
-        measures=measure_outputs,
-        having=list(q.having),
-        order_by=list(q.order),
-        limit=q.limit,
-        offset=q.offset,
+    return _assemble_merge_sql(
+        q,
+        catalog,
+        primary_partition,
+        partitions,
+        bridges,
+        output_column_meta,
         mode="raw_rows",
-        cross_partition_clauses=_serialise_cnf(cross_partition_clauses or []),
+        measure_selects=measure_selects,
+        time_select=time_select,
+        cross_partition_clauses=cross_partition_clauses,
     )
-    return sql, spec, binder.params
 
 
-def _raw_agg_expr(agg: str, col: str, frag_alias: str) -> str:
+_PERCENTILES: dict[str, float] = {"median": 0.5, "p75": 0.75, "p90": 0.90, "p95": 0.95}
+
+
+def _raw_agg_expr(agg: str, col: str, idx: int) -> exp.Expression:
+    """Merge-side aggregation AST for a raw-rows measure column."""
     if not col:
-        return "COUNT(*)"
-    ref = f"{frag_alias}.{_quote_ident(col)}"
+        return exp.Count(this=exp.Star())
+    ref = _frag_col(idx, col)
     if agg == "sum":
-        return f"SUM({ref})"
+        return exp.Sum(this=ref)
     if agg == "count":
-        return f"COUNT({ref})"
+        return exp.Count(this=ref)
     if agg == "count_distinct":
-        return f"COUNT(DISTINCT {ref})"
+        return exp.Count(this=exp.Distinct(expressions=[ref]))
     if agg == "avg":
-        return f"AVG({ref})"
+        return exp.Avg(this=ref)
     if agg == "min":
-        return f"MIN({ref})"
+        return exp.Min(this=ref)
     if agg == "max":
-        return f"MAX({ref})"
-    _q = {"median": 0.5, "p75": 0.75, "p90": 0.90, "p95": 0.95}
-    if agg in _q:
-        return f"PERCENTILE_CONT({_q[agg]}) WITHIN GROUP (ORDER BY {ref})"
+        return exp.Max(this=ref)
+    if agg in _PERCENTILES:
+        # Renders as DuckDB's QUANTILE_CONT(col, q ORDER BY col).
+        return exp.WithinGroup(
+            this=exp.Anonymous(
+                this="PERCENTILE_CONT", expressions=[exp.Literal.number(_PERCENTILES[agg])]
+            ),
+            expression=exp.Order(expressions=[exp.Ordered(this=ref)]),
+        )
     raise FederationError(f"agg={agg!r} unsupported.", reason="unsupported_agg")
 
 
-def _emit_having_term(alias: str, f: Filter, binder: _MergeBinder) -> str:
-    col, op, val = _quote_ident(alias), f.op, binder.bind(f.values[0])
-    if op == "gt":
-        return f"{col} > {val}"
-    if op == "gte":
-        return f"{col} >= {val}"
-    if op == "lt":
-        return f"{col} < {val}"
-    if op == "lte":
-        return f"{col} <= {val}"
-    if op == "eq":
-        return f"{col} = {val}"
-    if op == "neq":
-        return f"{col} <> {val}"
-    raise FederationError(f"HAVING op {op!r} unsupported.", reason="unsupported_having_op")
+def _emit_having_term(alias: str, f: Filter, binder: _MergeBinder) -> exp.Expression:
+    """HAVING predicate AST over an output measure alias."""
+    op = f.op
+    if op not in _BINARY_OPS:
+        raise FederationError(f"HAVING op {op!r} unsupported.", reason="unsupported_having_op")
+    return _BINARY_OPS[op](
+        this=exp.column(alias, quoted=True), expression=binder.placeholder(f.values[0])
+    )
 
 
 def _compile_raw_rows(
@@ -1636,7 +1589,6 @@ def _compile_raw_rows(
         primary_partition,
         partitions,
         bridges,
-        output_columns,
         output_column_meta,
         cross_partition_clauses=cross_partition_clauses,
     )
@@ -1831,7 +1783,6 @@ def compile_federated_query(
         primary_partition,
         partitions,
         bridges,
-        output_columns,
         output_column_meta,
         cross_partition_clauses=cross_partition_clauses,
     )

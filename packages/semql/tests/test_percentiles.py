@@ -176,5 +176,8 @@ def test_raw_rows_federation_emits_percentile_at_merge() -> None:
         catalog,
         mode="raw_rows",
     )
-    assert "PERCENTILE_CONT" in plan.merge.sql.upper()
+    # The AST emitter renders DuckDB's QUANTILE_CONT (its canonical spelling
+    # of PERCENTILE_CONT ... WITHIN GROUP).
+    sql_upper = plan.merge.sql.upper()
+    assert "QUANTILE_CONT" in sql_upper or "PERCENTILE_CONT" in sql_upper
     assert "0.5" in plan.merge.sql

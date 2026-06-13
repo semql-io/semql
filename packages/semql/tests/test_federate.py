@@ -153,8 +153,8 @@ def test_merge_sql_joins_fragments_on_bridge_keys() -> None:
     # Bridge key equality is in the merge.
     assert '"customer_id"' in merge_sql
     assert '"id"' in merge_sql
-    # Sum re-aggregation at merge.
-    assert 'SUM(f0."revenue")' in merge_sql
+    # Sum re-aggregation at merge (the AST emitter quotes the frag alias).
+    assert 'SUM("f0"."revenue")' in merge_sql
     # Group by the dim column.
     assert "GROUP BY 1" in merge_sql
 
@@ -194,7 +194,7 @@ def test_avg_measure_decomposed_in_primary_fragment() -> None:
     assert any(c.endswith("__avg_count") for c in primary_cols)
     # Merge recomposes avg as SUM(sum) / NULLIF(SUM(count), 0).
     merge_sql = plan.merge.sql
-    assert "SUM(f0" in merge_sql
+    assert 'SUM("f0' in merge_sql
     assert "NULLIF" in merge_sql
     # Final output column is the original measure name.
     assert "avg_amount" in plan.columns
@@ -625,8 +625,10 @@ def test_raw_rows_supports_time_dimension() -> None:
         ),
     )
     plan = compile_federated_query(q, catalog, mode="raw_rows")
-    # Time bucket lives in the merge SQL as date_trunc.
-    assert "date_trunc('day'" in plan.merge.sql or "DATE_TRUNC('day'" in plan.merge.sql
+    # Time bucket lives in the merge SQL as date_trunc (the AST emitter
+    # renders the function + unit in DuckDB's canonical upper case).
+    merge_lower = plan.merge.sql.lower()
+    assert "date_trunc('day'" in merge_lower
     # Output column name reflects the bucketed grain.
     assert "created_at_day" in plan.columns
     # Fragment received the range as fragment-side filters on the raw
