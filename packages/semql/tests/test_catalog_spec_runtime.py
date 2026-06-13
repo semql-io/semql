@@ -250,3 +250,111 @@ def test_existing_catalog_constructor_still_validates() -> None:
     ``CatalogSpec.from_iterables``; the existing API is unchanged."""
     with pytest.raises(ValueError, match="duplicate"):
         Catalog([_orders(), _orders()])
+
+
+# ---------------------------------------------------------------------------
+# Validation parity — collect-all and raise-on-first share one routine
+# (S11). The two modes can't drift because they're the same checks with
+# a different ``emit``.
+# ---------------------------------------------------------------------------
+
+
+def _scoped_cube() -> Cube:
+    return Cube(
+        name="orders",
+        dialect=Dialect.POSTGRES,
+        table="orders",
+        alias="o",
+        scope="reportees",
+        measures=[Measure(name="count", sql="*", agg="count", unit="count")],
+    )
+
+
+def test_validation_modes_agree_raise_emits_first_collected() -> None:
+    """Driving the shared routine with a collecting emit and a raising
+    emit on identical input: the raise mode raises with exactly the first
+    message the collect mode would gather. This is the anti-drift pin."""
+    from semql.catalog import (
+        _run_catalog_validations,  # pyright: ignore[reportPrivateUsage]
+    )
+    from semql.model import Join
+    from semql.units import DEFAULT_REGISTRY
+
+    bad = Cube(
+        name="bad",
+        dialect=Dialect.POSTGRES,
+        table="bad",
+        alias="b",
+        joins=[Join(to="ghost", relationship="many_to_one", on="{b}.id = 1")],
+        measures=[Measure(name="count", sql="*", agg="count", unit="count")],
+    )
+    collected: list[tuple[str, str]] = []
+
+    def _collect(code: str, message: str, **_: object) -> None:
+        collected.append((code, message))
+
+    _run_catalog_validations(
+        cubes=[bad],
+        views=[],
+        lookups=[],
+        saved_queries=[],
+        glossary=[],
+        relations="",
+        scope_fn_names=None,
+        unit_registry=DEFAULT_REGISTRY,
+        emit=_collect,
+    )
+    assert collected
+    assert collected[0][0] == "unknown_join_target"
+
+    def _raise(code: str, message: str, **_: object) -> None:
+        raise ValueError(message)
+
+    with pytest.raises(ValueError) as exc:
+        _run_catalog_validations(
+            cubes=[bad],
+            views=[],
+            lookups=[],
+            saved_queries=[],
+            glossary=[],
+            relations="",
+            scope_fn_names=None,
+            unit_registry=DEFAULT_REGISTRY,
+            emit=_raise,
+        )
+    assert str(exc.value) == collected[0][1]
+
+
+def test_collect_all_emits_unknown_scope_function_when_names_given() -> None:
+    """Closed drift: collect-all now emits unknown_scope_function (it was
+    documented but never produced). Requires scope_fn_names — a bare spec
+    can't know the registered scopes, so it skips the check by default."""
+    from semql.catalog import CatalogSpec
+
+    _spec, errors = CatalogSpec.from_iterables(cubes=[_scoped_cube()], scope_fn_names=[])
+    assert "unknown_scope_function" in {e["code"] for e in errors}
+
+    # Default (scope_fn_names=None) skips the check — no false positive.
+    _spec2, errors2 = CatalogSpec.from_iterables(cubes=[_scoped_cube()])
+    assert "unknown_scope_function" not in {e["code"] for e in errors2}
+    # And the raise path rejects the same defect.
+    with pytest.raises(ValueError, match="scope"):
+        Catalog([_scoped_cube()])
+
+
+def test_collect_all_emits_unit_diagnostics() -> None:
+    """Closed drift: collect-all now emits unit_display_without_unit
+    (also documented but never produced)."""
+    from semql.catalog import CatalogSpec
+
+    cube = Cube(
+        name="orders",
+        dialect=Dialect.POSTGRES,
+        table="orders",
+        alias="o",
+        measures=[Measure(name="dur", sql="{o}.ms", agg="sum", display_unit="hours")],
+    )
+    _spec, errors = CatalogSpec.from_iterables(cubes=[cube])
+    assert "unit_display_without_unit" in {e["code"] for e in errors}
+    with pytest.raises(ValueError, match="display_unit"):
+        Catalog([cube])

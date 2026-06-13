@@ -33,7 +33,7 @@ aggregated into a single list instead of a first-error raise.
 from __future__ import annotations
 
 import difflib
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from typing import Any, TypeVar, cast
 
@@ -62,6 +62,394 @@ from semql.units import DEFAULT_REGISTRY, Registry
 from semql.validate import ValidationError, validate
 
 _T = TypeVar("_T", bound=BaseField)
+
+# ``emit(code, message, **extra)`` — the one knob that distinguishes the
+# two catalog-validation contracts. ``Catalog.__init__`` passes an emit
+# that raises ``ValueError`` (first-error); ``CatalogSpec.from_iterables``
+# passes one that appends to a list (collect-all). See
+# :func:`_run_catalog_validations`.
+_DiagEmit = Callable[..., None]
+
+
+def _augment_with_inferred_joins(cubes: list[Cube], emit: _DiagEmit) -> list[Cube]:
+    """Derive ``many_to_one`` joins from ``Dimension.foreign_key`` and
+    return the cube list with them appended. Reports unknown FK targets
+    and FK targets that lack a primary_key via ``emit``. An explicit Join
+    to the same target wins (no duplicate)."""
+    by_name: dict[str, Cube] = {c.name: c for c in cubes}
+    out: list[Cube] = list(cubes)
+    for idx, cube in enumerate(out):
+        inferred: list[Join] = []
+        explicit_targets = {j.to for j in cube.joins}
+        for dim in cube.dimensions:
+            fk = dim.foreign_key
+            if fk is None:
+                continue
+            if fk not in by_name:
+                emit(
+                    "unknown_foreign_key_target",
+                    f"Cube {cube.name!r}, dimension {dim.name!r}: "
+                    f"foreign_key={fk!r} names a cube not in the "
+                    f"catalog. Known cubes: {sorted(by_name)}.",
+                    cube=cube.name,
+                    dimension=dim.name,
+                    foreign_key=fk,
+                )
+                continue
+            target = by_name[fk]
+            if target.primary_key is None:
+                emit(
+                    "foreign_key_target_no_primary_key",
+                    f"Cube {cube.name!r}, dimension {dim.name!r}: "
+                    f"foreign_key={fk!r} requires the target cube "
+                    f"to declare a primary_key. Add primary_key="
+                    f"'<dim>' to cube {fk!r}.",
+                    cube=cube.name,
+                    dimension=dim.name,
+                    foreign_key=fk,
+                )
+                continue
+            if fk in explicit_targets:
+                continue  # explicit Join wins
+            inferred.append(
+                Join(
+                    to=fk,
+                    relationship="many_to_one",
+                    on=f"{{{cube.alias}}}.{dim.name} = {{{target.alias}}}.{target.primary_key}",
+                )
+            )
+        if inferred:
+            out[idx] = cube.model_copy(update={"joins": [*cube.joins, *inferred]})
+    return out
+
+
+def _run_catalog_validations(
+    *,
+    cubes: Sequence[Cube],
+    views: Sequence[View],
+    lookups: Sequence[Lookup],
+    saved_queries: Sequence[SavedQuery],
+    glossary: Sequence[GlossaryEntry],
+    relations: str,
+    scope_fn_names: Sequence[str] | None,
+    unit_registry: Registry,
+    emit: _DiagEmit,
+) -> tuple[list[Cube], str]:
+    """Single source of truth for catalog validation.
+
+    Runs every structural check exactly once, reporting each failure
+    through ``emit(code, message, **extra)``. The two public entry
+    points differ only in what ``emit`` does — :meth:`Catalog.__init__`
+    raises ``ValueError`` (first-error), :meth:`CatalogSpec.from_iterables`
+    appends to a list (collect-all) — so the checks can't drift apart.
+
+    Returns ``(augmented_cubes, relations_str)``: the cube list with
+    foreign-key-derived joins appended, and the validated relations
+    string. ``scope_fn_names=None`` skips the scope-registration check
+    (a spec built without a runtime can't know the registered scopes);
+    pass the names to enable it.
+    """
+    cube_list = list(cubes)
+    names = [c.name for c in cube_list]
+    duplicates = sorted({n for n in names if names.count(n) > 1})
+    if duplicates:
+        emit(
+            "duplicate_cube_name",
+            f"Catalog has duplicate cube names: {duplicates}. "
+            "Each cube.name must be unique within a catalog.",
+            duplicates=duplicates,
+        )
+
+    # primary_key must name a real dimension on the cube.
+    for c in cube_list:
+        if c.primary_key is not None:
+            dim_names = {d.name for d in c.dimensions}
+            if c.primary_key not in dim_names:
+                emit(
+                    "unknown_primary_key_dimension",
+                    f"Cube {c.name!r} declares primary_key="
+                    f"{c.primary_key!r} but the cube has no dimension "
+                    f"by that name. Declare it as a Dimension or pick "
+                    f"a different primary_key.",
+                    cube=c.name,
+                    primary_key=c.primary_key,
+                )
+
+    # Foreign-key-derived joins (augments the cube list) + FK diagnostics.
+    cube_list = _augment_with_inferred_joins(cube_list, emit)
+    by_name: dict[str, Cube] = {c.name: c for c in cube_list}
+    known = set(by_name)
+
+    # Every Join target must be a known cube.
+    for c in cube_list:
+        for j in c.joins:
+            if j.to not in known:
+                emit(
+                    "unknown_join_target",
+                    f"Cube {c.name!r} declares Join(to={j.to!r}) but "
+                    f"{j.to!r} is not in the catalog. "
+                    f"Known cubes: {sorted(known)}.",
+                    cube=c.name,
+                    join_target=j.to,
+                )
+
+    # CTE names share one flat namespace across the catalog.
+    cte_owners: dict[str, str] = {}
+    for cube in cube_list:
+        src = cube.source
+        if not isinstance(src, DerivedTable):
+            continue
+        for cte in src.with_ctes:
+            if cte.name in cte_owners:
+                emit(
+                    "duplicate_cte_name",
+                    f"Cube {cube.name!r}: CTE name {cte.name!r} in "
+                    f"with_ctes collides with cube "
+                    f"{cte_owners[cte.name]!r}. CTE names must be "
+                    "unique across the catalog.",
+                    cube=cube.name,
+                    cte_name=cte.name,
+                )
+            cte_owners[cte.name] = cube.name
+
+    # Views: unique names, no cube collision, targets resolve.
+    view_names: set[str] = set()
+    for v in views:
+        if v.name in view_names:
+            emit(
+                "duplicate_view_name",
+                f"Catalog has duplicate view name {v.name!r}.",
+                view_name=v.name,
+            )
+        view_names.add(v.name)
+        if v.name in by_name:
+            emit(
+                "view_collides_with_cube",
+                f"View {v.name!r} collides with cube name {v.name!r}. "
+                "View and cube names share a namespace; rename one.",
+                view_name=v.name,
+            )
+        for local, target_ref in v.fields.items():
+            if "." not in target_ref:
+                emit(
+                    "unknown_view_target_field",
+                    f"View {v.name!r}, field {local!r}: target "
+                    f"{target_ref!r} must be qualified as 'cube.field'.",
+                    view_name=v.name,
+                    field=local,
+                )
+                continue
+            cube_name, field_name = target_ref.split(".", 1)
+            if cube_name not in by_name:
+                emit(
+                    "unknown_view_target_cube",
+                    f"View {v.name!r}, field {local!r}: target "
+                    f"cube {cube_name!r} not in the catalog. "
+                    f"Known cubes: {sorted(by_name)}.",
+                    view_name=v.name,
+                    field=local,
+                )
+                continue
+            target_cube = by_name[cube_name]
+            field_names = {f.name for f in target_cube.measures}
+            field_names |= {f.name for f in target_cube.dimensions}
+            field_names |= {f.name for f in target_cube.time_dimensions}
+            if field_name not in field_names:
+                emit(
+                    "unknown_view_target_field",
+                    f"View {v.name!r}, field {local!r}: "
+                    f"{cube_name}.{field_name} is not a known measure "
+                    f"or dimension on cube {cube_name!r}.",
+                    view_name=v.name,
+                    field=local,
+                )
+
+    # unit / display_unit pairs must be convertible in the registry.
+    for cube in cube_list:
+        for fld in (*cube.measures, *cube.dimensions):
+            _emit_unit_diagnostics(cube, fld, unit_registry, emit)
+
+    # Lookups: qualified ``cube.dim`` resolving to a string dimension.
+    seen_lookup_dims: set[str] = set()
+    for lk in lookups:
+        if lk.dimension in seen_lookup_dims:
+            emit(
+                "duplicate_lookup_dimension",
+                f"Catalog has duplicate Lookup for dimension "
+                f"{lk.dimension!r}. Each ``cube.dim`` may have at "
+                "most one Lookup.",
+                dimension=lk.dimension,
+            )
+        seen_lookup_dims.add(lk.dimension)
+        if "." not in lk.dimension:
+            emit(
+                "unknown_lookup_dimension",
+                f"Lookup({lk.dimension!r}): dimension must be qualified as 'cube.dim'.",
+                dimension=lk.dimension,
+            )
+            continue
+        cube_name, dim_name = lk.dimension.split(".", 1)
+        if cube_name not in by_name:
+            emit(
+                "unknown_lookup_cube",
+                f"Lookup({lk.dimension!r}): cube {cube_name!r} is "
+                f"not in the catalog. Known cubes: "
+                f"{sorted(by_name)}.",
+                dimension=lk.dimension,
+            )
+            continue
+        target_cube = by_name[cube_name]
+        target_dim: Dimension | None = next(
+            (d for d in target_cube.dimensions if d.name == dim_name), None
+        )
+        if target_dim is None:
+            emit(
+                "unknown_lookup_dimension",
+                f"Lookup({lk.dimension!r}): cube {cube_name!r} has "
+                f"no dimension named {dim_name!r}. Known dimensions: "
+                f"{sorted(d.name for d in target_cube.dimensions)}.",
+                dimension=lk.dimension,
+            )
+            continue
+        if target_dim.type != "string":
+            emit(
+                "lookup_dimension_wrong_type",
+                f"Lookup({lk.dimension!r}): only string-typed "
+                f"dimensions are eligible — {dim_name!r} is type="
+                f"{target_dim.type!r}.",
+                dimension=lk.dimension,
+            )
+
+    # Saved queries: valid name shape, unique, no cube/view collision.
+    seen_saved_names: set[str] = set()
+    for sq in saved_queries:
+        if not sq.name or "." in sq.name or " " in sq.name:
+            emit(
+                "invalid_saved_query_name",
+                f"SavedQuery has invalid name {sq.name!r}: must be "
+                "non-empty and contain no dots or spaces (it becomes "
+                "part of an MCP tool name).",
+                saved_query_name=sq.name,
+            )
+        if sq.name in seen_saved_names:
+            emit(
+                "duplicate_saved_query_name",
+                f"Catalog has duplicate SavedQuery name {sq.name!r}. "
+                "Each saved query's name must be unique.",
+                saved_query_name=sq.name,
+            )
+        if sq.name in by_name or sq.name in view_names:
+            emit(
+                "saved_query_collides_with_cube_or_view",
+                f"SavedQuery name {sq.name!r} collides with a cube "
+                "or view of the same name. Saved-query / cube / view "
+                "names share a namespace; rename one.",
+                saved_query_name=sq.name,
+            )
+        seen_saved_names.add(sq.name)
+
+    # Replacement pointers must name a real cube / saved query.
+    for c in cube_list:
+        if c.replacement is not None and c.replacement not in by_name:
+            emit(
+                "unknown_replacement_cube",
+                f"Cube {c.name!r}: replacement={c.replacement!r} names "
+                f"a cube not in the catalog. Known cubes: "
+                f"{sorted(by_name)}.",
+                cube=c.name,
+                replacement=c.replacement,
+            )
+    saved_query_names = {sq.name for sq in saved_queries}
+    for sq in saved_queries:
+        if sq.replacement is not None and sq.replacement not in saved_query_names:
+            emit(
+                "unknown_replacement_saved_query",
+                f"SavedQuery {sq.name!r}: replacement={sq.replacement!r} "
+                f"names a saved query not in the catalog. Known saved "
+                f"queries: {sorted(saved_query_names)}.",
+                saved_query_name=sq.name,
+                replacement=sq.replacement,
+            )
+
+    # Glossary: terms + aliases share one case-insensitive namespace.
+    seen_glossary: dict[str, str] = {}
+
+    def _register(token: str, source: str) -> None:
+        key = token.lower()
+        if key in seen_glossary:
+            emit(
+                "glossary_token_collision",
+                f"Catalog glossary: token {token!r} ({source}) collides "
+                f"with {seen_glossary[key]} (case-insensitive). Terms "
+                "and aliases share one namespace; rename one.",
+                token=token,
+                conflict_with=seen_glossary[key],
+            )
+        seen_glossary[key] = source
+
+    for g in glossary:
+        _register(g.term, f"term {g.term!r}")
+        for a in g.aliases:
+            _register(a, f"alias on term {g.term!r}")
+
+    # Relations narrative — best-effort parse.
+    relations_str = relations
+    try:
+        relations_str = validate_relations("Catalog", "<catalog>", relations)
+    except ValueError as exc:
+        emit("invalid_relations", str(exc))
+
+    # scope must resolve to a registered scope function. Skipped when
+    # ``scope_fn_names`` is None — a spec built without a runtime can't
+    # know the registered scopes.
+    if scope_fn_names is not None:
+        registered = set(scope_fn_names)
+        for c in cube_list:
+            if c.scope is not None and c.scope not in registered:
+                emit(
+                    "unknown_scope_function",
+                    f"Cube {c.name!r} declares scope={c.scope!r} but no "
+                    f"scope function is registered under that name. "
+                    f"Pass scope_fns={{'{c.scope}': fn, ...}} to the Catalog "
+                    f"constructor. Registered scopes: {sorted(registered)}.",
+                    cube=c.name,
+                    scope=c.scope,
+                )
+
+    return cube_list, relations_str
+
+
+def _emit_unit_diagnostics(cube: Cube, fld: BaseField, registry: Registry, emit: _DiagEmit) -> None:
+    """``unit`` / ``display_unit`` validation for one field. No-op when
+    ``display_unit`` is unset or equals ``unit``."""
+    unit = getattr(fld, "unit", None)
+    display_unit = getattr(fld, "display_unit", None)
+    if display_unit is None:
+        return
+    if unit is None:
+        emit(
+            "unit_display_without_unit",
+            f"Cube {cube.name!r}, field {fld.name!r}: display_unit="
+            f"{display_unit!r} requires unit to also be set — there's "
+            "nothing to convert from.",
+            cube=cube.name,
+            field=fld.name,
+        )
+        return
+    if unit == display_unit:
+        return
+    try:
+        registry.factor(unit, display_unit)
+    except ValueError as exc:
+        emit(
+            "unknown_unit_conversion",
+            f"Cube {cube.name!r}, field {fld.name!r}: cannot convert "
+            f"{unit!r} → {display_unit!r}: {exc}. "
+            "Register the conversion on the catalog's unit_registry "
+            "or correct the spelling.",
+            cube=cube.name,
+            field=fld.name,
+        )
 
 
 class CatalogSpec(BaseModel):
@@ -127,6 +515,7 @@ class CatalogSpec(BaseModel):
         saved_queries: Sequence[SavedQuery] | None = None,
         glossary: Sequence[GlossaryEntry] | None = None,
         relations: str = "",
+        scope_fn_names: Sequence[str] | None = None,
         compile_hook_names: Sequence[str] = (),
         sql_rewrite_hook_names: Sequence[str] = (),
     ) -> tuple[CatalogSpec, list[dict[str, Any]]]:
@@ -143,6 +532,10 @@ class CatalogSpec(BaseModel):
         partial spec for diagnostics, then decide whether to surface
         the errors or pair with a runtime anyway.
 
+        Validation is shared verbatim with :meth:`Catalog.__init__` via
+        :func:`_run_catalog_validations`; the two paths differ only in
+        collect-vs-raise, so the set of checks can't drift.
+
         Each error is a dict shaped ``{"code", "message", ...}``
         (the error-envelope shape). Codes are stable identifiers:
 
@@ -151,13 +544,11 @@ class CatalogSpec(BaseModel):
         - ``unknown_join_target``
         - ``unknown_foreign_key_target``
         - ``foreign_key_target_no_primary_key``
-        - ``missing_primary_key_for_foreign_key``
         - ``duplicate_cte_name``
         - ``duplicate_view_name``
         - ``view_collides_with_cube``
         - ``unknown_view_target_cube``
         - ``unknown_view_target_field``
-        - ``view_target_field_wrong_type``
         - ``unit_display_without_unit``
         - ``unknown_unit_conversion``
         - ``duplicate_lookup_dimension``
@@ -170,299 +561,32 @@ class CatalogSpec(BaseModel):
         - ``unknown_replacement_cube``
         - ``unknown_replacement_saved_query``
         - ``glossary_token_collision``
-        - ``unknown_scope_function``
+        - ``invalid_relations``
+        - ``unknown_scope_function`` (only when ``scope_fn_names`` is
+          passed — a bare spec can't know the runtime's registered scopes)
         """
         errors: list[dict[str, Any]] = []
 
-        def _err(code: str, message: str, **extra: object) -> None:
-            payload: dict[str, Any] = {"code": code, "message": message}
-            payload.update(extra)
-            errors.append(payload)
+        def _collect(code: str, message: str, **extra: object) -> None:
+            errors.append({"code": code, "message": message, **extra})
 
-        cube_list = list(cubes)
-        # META reflection cubes are auto-appended by the runtime; the
-        # spec carries only user-supplied cubes.
-        names = [c.name for c in cube_list]
-        duplicates = sorted({n for n in names if names.count(n) > 1})
-        if duplicates:
-            _err(
-                "duplicate_cube_name",
-                f"Catalog has duplicate cube names: {duplicates}. Each cube.name "
-                "must be unique within a catalog.",
-                duplicates=duplicates,
-            )
-
-        # Primary-key declarations
-        seen_names: set[str] = set(names)
-        for cube in cube_list:
-            if cube.primary_key is None:
-                continue
-            dim_names = {d.name for d in cube.dimensions}
-            if cube.primary_key not in dim_names:
-                _err(
-                    "unknown_primary_key_dimension",
-                    f"Cube {cube.name!r} declares primary_key={cube.primary_key!r} "
-                    "but the cube has no dimension by that name.",
-                    cube=cube.name,
-                    primary_key=cube.primary_key,
-                )
-
-        # Auto-derived foreign-key joins + join target existence.
-        # We duplicate the legacy logic so the error envelope matches
-        # what :class:`Catalog` would have raised; refactoring the
-        # validation into a shared helper is a follow-up.
-        by_name: dict[str, Cube] = {c.name: c for c in cube_list}
-        augmented: list[Cube] = []
-        for cube in cube_list:
-            explicit_targets = {j.to for j in cube.joins}
-            inferred: list[Join] = []
-            for dim in cube.dimensions:
-                fk = dim.foreign_key
-                if fk is None:
-                    continue
-                if fk not in by_name:
-                    _err(
-                        "unknown_foreign_key_target",
-                        f"Cube {cube.name!r}, dimension {dim.name!r}: "
-                        f"foreign_key={fk!r} names a cube not in the catalog.",
-                        cube=cube.name,
-                        dimension=dim.name,
-                        foreign_key=fk,
-                    )
-                    continue
-                target = by_name[fk]
-                if target.primary_key is None:
-                    _err(
-                        "foreign_key_target_no_primary_key",
-                        f"Cube {cube.name!r}, dimension {dim.name!r}: "
-                        f"foreign_key={fk!r} requires the target cube to "
-                        f"declare a primary_key.",
-                        cube=cube.name,
-                        dimension=dim.name,
-                        foreign_key=fk,
-                    )
-                    continue
-                if fk in explicit_targets:
-                    continue
-                inferred.append(
-                    Join(
-                        to=fk,
-                        relationship="many_to_one",
-                        on=f"{{{cube.alias}}}.{dim.name} = {{{target.alias}}}.{target.primary_key}",
-                    )
-                )
-            if inferred:
-                cube = cube.model_copy(update={"joins": [*cube.joins, *inferred]})
-            augmented.append(cube)
-        cube_list = augmented
-        for cube in cube_list:
-            for join in cube.joins:
-                if join.to not in seen_names:
-                    _err(
-                        "unknown_join_target",
-                        f"Cube {cube.name!r} declares Join(to={join.to!r}) "
-                        f"but {join.to!r} is not in the catalog.",
-                        cube=cube.name,
-                        join_target=join.to,
-                    )
-
-        # CTE name uniqueness across the catalog
-        cte_owners: dict[str, str] = {}
-        for cube in cube_list:
-            src = cube.source
-            if not isinstance(src, DerivedTable):
-                continue
-            for cte in src.with_ctes:
-                if cte.name in cte_owners:
-                    _err(
-                        "duplicate_cte_name",
-                        f"Cube {cube.name!r}: CTE name {cte.name!r} in with_ctes "
-                        f"collides with cube {cte_owners[cte.name]!r}.",
-                        cube=cube.name,
-                        cte_name=cte.name,
-                    )
-                cte_owners[cte.name] = cube.name
-
-        # View validation
-        view_list: list[View] = list(views or [])
-        view_names: set[str] = set()
-        for v in view_list:
-            if v.name in view_names:
-                _err(
-                    "duplicate_view_name",
-                    f"Catalog has duplicate view name {v.name!r}.",
-                    view_name=v.name,
-                )
-            view_names.add(v.name)
-            if v.name in seen_names:
-                _err(
-                    "view_collides_with_cube",
-                    f"View {v.name!r} collides with cube name {v.name!r}. "
-                    "View and cube names share a namespace; rename one.",
-                    view_name=v.name,
-                )
-            for local, target_ref in v.fields.items():
-                if "." not in target_ref:
-                    _err(
-                        "unknown_view_target_field",
-                        f"View {v.name!r}, field {local!r}: target "
-                        f"{target_ref!r} must be qualified as 'cube.field'.",
-                        view_name=v.name,
-                        field=local,
-                    )
-                    continue
-                cube_name, field_name = target_ref.split(".", 1)
-                if cube_name not in by_name:
-                    _err(
-                        "unknown_view_target_cube",
-                        f"View {v.name!r}, field {local!r}: target cube "
-                        f"{cube_name!r} not in the catalog.",
-                        view_name=v.name,
-                        field=local,
-                    )
-                    continue
-                target_cube = by_name[cube_name]
-                cube_field_names = {f.name for f in target_cube.measures}
-                cube_field_names |= {f.name for f in target_cube.dimensions}
-                cube_field_names |= {f.name for f in target_cube.time_dimensions}
-                if field_name not in cube_field_names:
-                    _err(
-                        "unknown_view_target_field",
-                        f"View {v.name!r}, field {local!r}: "
-                        f"{cube_name}.{field_name} is not a known measure or "
-                        f"dimension on cube {cube_name!r}.",
-                        view_name=v.name,
-                        field=local,
-                    )
-
-        # Lookup validation
-        lookup_list: list[Lookup] = list(lookups or [])
-        seen_lookup_dims: set[str] = set()
-        for lk in lookup_list:
-            if lk.dimension in seen_lookup_dims:
-                _err(
-                    "duplicate_lookup_dimension",
-                    f"Catalog has duplicate Lookup for dimension {lk.dimension!r}.",
-                    dimension=lk.dimension,
-                )
-            seen_lookup_dims.add(lk.dimension)
-            if "." not in lk.dimension:
-                _err(
-                    "unknown_lookup_dimension",
-                    f"Lookup({lk.dimension!r}): dimension must be qualified as 'cube.dim'.",
-                    dimension=lk.dimension,
-                )
-                continue
-            cube_name, dim_name = lk.dimension.split(".", 1)
-            if cube_name not in by_name:
-                _err(
-                    "unknown_lookup_cube",
-                    f"Lookup({lk.dimension!r}): cube {cube_name!r} is not in the catalog.",
-                    dimension=lk.dimension,
-                )
-                continue
-            target_cube = by_name[cube_name]
-            target_dim = next((d for d in target_cube.dimensions if d.name == dim_name), None)
-            if target_dim is None:
-                _err(
-                    "unknown_lookup_dimension",
-                    f"Lookup({lk.dimension!r}): cube {cube_name!r} has no "
-                    f"dimension named {dim_name!r}.",
-                    dimension=lk.dimension,
-                )
-                continue
-            if target_dim.type != "string":
-                _err(
-                    "lookup_dimension_wrong_type",
-                    f"Lookup({lk.dimension!r}): only string-typed dimensions "
-                    f"are eligible — {dim_name!r} is type={target_dim.type!r}.",
-                    dimension=lk.dimension,
-                )
-
-        # Saved queries
-        saved_query_list: list[SavedQuery] = list(saved_queries or [])
-        seen_saved_names: set[str] = set()
-        for sq in saved_query_list:
-            if not sq.name or "." in sq.name or " " in sq.name:
-                _err(
-                    "invalid_saved_query_name",
-                    f"SavedQuery has invalid name {sq.name!r}: must be non-empty "
-                    "and contain no dots or spaces.",
-                    saved_query_name=sq.name,
-                )
-            if sq.name in seen_saved_names:
-                _err(
-                    "duplicate_saved_query_name",
-                    f"Catalog has duplicate SavedQuery name {sq.name!r}.",
-                    saved_query_name=sq.name,
-                )
-            if sq.name in seen_names or sq.name in view_names:
-                _err(
-                    "saved_query_collides_with_cube_or_view",
-                    f"SavedQuery name {sq.name!r} collides with a cube or view of the same name.",
-                    saved_query_name=sq.name,
-                )
-            seen_saved_names.add(sq.name)
-
-        # Replacement pointers
-        for cube in cube_list:
-            if cube.replacement is not None and cube.replacement not in by_name:
-                _err(
-                    "unknown_replacement_cube",
-                    f"Cube {cube.name!r}: replacement={cube.replacement!r} "
-                    "names a cube not in the catalog.",
-                    cube=cube.name,
-                    replacement=cube.replacement,
-                )
-        saved_query_by_name = {sq.name: sq for sq in saved_query_list}
-        for sq in saved_query_list:
-            if sq.replacement is not None and sq.replacement not in saved_query_by_name:
-                _err(
-                    "unknown_replacement_saved_query",
-                    f"SavedQuery {sq.name!r}: replacement={sq.replacement!r} "
-                    "names a saved query not in the catalog.",
-                    saved_query_name=sq.name,
-                    replacement=sq.replacement,
-                )
-
-        # Glossary collisions (case-insensitive)
-        glossary_list: list[GlossaryEntry] = list(glossary or [])
-        seen_glossary: dict[str, str] = {}
-
-        def _register(token: str, source: str) -> None:
-            key = token.lower()
-            if key in seen_glossary:
-                _err(
-                    "glossary_token_collision",
-                    f"Catalog glossary: token {token!r} ({source}) collides with "
-                    f"{seen_glossary[key]} (case-insensitive).",
-                    token=token,
-                    conflict_with=seen_glossary[key],
-                )
-            seen_glossary[key] = source
-
-        for g in glossary_list:
-            _register(g.term, f"term {g.term!r}")
-            for a in g.aliases:
-                _register(a, f"alias on term {g.term!r}")
-
-        # Relations narrative — best-effort; only run if there are no
-        # name collisions upstream (otherwise the message is misleading).
-        relations_str = relations
-        try:
-            relations_str = validate_relations("Catalog", "<catalog>", relations)
-        except ValueError as exc:
-            _err(
-                "invalid_relations",
-                str(exc),
-            )
-
+        cube_list, relations_str = _run_catalog_validations(
+            cubes=list(cubes),
+            views=list(views or []),
+            lookups=list(lookups or []),
+            saved_queries=list(saved_queries or []),
+            glossary=list(glossary or []),
+            relations=relations,
+            scope_fn_names=scope_fn_names,
+            unit_registry=DEFAULT_REGISTRY,
+            emit=_collect,
+        )
         spec = cls(
             cubes=tuple(cube_list),
-            views=tuple(view_list),
-            lookups=tuple(lookup_list),
-            saved_queries=tuple(saved_query_list),
-            glossary=tuple(glossary_list),
+            views=tuple(views or []),
+            lookups=tuple(lookups or []),
+            saved_queries=tuple(saved_queries or []),
+            glossary=tuple(glossary or []),
             relations=relations_str,
             compile_hook_names=tuple(compile_hook_names),
             sql_rewrite_hook_names=tuple(sql_rewrite_hook_names),
@@ -579,119 +703,52 @@ class Catalog:
     ) -> None:
         self.compile_hooks = compile_hooks or []
         self.sql_rewrite_hooks = sql_rewrite_hooks or []
-        names = [c.name for c in cubes]
-        duplicates = sorted({n for n in names if names.count(n) > 1})
-        if duplicates:
-            raise ValueError(
-                f"Catalog has duplicate cube names: {duplicates}. "
-                "Each cube.name must be unique within a catalog."
-            )
 
-        # Auto-append any missing META cubes so reflection always works.
-        existing = set(names)
+        # META reflection cubes are appended (so reflection always works)
+        # and ``extends`` chains flattened *before* validation, so the
+        # checks see the full, inheritance-resolved cube set.
+        existing = {c.name for c in cubes}
         merged: list[Cube] = list(cubes)
         for meta in META_CUBES:
             if meta.name not in existing:
                 merged.append(meta)
                 existing.add(meta.name)
-
-        # Resolve ``extends`` chains — flatten inherited measures /
-        # dimensions / time_dimensions / segments by name. Detect cycles.
         merged = _resolve_extends(merged)
 
-        # Validate primary_key declarations — must name a real dimension.
-        for c in merged:
-            if c.primary_key is not None:
-                dim_names = {d.name for d in c.dimensions}
-                if c.primary_key not in dim_names:
-                    raise ValueError(
-                        f"Cube {c.name!r} declares primary_key="
-                        f"{c.primary_key!r} but the cube has no dimension "
-                        f"by that name. Declare it as a Dimension or pick "
-                        f"a different primary_key."
-                    )
+        view_list: list[View] = list(views or [])
+        lookup_list: list[Lookup] = list(lookups or [])
+        saved_query_list: list[SavedQuery] = list(saved_queries or [])
+        glossary_list: list[GlossaryEntry] = list(glossary or [])
+        self.unit_registry: Registry = unit_registry or DEFAULT_REGISTRY
+        self._scope_fns: dict[str, ScopeFn] = dict(scope_fns or {})
 
-        # Auto-derive Join edges from Dimension.foreign_key declarations.
-        # An explicit Join with the same target wins — no duplicates.
-        by_name: dict[str, Cube] = {c.name: c for c in merged}
-        for cube in merged:
-            inferred: list[Join] = []
-            explicit_targets = {j.to for j in cube.joins}
-            for dim in cube.dimensions:
-                fk = dim.foreign_key
-                if fk is None:
-                    continue
-                if fk not in by_name:
-                    raise ValueError(
-                        f"Cube {cube.name!r}, dimension {dim.name!r}: "
-                        f"foreign_key={fk!r} names a cube not in the "
-                        f"catalog. Known cubes: {sorted(by_name)}."
-                    )
-                target = by_name[fk]
-                if target.primary_key is None:
-                    raise ValueError(
-                        f"Cube {cube.name!r}, dimension {dim.name!r}: "
-                        f"foreign_key={fk!r} requires the target cube "
-                        f"to declare a primary_key. Add primary_key="
-                        f"'<dim>' to cube {fk!r}."
-                    )
-                if fk in explicit_targets:
-                    continue  # explicit Join wins
-                inferred.append(
-                    Join(
-                        to=fk,
-                        relationship="many_to_one",
-                        on=f"{{{cube.alias}}}.{dim.name} = {{{target.alias}}}.{target.primary_key}",
-                    )
-                )
-            if inferred:
-                # Replace the cube with a copy carrying the augmented joins.
-                # Cube isn't frozen, but stay disciplined and use model_copy.
-                merged[merged.index(cube)] = cube.model_copy(
-                    update={"joins": [*cube.joins, *inferred]}
-                )
+        # First-error validation: the shared routine raises on the first
+        # diagnostic. ``CatalogSpec.from_iterables`` is the collect-all
+        # twin — same checks, different emit — so the two can't drift.
+        def _raise(code: str, message: str, **extra: object) -> None:
+            raise ValueError(message)
 
-        known = {c.name for c in merged}
-        for c in merged:
-            for j in c.joins:
-                if j.to not in known:
-                    raise ValueError(
-                        f"Cube {c.name!r} declares Join(to={j.to!r}) but "
-                        f"{j.to!r} is not in the catalog. "
-                        f"Known cubes: {sorted(known)}."
-                    )
-
-        # DerivedTable CTE names live in a flat namespace across the
-        # whole catalog — the compiler hoists every touched cube's CTEs
-        # into a single outer ``WITH`` clause, so two cubes that both
-        # declare ``WITH foo AS (...)`` with different bodies would
-        # silently lose one. Surface the collision at construction time.
-        cte_owners: dict[str, str] = {}
-        for cube in merged:
-            src = cube.source
-            if not isinstance(src, DerivedTable):
-                continue
-            for cte in src.with_ctes:
-                if cte.name in cte_owners:
-                    raise ValueError(
-                        f"Cube {cube.name!r}: CTE name {cte.name!r} in "
-                        f"with_ctes collides with cube "
-                        f"{cte_owners[cte.name]!r}. CTE names must be "
-                        "unique across the catalog."
-                    )
-                cte_owners[cte.name] = cube.name
+        merged, relations_str = _run_catalog_validations(
+            cubes=merged,
+            views=view_list,
+            lookups=lookup_list,
+            saved_queries=saved_query_list,
+            glossary=glossary_list,
+            relations=relations,
+            scope_fn_names=list(self._scope_fns),
+            unit_registry=self.unit_registry,
+            emit=_raise,
+        )
 
         self._cubes: list[Cube] = merged
         self._by_name: dict[str, Cube] = {c.name: c for c in merged}
 
         # Default-deny lint (opt-in). A cube with tenancy='none', no
-        # ``scope`` and no ``required_roles`` has *no* access control of
-        # any kind — every viewer sees every row. That's legitimate for
-        # public lookups, but for a catalog of sensitive data it's almost
-        # always an oversight (and the 'none' default makes it easy to
-        # reach by simply not thinking about tenancy). ``strict_tenancy``
-        # turns that oversight into a construction error. META reflection
-        # cubes are exempt — they describe the catalog, not tenant data.
+        # ``scope`` and no ``required_roles`` has *no* access control —
+        # every viewer sees every row. Legitimate for public lookups, but
+        # for sensitive data it's almost always an oversight (the 'none'
+        # default makes it easy to reach). ``strict_tenancy`` turns that
+        # into a construction error. META reflection cubes are exempt.
         if strict_tenancy:
             unguarded = [
                 c.name
@@ -709,184 +766,12 @@ class Catalog:
                     "required_roles (or drop strict_tenancy to allow open cubes)."
                 )
 
-        # Validate views: every field target must resolve to a real
-        # cube.field, and view names can't collide with cube names.
-        view_list: list[View] = list(views or [])
-        seen_view_names: set[str] = set()
-        for v in view_list:
-            if v.name in seen_view_names:
-                raise ValueError(f"Catalog has duplicate view name {v.name!r}.")
-            seen_view_names.add(v.name)
-            if v.name in self._by_name:
-                raise ValueError(
-                    f"View {v.name!r} collides with cube name {v.name!r}. "
-                    "View and cube names share a namespace; rename one."
-                )
-            for local, target_ref in v.fields.items():
-                cube_name, field_name = target_ref.split(".", 1)
-                if cube_name not in self._by_name:
-                    raise ValueError(
-                        f"View {v.name!r}, field {local!r}: target "
-                        f"cube {cube_name!r} not in the catalog. "
-                        f"Known cubes: {sorted(self._by_name)}."
-                    )
-                target_cube = self._by_name[cube_name]
-                cube_field_names = {f.name for f in target_cube.measures}
-                cube_field_names |= {f.name for f in target_cube.dimensions}
-                cube_field_names |= {f.name for f in target_cube.time_dimensions}
-                if field_name not in cube_field_names:
-                    raise ValueError(
-                        f"View {v.name!r}, field {local!r}: "
-                        f"{cube_name}.{field_name} is not a known measure "
-                        f"or dimension on cube {cube_name!r}."
-                    )
         self.views: dict[str, View] = {v.name: v for v in view_list}
         self._policy: PolicyFn | None = policy
-
-        # Validate scope_fns: every Cube.scope must resolve to a
-        # registered name. Catching it here means the compiler can
-        # trust the registry lookup later.
-        # Unit conversion registry — used by downstream presenters
-        # (visualize, renderers) when applying ``Measure.display_unit``
-        # to row values. Defaults to the shared process-wide registry;
-        # pass a custom :class:`semql.units.Registry` to isolate a
-        # catalog's vocabulary (e.g. per-tenant overrides) without
-        # mutating the global one.
-        self.unit_registry: Registry = unit_registry or DEFAULT_REGISTRY
-
-        # Unit / display_unit validation — fail fast on configuration
-        # errors that would otherwise only surface at render time.
-        # Two checks:
-        #   1. ``display_unit`` without ``unit`` — the renderer would
-        #      have nothing to convert FROM.
-        #   2. The (unit, display_unit) pair must be reachable in the
-        #      registry. Catches typos like ``display_unit="hour"`` vs
-        #      ``"hours"`` that Pydantic accepts as plain strings.
-        # Both checks are skipped when ``unit`` matches ``display_unit``
-        # (no conversion needed) or when only ``unit`` is set.
-        for cube in merged:
-            for fld in (*cube.measures, *cube.dimensions):
-                self._check_unit_pair(cube, fld)
-
-        # Lookups: dimension-value catalogs addressable by qualified
-        # ``cube.dim``. Each Lookup's dimension must resolve to a real
-        # ``string``-typed Dimension on a real cube — typo or type
-        # mismatches surface here instead of at prompt-render time.
-        lookup_list: list[Lookup] = list(lookups or [])
-        seen_lookup_dims: set[str] = set()
-        for lk in lookup_list:
-            if lk.dimension in seen_lookup_dims:
-                raise ValueError(
-                    f"Catalog has duplicate Lookup for dimension "
-                    f"{lk.dimension!r}. Each ``cube.dim`` may have at "
-                    "most one Lookup."
-                )
-            seen_lookup_dims.add(lk.dimension)
-            cube_name, dim_name = lk.dimension.split(".", 1)
-            if cube_name not in self._by_name:
-                raise ValueError(
-                    f"Lookup({lk.dimension!r}): cube {cube_name!r} is "
-                    f"not in the catalog. Known cubes: "
-                    f"{sorted(self._by_name)}."
-                )
-            target_cube = self._by_name[cube_name]
-            target_dim: Dimension | None = next(
-                (d for d in target_cube.dimensions if d.name == dim_name), None
-            )
-            if target_dim is None:
-                raise ValueError(
-                    f"Lookup({lk.dimension!r}): cube {cube_name!r} has "
-                    f"no dimension named {dim_name!r}. Known dimensions: "
-                    f"{sorted(d.name for d in target_cube.dimensions)}."
-                )
-            if target_dim.type != "string":
-                raise ValueError(
-                    f"Lookup({lk.dimension!r}): only string-typed "
-                    f"dimensions are eligible — {dim_name!r} is type="
-                    f"{target_dim.type!r}."
-                )
         self.lookups: dict[str, Lookup] = {lk.dimension: lk for lk in lookup_list}
-
-        # Saved queries — pre-baked SemanticQueries the MCP layer
-        # auto-exposes as zero-arg tools. Validate name uniqueness +
-        # name shape; a deeper compile-time validation of each query
-        # against the catalog is best-effort and gated behind
-        # ``validate_saved_queries`` so a half-built catalog at
-        # bootstrap time still loads.
-        saved_query_list: list[SavedQuery] = list(saved_queries or [])
-        seen_saved_names: set[str] = set()
-        for sq in saved_query_list:
-            if not sq.name or "." in sq.name or " " in sq.name:
-                raise ValueError(
-                    f"SavedQuery has invalid name {sq.name!r}: must be "
-                    "non-empty and contain no dots or spaces (it becomes "
-                    "part of an MCP tool name)."
-                )
-            if sq.name in seen_saved_names:
-                raise ValueError(
-                    f"Catalog has duplicate SavedQuery name {sq.name!r}. "
-                    "Each saved query's name must be unique."
-                )
-            if sq.name in self._by_name or sq.name in self.views:
-                raise ValueError(
-                    f"SavedQuery name {sq.name!r} collides with a cube "
-                    "or view of the same name. Saved-query / cube / view "
-                    "names share a namespace; rename one."
-                )
-            seen_saved_names.add(sq.name)
         self.saved_queries: dict[str, SavedQuery] = {sq.name: sq for sq in saved_query_list}
-
-        # Replacement pointers must name a real cube. Cube doesn't
-        # know its siblings at construction time; check here.
-        for c in merged:
-            if c.replacement is not None and c.replacement not in self._by_name:
-                raise ValueError(
-                    f"Cube {c.name!r}: replacement={c.replacement!r} names "
-                    f"a cube not in the catalog. Known cubes: "
-                    f"{sorted(self._by_name)}."
-                )
-        for sq in saved_query_list:
-            if sq.replacement is not None and sq.replacement not in self.saved_queries:
-                raise ValueError(
-                    f"SavedQuery {sq.name!r}: replacement={sq.replacement!r} "
-                    f"names a saved query not in the catalog. Known saved "
-                    f"queries: {sorted(self.saved_queries)}."
-                )
-
-        # Catalog-wide glossary + cross-cube relations narrative.
-        # Terms and aliases share one namespace (the retriever indexes
-        # aliases as separate documents pointing at the same canonical
-        # entry, so a token that's both a term and an alias would be
-        # ambiguous). Collisions are raised case-insensitively.
-        glossary_list: list[GlossaryEntry] = list(glossary or [])
-        seen_glossary: dict[str, str] = {}  # lowercase token → "term:X" / "alias on X"
-
-        def _register(token: str, source: str) -> None:
-            key = token.lower()
-            if key in seen_glossary:
-                raise ValueError(
-                    f"Catalog glossary: token {token!r} ({source}) collides "
-                    f"with {seen_glossary[key]} (case-insensitive). Terms "
-                    "and aliases share one namespace; rename one."
-                )
-            seen_glossary[key] = source
-
-        for g in glossary_list:
-            _register(g.term, f"term {g.term!r}")
-            for a in g.aliases:
-                _register(a, f"alias on term {g.term!r}")
         self.glossary: list[GlossaryEntry] = glossary_list
-        self.relations: str = validate_relations("Catalog", "<catalog>", relations)
-
-        self._scope_fns: dict[str, ScopeFn] = dict(scope_fns or {})
-        for c in merged:
-            if c.scope is not None and c.scope not in self._scope_fns:
-                raise ValueError(
-                    f"Cube {c.name!r} declares scope={c.scope!r} but no "
-                    f"scope function is registered under that name. "
-                    f"Pass scope_fns={{'{c.scope}': fn, ...}} to the Catalog "
-                    f"constructor. Registered scopes: {sorted(self._scope_fns)}."
-                )
+        self.relations: str = relations_str
         self._error_transform: object | None = error_transform
 
         # build the spec + runtime pair now that validation has
@@ -914,37 +799,6 @@ class Catalog:
             compile_hooks=list(self.compile_hooks),
             sql_rewrite_hooks=list(self.sql_rewrite_hooks),
         )
-
-    def _check_unit_pair(self, cube: Cube, fld: BaseField) -> None:
-        """Validate ``unit`` / ``display_unit`` on a single field.
-
-        Raises ``ValueError`` with a pointer to the offending cube and
-        field if:
-          * ``display_unit`` is set without ``unit``, or
-          * the pair can't be converted in ``self.unit_registry``.
-        Skips no-op pairs where ``unit == display_unit``.
-        """
-        unit = getattr(fld, "unit", None)
-        display_unit = getattr(fld, "display_unit", None)
-        if display_unit is None:
-            return
-        if unit is None:
-            raise ValueError(
-                f"Cube {cube.name!r}, field {fld.name!r}: display_unit="
-                f"{display_unit!r} requires unit to also be set — there's "
-                "nothing to convert from."
-            )
-        if unit == display_unit:
-            return
-        try:
-            self.unit_registry.factor(unit, display_unit)
-        except ValueError as exc:
-            raise ValueError(
-                f"Cube {cube.name!r}, field {fld.name!r}: cannot convert "
-                f"{unit!r} → {display_unit!r}: {exc}. "
-                "Register the conversion on the catalog's unit_registry "
-                "or correct the spelling."
-            ) from exc
 
     @property
     def policy(self) -> PolicyFn | None:
