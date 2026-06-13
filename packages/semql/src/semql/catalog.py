@@ -6,20 +6,38 @@ provides convenience methods that wrap the lower-level
 ``compile_query`` function. Prompt rendering lives in the separate
 ``semql-prompt`` package (``semql_prompt.planner_prompt(catalog, ...)``).
 
+B5 — CatalogSpec / CatalogRuntime split:
+- :class:`CatalogSpec` is a frozen Pydantic value type holding the
+  serialisable catalog data (cubes, views, lookups, saved queries,
+  glossary, relations, hook names). Round-trips through
+  ``model_dump`` / ``from_dict`` so a catalog can cross a process
+  boundary (cached specs, migrations, multi-tenant overrides).
+- :class:`CatalogRuntime` is a frozen dataclass for the callables
+  (policy, scope_fns, unit_registry, error_transform, hooks). Not
+  part of the serialised payload.
+- :class:`Catalog` pairs a spec with a runtime. The legacy public
+  constructor (``Catalog(cubes=..., policy=..., ...)``) builds both
+  internally and stays backward-compatible.
+
 Construction-time validation:
 - No duplicate cube names.
 - Every ``Join.to`` resolves to a cube in the catalog.
 
 Both are reasons a query would fail at compile time later — surfacing
 them at catalog construction means the planner and MCP layer can
-trust the input.
+trust the input. ``CatalogSpec.from_iterables`` is the
+collect-all counterpart for callers that want every problem
+aggregated into a single list instead of a first-error raise.
 """
 
 from __future__ import annotations
 
 import difflib
-from collections.abc import Iterator
-from typing import TYPE_CHECKING, TypeVar
+from collections.abc import Iterator, Sequence
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, TypeVar
+
+from pydantic import BaseModel, ConfigDict, Field
 
 from semql._grounding import validate_relations
 
@@ -51,9 +69,501 @@ if TYPE_CHECKING:
     from semql.validate import ValidationError
 
 
+class CatalogSpec(BaseModel):
+    """B5 — the serialisable half of a Catalog.
+
+    A :class:`CatalogSpec` carries every field that survives a process
+    boundary: cubes, views, lookups, saved queries, glossary, the
+    catalog-wide relations narrative, and the names of the compile /
+    sql-rewrite hooks (the callables themselves live on the runtime
+    — names are the wire-format handle). Round-trips byte-stable
+    through ``model_dump`` / ``from_dict``.
+
+    Specs are immutable: mutate via ``model_copy(update=...)`` and
+    re-construct the catalog, or use :meth:`from_iterables` for a
+    collect-all build that aggregates every construction error into
+    a structured list (the PHILOSOPHY.md validate-path promise).
+
+    Hooks as names: ``compile_hook_names`` is a tuple of strings
+    (e.g. ``("myapp.audit_hook",)``) — the runtime side is
+    responsible for resolving the name back to a callable. This
+    keeps the spec serialisable without dragging the callables
+    into the payload.
+
+    The ``schema_version`` field is bumped on a breaking change to
+    the spec shape. ``from_dict`` surfaces a clear error on a stale
+    payload rather than silently corrupting state.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    #: Bump on a breaking change to the wire format.
+    schema_version: int = 1
+    cubes: tuple[Cube, ...] = ()
+    views: tuple[View, ...] = ()
+    lookups: tuple[Lookup, ...] = ()
+    saved_queries: tuple[SavedQuery, ...] = ()
+    glossary: tuple[GlossaryEntry, ...] = ()
+    relations: str = ""
+    compile_hook_names: tuple[str, ...] = ()
+    sql_rewrite_hook_names: tuple[str, ...] = ()
+
+    #: Aggregated construction errors from :meth:`from_iterables`.
+    #: ``()`` for a clean build; populated when collect-all surfaces
+    #: a problem the legacy first-error constructor would have raised.
+    construction_errors: tuple[dict[str, Any], ...] = Field(default_factory=tuple)
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> CatalogSpec:
+        """Construct a :class:`CatalogSpec` from a dict payload.
+
+        Equivalent to ``CatalogSpec.model_validate(payload)`` —
+        named for the wire-format use case (read from JSON / a DB
+        row / a serialised cache)."""
+        return cls.model_validate(payload)
+
+    @classmethod
+    def from_iterables(
+        cls,
+        *,
+        cubes: Sequence[Cube] = (),
+        views: Sequence[View] | None = None,
+        lookups: Sequence[Lookup] | None = None,
+        saved_queries: Sequence[SavedQuery] | None = None,
+        glossary: Sequence[GlossaryEntry] | None = None,
+        relations: str = "",
+        compile_hook_names: Sequence[str] = (),
+        sql_rewrite_hook_names: Sequence[str] = (),
+    ) -> tuple[CatalogSpec, list[dict[str, Any]]]:
+        """Collect-all constructor for a spec.
+
+        Runs every validation the legacy :class:`Catalog` constructor
+        would have raised on (duplicate cube names, unknown join
+        targets, view ref resolution, lookup dim resolution, saved
+        query collisions, glossary token collisions, scope function
+        registration, primary-key declarations, replacement
+        pointers, ...) and aggregates the failures into a structured
+        ``errors`` list. The spec itself is returned regardless of
+        whether errors were collected — a caller can inspect the
+        partial spec for diagnostics, then decide whether to surface
+        the errors or pair with a runtime anyway.
+
+        Each error is a dict shaped ``{"code", "message", ...}``
+        (the B8 envelope shape). Codes are stable identifiers:
+
+        - ``duplicate_cube_name``
+        - ``unknown_primary_key_dimension``
+        - ``unknown_join_target``
+        - ``unknown_foreign_key_target``
+        - ``foreign_key_target_no_primary_key``
+        - ``missing_primary_key_for_foreign_key``
+        - ``duplicate_cte_name``
+        - ``duplicate_view_name``
+        - ``view_collides_with_cube``
+        - ``unknown_view_target_cube``
+        - ``unknown_view_target_field``
+        - ``view_target_field_wrong_type``
+        - ``unit_display_without_unit``
+        - ``unknown_unit_conversion``
+        - ``duplicate_lookup_dimension``
+        - ``unknown_lookup_cube``
+        - ``unknown_lookup_dimension``
+        - ``lookup_dimension_wrong_type``
+        - ``invalid_saved_query_name``
+        - ``duplicate_saved_query_name``
+        - ``saved_query_collides_with_cube_or_view``
+        - ``unknown_replacement_cube``
+        - ``unknown_replacement_saved_query``
+        - ``glossary_token_collision``
+        - ``unknown_scope_function``
+        """
+        errors: list[dict[str, Any]] = []
+
+        def _err(code: str, message: str, **extra: object) -> None:
+            payload: dict[str, Any] = {"code": code, "message": message}
+            payload.update(extra)
+            errors.append(payload)
+
+        cube_list = list(cubes)
+        # META reflection cubes are auto-appended by the runtime; the
+        # spec carries only user-supplied cubes.
+        names = [c.name for c in cube_list]
+        duplicates = sorted({n for n in names if names.count(n) > 1})
+        if duplicates:
+            _err(
+                "duplicate_cube_name",
+                f"Catalog has duplicate cube names: {duplicates}. Each cube.name "
+                "must be unique within a catalog.",
+                duplicates=duplicates,
+            )
+
+        # Primary-key declarations
+        seen_names: set[str] = set(names)
+        for cube in cube_list:
+            if cube.primary_key is None:
+                continue
+            dim_names = {d.name for d in cube.dimensions}
+            if cube.primary_key not in dim_names:
+                _err(
+                    "unknown_primary_key_dimension",
+                    f"Cube {cube.name!r} declares primary_key={cube.primary_key!r} "
+                    "but the cube has no dimension by that name.",
+                    cube=cube.name,
+                    primary_key=cube.primary_key,
+                )
+
+        # Auto-derived foreign-key joins + join target existence.
+        # We duplicate the legacy logic so the error envelope matches
+        # what :class:`Catalog` would have raised; refactoring the
+        # validation into a shared helper is a follow-up.
+        by_name: dict[str, Cube] = {c.name: c for c in cube_list}
+        augmented: list[Cube] = []
+        for cube in cube_list:
+            explicit_targets = {j.to for j in cube.joins}
+            inferred: list[Join] = []
+            for dim in cube.dimensions:
+                fk = dim.foreign_key
+                if fk is None:
+                    continue
+                if fk not in by_name:
+                    _err(
+                        "unknown_foreign_key_target",
+                        f"Cube {cube.name!r}, dimension {dim.name!r}: "
+                        f"foreign_key={fk!r} names a cube not in the catalog.",
+                        cube=cube.name,
+                        dimension=dim.name,
+                        foreign_key=fk,
+                    )
+                    continue
+                target = by_name[fk]
+                if target.primary_key is None:
+                    _err(
+                        "foreign_key_target_no_primary_key",
+                        f"Cube {cube.name!r}, dimension {dim.name!r}: "
+                        f"foreign_key={fk!r} requires the target cube to "
+                        f"declare a primary_key.",
+                        cube=cube.name,
+                        dimension=dim.name,
+                        foreign_key=fk,
+                    )
+                    continue
+                if fk in explicit_targets:
+                    continue
+                inferred.append(
+                    Join(
+                        to=fk,
+                        relationship="many_to_one",
+                        on=f"{{{cube.alias}}}.{dim.name} = {{{target.alias}}}.{target.primary_key}",
+                    )
+                )
+            if inferred:
+                cube = cube.model_copy(update={"joins": [*cube.joins, *inferred]})
+            augmented.append(cube)
+        cube_list = augmented
+        for cube in cube_list:
+            for join in cube.joins:
+                if join.to not in seen_names:
+                    _err(
+                        "unknown_join_target",
+                        f"Cube {cube.name!r} declares Join(to={join.to!r}) "
+                        f"but {join.to!r} is not in the catalog.",
+                        cube=cube.name,
+                        join_target=join.to,
+                    )
+
+        # CTE name uniqueness across the catalog
+        cte_owners: dict[str, str] = {}
+        for cube in cube_list:
+            src = cube.source
+            if not isinstance(src, DerivedTable):
+                continue
+            for cte in src.with_ctes:
+                if cte.name in cte_owners:
+                    _err(
+                        "duplicate_cte_name",
+                        f"Cube {cube.name!r}: CTE name {cte.name!r} in with_ctes "
+                        f"collides with cube {cte_owners[cte.name]!r}.",
+                        cube=cube.name,
+                        cte_name=cte.name,
+                    )
+                cte_owners[cte.name] = cube.name
+
+        # View validation
+        view_list: list[View] = list(views or [])
+        view_names: set[str] = set()
+        for v in view_list:
+            if v.name in view_names:
+                _err(
+                    "duplicate_view_name",
+                    f"Catalog has duplicate view name {v.name!r}.",
+                    view_name=v.name,
+                )
+            view_names.add(v.name)
+            if v.name in seen_names:
+                _err(
+                    "view_collides_with_cube",
+                    f"View {v.name!r} collides with cube name {v.name!r}. "
+                    "View and cube names share a namespace; rename one.",
+                    view_name=v.name,
+                )
+            for local, target_ref in v.fields.items():
+                if "." not in target_ref:
+                    _err(
+                        "unknown_view_target_field",
+                        f"View {v.name!r}, field {local!r}: target "
+                        f"{target_ref!r} must be qualified as 'cube.field'.",
+                        view_name=v.name,
+                        field=local,
+                    )
+                    continue
+                cube_name, field_name = target_ref.split(".", 1)
+                if cube_name not in by_name:
+                    _err(
+                        "unknown_view_target_cube",
+                        f"View {v.name!r}, field {local!r}: target cube "
+                        f"{cube_name!r} not in the catalog.",
+                        view_name=v.name,
+                        field=local,
+                    )
+                    continue
+                target_cube = by_name[cube_name]
+                cube_field_names = {f.name for f in target_cube.measures}
+                cube_field_names |= {f.name for f in target_cube.dimensions}
+                cube_field_names |= {f.name for f in target_cube.time_dimensions}
+                if field_name not in cube_field_names:
+                    _err(
+                        "unknown_view_target_field",
+                        f"View {v.name!r}, field {local!r}: "
+                        f"{cube_name}.{field_name} is not a known measure or "
+                        f"dimension on cube {cube_name!r}.",
+                        view_name=v.name,
+                        field=local,
+                    )
+
+        # Lookup validation
+        lookup_list: list[Lookup] = list(lookups or [])
+        seen_lookup_dims: set[str] = set()
+        for lk in lookup_list:
+            if lk.dimension in seen_lookup_dims:
+                _err(
+                    "duplicate_lookup_dimension",
+                    f"Catalog has duplicate Lookup for dimension {lk.dimension!r}.",
+                    dimension=lk.dimension,
+                )
+            seen_lookup_dims.add(lk.dimension)
+            if "." not in lk.dimension:
+                _err(
+                    "unknown_lookup_dimension",
+                    f"Lookup({lk.dimension!r}): dimension must be qualified as 'cube.dim'.",
+                    dimension=lk.dimension,
+                )
+                continue
+            cube_name, dim_name = lk.dimension.split(".", 1)
+            if cube_name not in by_name:
+                _err(
+                    "unknown_lookup_cube",
+                    f"Lookup({lk.dimension!r}): cube {cube_name!r} is not in the catalog.",
+                    dimension=lk.dimension,
+                )
+                continue
+            target_cube = by_name[cube_name]
+            target_dim = next((d for d in target_cube.dimensions if d.name == dim_name), None)
+            if target_dim is None:
+                _err(
+                    "unknown_lookup_dimension",
+                    f"Lookup({lk.dimension!r}): cube {cube_name!r} has no "
+                    f"dimension named {dim_name!r}.",
+                    dimension=lk.dimension,
+                )
+                continue
+            if target_dim.type != "string":
+                _err(
+                    "lookup_dimension_wrong_type",
+                    f"Lookup({lk.dimension!r}): only string-typed dimensions "
+                    f"are eligible — {dim_name!r} is type={target_dim.type!r}.",
+                    dimension=lk.dimension,
+                )
+
+        # Saved queries
+        saved_query_list: list[SavedQuery] = list(saved_queries or [])
+        seen_saved_names: set[str] = set()
+        for sq in saved_query_list:
+            if not sq.name or "." in sq.name or " " in sq.name:
+                _err(
+                    "invalid_saved_query_name",
+                    f"SavedQuery has invalid name {sq.name!r}: must be non-empty "
+                    "and contain no dots or spaces.",
+                    saved_query_name=sq.name,
+                )
+            if sq.name in seen_saved_names:
+                _err(
+                    "duplicate_saved_query_name",
+                    f"Catalog has duplicate SavedQuery name {sq.name!r}.",
+                    saved_query_name=sq.name,
+                )
+            if sq.name in seen_names or sq.name in view_names:
+                _err(
+                    "saved_query_collides_with_cube_or_view",
+                    f"SavedQuery name {sq.name!r} collides with a cube or view of the same name.",
+                    saved_query_name=sq.name,
+                )
+            seen_saved_names.add(sq.name)
+
+        # Replacement pointers
+        for cube in cube_list:
+            if cube.replacement is not None and cube.replacement not in by_name:
+                _err(
+                    "unknown_replacement_cube",
+                    f"Cube {cube.name!r}: replacement={cube.replacement!r} "
+                    "names a cube not in the catalog.",
+                    cube=cube.name,
+                    replacement=cube.replacement,
+                )
+        saved_query_by_name = {sq.name: sq for sq in saved_query_list}
+        for sq in saved_query_list:
+            if sq.replacement is not None and sq.replacement not in saved_query_by_name:
+                _err(
+                    "unknown_replacement_saved_query",
+                    f"SavedQuery {sq.name!r}: replacement={sq.replacement!r} "
+                    "names a saved query not in the catalog.",
+                    saved_query_name=sq.name,
+                    replacement=sq.replacement,
+                )
+
+        # Glossary collisions (case-insensitive)
+        glossary_list: list[GlossaryEntry] = list(glossary or [])
+        seen_glossary: dict[str, str] = {}
+
+        def _register(token: str, source: str) -> None:
+            key = token.lower()
+            if key in seen_glossary:
+                _err(
+                    "glossary_token_collision",
+                    f"Catalog glossary: token {token!r} ({source}) collides with "
+                    f"{seen_glossary[key]} (case-insensitive).",
+                    token=token,
+                    conflict_with=seen_glossary[key],
+                )
+            seen_glossary[key] = source
+
+        for g in glossary_list:
+            _register(g.term, f"term {g.term!r}")
+            for a in g.aliases:
+                _register(a, f"alias on term {g.term!r}")
+
+        # Relations narrative — best-effort; only run if there are no
+        # name collisions upstream (otherwise the message is misleading).
+        relations_str = relations
+        try:
+            relations_str = validate_relations("Catalog", "<catalog>", relations)
+        except ValueError as exc:
+            _err(
+                "invalid_relations",
+                str(exc),
+            )
+
+        spec = cls(
+            cubes=tuple(cube_list),
+            views=tuple(view_list),
+            lookups=tuple(lookup_list),
+            saved_queries=tuple(saved_query_list),
+            glossary=tuple(glossary_list),
+            relations=relations_str,
+            compile_hook_names=tuple(compile_hook_names),
+            sql_rewrite_hook_names=tuple(sql_rewrite_hook_names),
+            construction_errors=tuple(errors),
+        )
+        return spec, errors
+
+
+@dataclass(frozen=True)
+class CatalogRuntime:
+    """B5 — the callable half of a Catalog.
+
+    The runtime holds the callables that can't cross a process
+    boundary: the visibility policy, the scope-function registry,
+    the unit registry, the error transform, the compile / sql-rewrite
+    hooks. The wire-format spec records the *names* of the hooks;
+    the runtime resolves them back to callables at construction
+    time (or accepts them directly when built in-process).
+
+    Not serialisable by design: ``model_dump`` is intentionally
+    absent. Callers serialise the spec and pair it with a fresh
+    runtime on the receiving side.
+    """
+
+    policy: PolicyFn | None
+    scope_fns: dict[str, ScopeFn]
+    unit_registry: Registry | None
+    error_transform: object | None
+    compile_hooks: list[CompileHook]
+    sql_rewrite_hooks: list[SqlRewriteHook]
+
+
 class Catalog:
     """A validated collection of cubes plus the convenience surface
-    (``compile``, ``as_dict``, ``with_retrieval``) downstream code wants."""
+    (``compile``, ``as_dict``, ``with_retrieval``) downstream code wants.
+
+    B5: a :class:`Catalog` pairs a :class:`CatalogSpec` (data) with
+    a :class:`CatalogRuntime` (callables). The legacy ``__init__``
+    signature still works — internally it builds the spec and runtime
+    from the validated state. Use :meth:`from_spec` to construct
+    from a pre-built spec, or :meth:`CatalogSpec.from_iterables` for
+    a collect-all build.
+    """
+
+    #: B5 — public so callers can introspect the serialised shape
+    #: without going through model_dump. Populated in ``__init__``.
+    spec: CatalogSpec
+
+    #: B5 — the callable half. Not serialisable.
+    runtime: CatalogRuntime
+
+    @classmethod
+    def from_spec(
+        cls,
+        spec: CatalogSpec,
+        *,
+        runtime: CatalogRuntime | None = None,
+        scope_fns: dict[str, ScopeFn] | None = None,
+        unit_registry: Registry | None = None,
+        policy: PolicyFn | None = None,
+        error_transform: object | None = None,
+        compile_hooks: list[CompileHook] | None = None,
+        sql_rewrite_hooks: list[SqlRewriteHook] | None = None,
+    ) -> Catalog:
+        """Build a Catalog from a pre-built :class:`CatalogSpec`.
+
+        ``runtime`` overrides the per-call callables; any that are
+        ``None`` fall back to the keyword arguments (or sensible
+        defaults). Use this when you deserialised a spec from a
+        cache or migration and want to pair it with a fresh
+        runtime in the current process."""
+        if spec.construction_errors:
+            messages = [e.get("message", "?") for e in spec.construction_errors]
+            raise ValueError(
+                f"CatalogSpec has {len(spec.construction_errors)} construction "
+                f"error(s); build via from_iterables and surface them, or fix "
+                f"the spec first. First: {messages[0]!r}"
+            )
+        # Materialise the spec into a Catalog via the legacy kwargs
+        # path: the spec's cubes / views / lookups / saved_queries /
+        # glossary / relations are user-supplied; the META auto-append
+        # and the rest of the first-error validation runs in __init__.
+        return cls(
+            list(spec.cubes),
+            views=list(spec.views),
+            lookups=list(spec.lookups),
+            saved_queries=list(spec.saved_queries),
+            glossary=list(spec.glossary),
+            relations=spec.relations,
+            policy=policy,
+            scope_fns=scope_fns,
+            unit_registry=unit_registry,
+            error_transform=error_transform,
+            compile_hooks=compile_hooks,
+            sql_rewrite_hooks=sql_rewrite_hooks,
+        )
 
     def __init__(
         self,
@@ -357,6 +867,32 @@ class Catalog:
                     f"constructor. Registered scopes: {sorted(self._scope_fns)}."
                 )
         self._error_transform: object | None = error_transform
+
+        # B5 — build the spec + runtime pair now that validation has
+        # passed. The spec carries only the user-supplied cubes
+        # (META reflection cubes are appended on read by the
+        # ``_by_name`` materialisation, not stored in the spec).
+        # The user-supplied cubes are the ones the caller passed in
+        # before the auto-append step ran; we recover them by
+        # excluding the META names.
+        meta_names = {m.name for m in META_CUBES}
+        user_cubes = tuple(c for c in merged if c.name not in meta_names)
+        self.spec = CatalogSpec(
+            cubes=user_cubes,
+            views=tuple(view_list),
+            lookups=tuple(lookup_list),
+            saved_queries=tuple(saved_query_list),
+            glossary=tuple(glossary_list),
+            relations=self.relations,
+        )
+        self.runtime = CatalogRuntime(
+            policy=policy,
+            scope_fns=dict(self._scope_fns),
+            unit_registry=self.unit_registry,
+            error_transform=error_transform,
+            compile_hooks=list(self.compile_hooks),
+            sql_rewrite_hooks=list(self.sql_rewrite_hooks),
+        )
 
     def _check_unit_pair(self, cube: Cube, fld: BaseField) -> None:
         """Validate ``unit`` / ``display_unit`` on a single field.
