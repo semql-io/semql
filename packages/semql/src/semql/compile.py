@@ -1238,6 +1238,58 @@ def _check_alias_uniqueness(touched: list[Cube]) -> None:
         owner[c.alias] = c.name
 
 
+# Aggregates whose value is inflated when a join duplicates the rows of
+# the cube the measure lives on. ``min`` / ``max`` / ``count_distinct``
+# are invariant under row duplication and stay safe; ``avg`` / ``ratio`` /
+# quantiles are distorted only by *uneven* duplication and are left to the
+# join-graph rework (W3) rather than refused with this coarser check.
+_FAN_OUT_SENSITIVE_AGGS: frozenset[str] = frozenset({"sum", "count"})
+
+
+def _check_fan_out(
+    measure_fields: list[tuple[Cube, Measure]],
+    join_edges: list[tuple[Cube, Cube, Any]],
+) -> None:
+    """Refuse a query whose join graph fans out an additive measure.
+
+    A ``one_to_many`` / ``many_to_one`` join duplicates the rows of its
+    "one" side; ``SUM`` / ``COUNT`` over a measure on that cube then
+    double-counts — the canonical semantic-layer wrong result. The
+    cardinality is read from ``Join.relationship`` (this is its first
+    reader) and from ``Join.to`` rather than the plan's left/right
+    assignment, so spine-rooting that flips an edge can't fool it: the
+    "one" side is intrinsic to the declared relationship.
+
+    Scoped to a single query's join edges, so a cube whose measures only
+    fan out under *some other* join still aggregates fine on its own."""
+    duplicated: dict[str, tuple[str, str]] = {}  # cube -> (other cube, relationship)
+    for left, right, join in join_edges:
+        target = getattr(join, "to", None)
+        rel = getattr(join, "relationship", None)
+        names = {left.name, right.name}
+        if target not in names or len(names) != 2:
+            continue  # self-join or malformed edge — not a plain fan-out
+        declarer = (names - {target}).pop()
+        if rel == "many_to_one":
+            # many ``declarer`` rows per one ``target`` row → target duplicates.
+            duplicated.setdefault(target, (declarer, rel))
+        elif rel == "one_to_many":
+            # one ``declarer`` row per many ``target`` rows → declarer duplicates.
+            duplicated.setdefault(declarer, (target, rel))
+    if not duplicated:
+        return
+    for cube, m in measure_fields:
+        if m.agg in _FAN_OUT_SENSITIVE_AGGS and cube.name in duplicated:
+            other, rel = duplicated[cube.name]
+            raise CompileError(
+                f"Measure {cube.name}.{m.name} ({m.agg}) fans out: the "
+                f"{rel} join between {cube.name!r} and {other!r} duplicates "
+                f"{cube.name!r}'s rows, so {m.agg.upper()} would over-count. "
+                f"Aggregate it without traversing that join, or pre-aggregate "
+                f"{cube.name!r} to the join grain."
+            )
+
+
 def _pick_single_backend(touched: list[Cube]) -> Backend:
     """Single-backend gate. Cross-backend queries route to
     :func:`semql.compile_federated_query` — non-federated compile is
@@ -1450,6 +1502,12 @@ class _CompileEnv:
             (j.left, j.right, j.model) for j in self.plan.joins
         ]
         self.root: Cube = self.cubes_in_from[0]
+
+        # Now that the query's join graph is resolved, refuse additive
+        # measures that the joins would fan out (silently inflated SUM /
+        # COUNT). Needs the edges, so it runs here rather than in the
+        # touched-cube prelude above.
+        _check_fan_out(self.measure_fields, self.join_edges)
 
         self.cube_aliases: dict[str, str] = {c.name: c.alias for c in self.cubes_in_from}
         self.dialect = dialect_for(self.backend, dialects)

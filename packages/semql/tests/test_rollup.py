@@ -503,9 +503,13 @@ def test_multi_cube_query_skips_rollup_routing() -> None:
         }
     )
     cat = Catalog([orders_with_fk, customers])
+    # Multi-cube via a customers *dimension* (forces the join) rather than
+    # customers.signups: COUNT(customers) across the many_to_one join would
+    # fan out (count order-rows, not customers) and is now refused. The
+    # rollup-routing skip is what this test cares about, not the measure.
     q = SemanticQuery(
-        measures=["orders.revenue", "customers.signups"],
-        dimensions=["orders.region"],
+        measures=["orders.revenue"],
+        dimensions=["orders.region", "customers.id"],
     )
     out = cat.compile(q)
     assert out.applied_rollup is None
