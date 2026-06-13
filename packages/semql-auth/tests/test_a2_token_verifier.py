@@ -24,8 +24,8 @@ from __future__ import annotations
 import time
 
 import pytest
-from semql.auth import HMACVerifier, JWKSVerifier, TokenVerifier
 from semql.errors import AuthError
+from semql_auth import HMACVerifier, JWKSVerifier, TokenVerifier
 
 # ---------------------------------------------------------------------------
 # Protocol shape

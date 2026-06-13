@@ -599,7 +599,7 @@ class X509Mapper:
     right attributes (``subject_cn``, ``subject_ou``,
     ``subject_o``, ``subject_c``, ``sans``, ``fingerprint``).
     The ``cryptography`` adapter is shipped as a small
-    reference function in ``semql.auth._cryptography_adapter``
+    reference function in ``semql_auth.auth._cryptography_adapter``
     (separate file, import-guarded) for the common case;
     call sites with their own cert decoder don't need it.
 

@@ -9,15 +9,6 @@ prompt rendering, etc.).
 
 from __future__ import annotations
 
-from semql.auth import (
-    DictMapper,
-    HMACVerifier,
-    IntrospectMapper,
-    JWKSVerifier,
-    TokenMapper,
-    TokenVerifier,
-    X509Mapper,
-)
 from semql.catalog import Catalog
 from semql.compile import MAX_UNGROUPED_ROWS, ColumnMeta, CompiledQuery, compile_query
 from semql.cost import BudgetExceededError, CostEstimate, QueryBudget, estimate_cost
@@ -237,11 +228,7 @@ __all__ = [
     "FilterTypeError",
     "FormatLiteral",
     "FragmentColumn",
-    "DictMapper",
     "GlossaryEntry",
-    "HMACVerifier",
-    "IntrospectMapper",
-    "JWKSVerifier",
     "HybridRetriever",
     "IncompatibleUnits",
     "InlineDerived",
@@ -300,9 +287,6 @@ __all__ = [
     "TimePartition",
     "TimePartitionedSource",
     "TimeWindow",
-    "TokenMapper",
-    "TokenVerifier",
-    "X509Mapper",
     "ToolDescriptionProjection",
     "UnitError",
     "UnknownIdentifierError",

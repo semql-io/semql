@@ -11,6 +11,7 @@ resolution-markers = [
 [manifest]
 members = [
     "semql",
+    "semql-auth",
     "semql-engine",
     "semql-erd",
     "semql-introspect",
@@ -2098,6 +2099,36 @@ requires-dist = [
     { name = "sqlglot", specifier = ">=30.9.0" },
 ]
 provides-extras = ["retrieval"]
+
+[[package]]
+name = "semql-auth"
+version = "0.2.1"
+source = { editable = "packages/semql-auth" }
+dependencies = [
+    { name = "semql" },
+]
+
+[package.optional-dependencies]
+introspect = [
+    { name = "httpx" },
+]
+jwks = [
+    { name = "httpx" },
+    { name = "pyjwt", extra = ["crypto"] },
+]
+x509 = [
+    { name = "cryptography" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "cryptography", marker = "extra == 'x509'", specifier = ">=42" },
+    { name = "httpx", marker = "extra == 'introspect'", specifier = ">=0.27" },
+    { name = "httpx", marker = "extra == 'jwks'", specifier = ">=0.27" },
+    { name = "pyjwt", extras = ["crypto"], marker = "extra == 'jwks'", specifier = ">=2.8" },
+    { name = "semql", editable = "packages/semql" },
+]
+provides-extras = ["jwks", "introspect", "x509"]
 
 [[package]]
 name = "semql-engine"

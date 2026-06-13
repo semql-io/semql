@@ -32,8 +32,8 @@ from typing import Any
 
 import pytest
 from semql import AuthContext
-from semql.auth import DictMapper, TokenMapper
 from semql.errors import AuthError
+from semql_auth import DictMapper, TokenMapper
 
 # ---------------------------------------------------------------------------
 # Protocol contract
@@ -193,7 +193,7 @@ def test_introspect_mapper_uses_post_with_basic_auth() -> None:
     and client credentials in HTTP Basic auth. The mapper must
     do exactly that — no GET, no query string.
     """
-    from semql.auth import IntrospectMapper
+    from semql_auth import IntrospectMapper
 
     captured: dict[str, Any] = {}
 
@@ -232,7 +232,7 @@ def test_introspect_mapper_inactive_token_raises_auth_error() -> None:
     """RFC 7662: ``{"active": false}`` is the canonical "this
     token doesn't exist / has been revoked" response. The
     mapper surfaces this as ``AuthError``."""
-    from semql.auth import IntrospectMapper
+    from semql_auth import IntrospectMapper
 
     class FakeClient:
         def post(
@@ -256,7 +256,7 @@ def test_introspect_mapper_uses_sub_then_username_then_client_id() -> None:
     back to ``client_id``. The mapper tries them in order so
     the contract is 'we'll get a viewer_id if there's any
     identifier at all'."""
-    from semql.auth import IntrospectMapper
+    from semql_auth import IntrospectMapper
 
     class FakeClient:
         def __init__(self, payload: dict[str, Any]) -> None:
@@ -303,7 +303,7 @@ def test_introspect_mapper_handles_scope_string() -> None:
     mapper splits it into a list of roles (overriding any
     ``roles`` claim — ``scope`` is the canonical OAuth
     surface)."""
-    from semql.auth import IntrospectMapper
+    from semql_auth import IntrospectMapper
 
     class FakeClient:
         def post(
@@ -327,7 +327,7 @@ def test_introspect_mapper_handles_expiry() -> None:
     enforce its own expiry check (the introspect endpoint
     already validated the token, but the result's ``exp`` is
     useful for cache TTL)."""
-    from semql.auth import IntrospectMapper
+    from semql_auth import IntrospectMapper
 
     class FakeClient:
         def post(
@@ -347,7 +347,7 @@ def test_introspect_mapper_handles_expiry() -> None:
 def test_introspect_mapper_http_error_raises_auth_error() -> None:
     """A non-2xx response from the introspection endpoint is an
     auth error (the token can't be validated)."""
-    from semql.auth import IntrospectMapper
+    from semql_auth import IntrospectMapper
 
     class FakeClient:
         def post(
@@ -364,7 +364,7 @@ def test_introspect_mapper_uses_default_httpx_client() -> None:
     """When no ``http_client`` is supplied, the mapper uses
     ``httpx`` — the canonical async/sync client. Verifies the
     import-time guard works (httpx is required, not optional)."""
-    from semql.auth import IntrospectMapper
+    from semql_auth import IntrospectMapper
 
     m = IntrospectMapper(
         "https://idp.example.com/oauth2/introspect",
@@ -381,7 +381,7 @@ def test_introspect_mapper_allows_url_trailing_slash_or_not() -> None:
     """The endpoint URL is whatever the IdP exposes — the
     mapper doesn't normalise it (callers configure the
     canonical form)."""
-    from semql.auth import IntrospectMapper
+    from semql_auth import IntrospectMapper
 
     m = IntrospectMapper("https://idp.example.com/introspect", client_id="c", client_secret="s")
     assert m._introspect_url == "https://idp.example.com/introspect"
@@ -396,7 +396,7 @@ def test_x509_mapper_uses_cn_for_viewer_id() -> None:
     """The cert's Common Name is the canonical viewer id for
     mTLS deployments (per RFC 6125 §6.4.4). The mapper
     extracts it from the cert's subject."""
-    from semql.auth import X509Mapper
+    from semql_auth import X509Mapper
 
     m = X509Mapper()
     cert = _fake_cert(subject_cn="alice", sans=())
@@ -408,7 +408,7 @@ def test_x509_mapper_uses_ou_for_roles() -> None:
     """Organizational Unit maps to a role — convention for
     grouping certs by team / project. Multiple OUs become
     multiple roles."""
-    from semql.auth import X509Mapper
+    from semql_auth import X509Mapper
 
     m = X509Mapper(ou_to_role=True)
     cert = _fake_cert(subject_cn="alice", subject_ou=("Data Platform", "Analytics"))
@@ -420,7 +420,7 @@ def test_x509_mapper_ou_to_role_disabled_keeps_attrs() -> None:
     """When ``ou_to_role=False`` (the default), the OU is kept
     in ``attrs`` for callers that want to inspect it. Opt-in
     to the structural mapping."""
-    from semql.auth import X509Mapper
+    from semql_auth import X509Mapper
 
     m = X509Mapper()
     cert = _fake_cert(subject_cn="alice", subject_ou=("Data Platform",))
@@ -433,7 +433,7 @@ def test_x509_mapper_uses_san_for_viewer_when_no_cn() -> None:
     """Some certs (especially service identities) have no CN
     but do have a URI / DNS / email SAN. The mapper falls back
     to the first SAN — URI > DNS > email > IP — in that order."""
-    from semql.auth import X509Mapper
+    from semql_auth import X509Mapper
 
     m = X509Mapper()
     cert = _fake_cert(
@@ -448,7 +448,7 @@ def test_x509_mapper_uses_dns_san_when_no_uri_san() -> None:
     """DNS-only SANs are the common case for service mesh /
     ingress-controller certs. The mapper extracts the DNS name
     as the viewer id."""
-    from semql.auth import X509Mapper
+    from semql_auth import X509Mapper
 
     m = X509Mapper()
     cert = _fake_cert(subject_cn="", sans=("payments.example.com",))
@@ -461,7 +461,7 @@ def test_x509_mapper_uses_email_san_when_no_uri_or_dns() -> None:
     mTLS). The mapper uses the *full* email as the viewer id —
     the local part alone is not a unique identity (the domain is
     also kept in ``attrs`` via ``sans``)."""
-    from semql.auth import X509Mapper
+    from semql_auth import X509Mapper
 
     m = X509Mapper()
     cert = _fake_cert(subject_cn="", sans=("alice@example.com",))
@@ -474,7 +474,7 @@ def test_x509_mapper_email_san_keeps_distinct_domains_distinct() -> None:
     (alice@a.com vs alice@b.com) are different principals — the
     mapper must not collapse them to a shared viewer id, or one
     tenant's row-level security would leak to the other."""
-    from semql.auth import X509Mapper
+    from semql_auth import X509Mapper
 
     m = X509Mapper()
     a = m.verify(_fake_cert(subject_cn="", sans=("alice@a.com",)))
@@ -487,7 +487,7 @@ def test_x509_mapper_no_cn_no_san_raises_auth_error() -> None:
     """A cert with neither CN nor any usable SAN has no
     identity — the mapper raises ``AuthError`` rather than
     emitting a viewer-less context."""
-    from semql.auth import X509Mapper
+    from semql_auth import X509Mapper
 
     m = X509Mapper()
     cert = _fake_cert(subject_cn="", sans=())
@@ -499,7 +499,7 @@ def test_x509_mapper_preserves_subject_dn_attrs() -> None:
     """The full subject DN lands in ``attrs`` for callers that
     want to inspect the organisation, country, etc. The
     mapper is non-destructive."""
-    from semql.auth import X509Mapper
+    from semql_auth import X509Mapper
 
     m = X509Mapper()
     cert = _fake_cert(
@@ -516,7 +516,7 @@ def test_x509_mapper_preserves_fingerprint() -> None:
     """The cert's SHA-256 fingerprint is a stable identity
     (key rotation changes the cert but a session-scoped
     fingerprint is useful for audit). It lands in ``attrs``."""
-    from semql.auth import X509Mapper
+    from semql_auth import X509Mapper
 
     m = X509Mapper()
     cert = _fake_cert(subject_cn="alice", fingerprint="aa:bb:cc")
@@ -576,7 +576,7 @@ def test_dict_mapper_protocol_uses_object_typed_identity() -> None:
     mappers narrow this to their own type. A bare object
     passes the ``isinstance`` check, but invoking ``verify``
     on it is the mapper's problem."""
-    from semql.auth import DictMapper
+    from semql_auth import DictMapper
 
     # The protocol is duck-typed; the impl narrows.
     m: TokenMapper = DictMapper()
@@ -590,6 +590,6 @@ def test_token_mapper_and_token_verifier_are_siblings() -> None:
     into their request middleware. They are NOT chained
     (a ``TokenMapper`` doesn't depend on ``TokenVerifier``).
     """
-    from semql.auth import TokenVerifier
+    from semql_auth import TokenVerifier
 
     assert TokenMapper is not TokenVerifier
