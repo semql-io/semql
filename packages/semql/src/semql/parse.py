@@ -1,4 +1,4 @@
-# pyright: reportPrivateImportUsage=false, reportUnusedImport=false, reportUnknownVariableType=false, reportUnknownMemberType=false, reportAttributeAccessIssue=false, reportArgumentType=false
+# pyright: reportPrivateImportUsage=false, reportUnusedImport=false, reportUnknownVariableType=false, reportUnknownMemberType=false, reportUnknownArgumentType=false, reportAttributeAccessIssue=false, reportArgumentType=false
 """SQL → SemanticQuery parser.
 
 Converts a SQL-like statement (typically emitted by an LLM agent)

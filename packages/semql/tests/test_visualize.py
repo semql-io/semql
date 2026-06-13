@@ -1,4 +1,5 @@
 # mypy: disable-error-code=type-arg
+# pyright: reportMissingTypeArgument=false, reportUnknownParameterType=false, reportUnknownArgumentType=false
 # (Test helpers pass bare ``frozenset`` literals of chart-type strings to
 # ``supported_charts``; annotating each as ``frozenset[VizChartType]`` adds
 # no test value and the literal-narrowing gymnastics aren't worth it here.)

@@ -1,3 +1,5 @@
+# pyright: reportPrivateUsage=false
+# (Deliberately unit-tests the private ``_edge_weight`` fan-out cost model.)
 """Weighted, bidirectional Dijkstra join-path resolution (ktx M2 / C6).
 
 ``find_join_path`` replaced an unweighted, forward-only BFS. The three
