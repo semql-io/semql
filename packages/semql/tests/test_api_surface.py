@@ -24,7 +24,7 @@ from semql import (
     decide_visualization,
     diff_catalogs,
     estimate_cost,
-    is_safe_select,
+    is_read_only_statement,
     iter_cubes,
     iter_fields,
     iter_joins,
@@ -81,7 +81,7 @@ def test_documented_function_exports_are_callable() -> None:
         "rewrite",
         "parse_sql_statement",
         "render_catalog_markdown",
-        "is_safe_select",
+        "is_read_only_statement",
         "iter_cubes",
         "iter_fields",
         "iter_joins",
@@ -131,7 +131,7 @@ def test_smoke_compile_and_introspect_surface() -> None:
     # compile (two entry points) + the LogicalPlan path
     compiled = compile_query(q, by_name)
     assert isinstance(compiled, CompiledQuery)
-    assert is_safe_select(compiled.sql)
+    assert is_read_only_statement(compiled.sql)
     plan = to_logical_plan(q, by_name)
     assert compile_plan(plan, by_name).sql == compiled.sql
 

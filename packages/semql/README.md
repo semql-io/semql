@@ -66,7 +66,7 @@ resolves it (along with `{schema}`-style context placeholders and
 | Planner / router prompt fragments | `semql.prompt` |
 | Backend strategies + sqlglot dialect adapter | `semql.backend`, `semql.dialect` |
 | Visualisation decision (chart type, axes, formats) | `semql.visualize` |
-| `is_safe_select` post-hoc SQL guard | `semql.safe` |
+| `is_read_only_statement` post-hoc SQL guard | `semql.safe` |
 | Structured error hierarchy | `semql.errors` |
 
 ## Features

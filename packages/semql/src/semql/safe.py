@@ -1,6 +1,6 @@
 """Belt-and-braces guard on emitted SQL.
 
-The compiler emits a single ``SELECT`` by construction. ``is_safe_select``
+The compiler emits a single ``SELECT`` by construction. ``is_read_only_statement``
 runs a post-hoc check on ``CompiledQuery.sql`` (or any other SQL string)
 that a downstream caller wants to gate before it hits the database.
 The guard is paranoid by design — multi-statement payloads,
@@ -15,7 +15,7 @@ from sqlglot import exp
 from sqlglot.errors import ParseError
 
 
-def is_safe_select(sql: str, *, dialect: str = "postgres") -> bool:
+def is_read_only_statement(sql: str, *, dialect: str = "postgres") -> bool:
     """Return True iff ``sql`` parses cleanly as exactly one ``SELECT``
     statement under the given ``dialect``.
 
@@ -47,4 +47,4 @@ def is_safe_select(sql: str, *, dialect: str = "postgres") -> bool:
     return isinstance(root, exp.Select | exp.Union | exp.Subquery)
 
 
-__all__ = ["is_safe_select"]
+__all__ = ["is_read_only_statement"]

@@ -9,7 +9,7 @@ asserts, for every dialect:
 
 1. the payload travels in ``out.params``, not ``out.sql``;
 2. the emitted SQL is a single statement (no stacked-query escape); and
-3. ``is_safe_select`` still holds (one read-only SELECT).
+3. ``is_read_only_statement`` still holds (one read-only SELECT).
 """
 
 from __future__ import annotations
@@ -28,7 +28,7 @@ from semql import (
     SemanticQuery,
     TimeDimension,
     TimeWindow,
-    is_safe_select,
+    is_read_only_statement,
 )
 from sqlglot import exp
 
@@ -109,7 +109,7 @@ def _assert_neutralised(out: object, payload: str, dialect: str) -> None:
     assert not any(payload in lit for lit in literals), (
         f"payload spliced into a SQL literal: {payload!r}\n{sql}"
     )
-    assert is_safe_select(sql)
+    assert is_read_only_statement(sql)
 
 
 # ---------------------------------------------------------------------------
@@ -148,7 +148,7 @@ def test_injection_via_in_list(backend: Backend) -> None:
     for payload in PAYLOADS:
         assert payload in bound, f"IN element not bound: {payload!r}"
         assert not any(payload in lit for lit in literals), f"IN element spliced: {payload!r}"
-    assert is_safe_select(out.sql)
+    assert is_read_only_statement(out.sql)
 
 
 # ---------------------------------------------------------------------------

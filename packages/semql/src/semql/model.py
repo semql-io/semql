@@ -522,7 +522,7 @@ class DerivedTable(_HashableModel):
     catalog (the first is ``Measure.sql``). The compiler surfaces the
     resolved SQL of both the main ``sql`` and every CTE on
     :attr:`semql.compile.CompiledQuery.derived_sources` so static checks
-    (``is_safe_select``, dialect snapshots) cover every raw fragment,
+    (``is_read_only_statement``, dialect snapshots) cover every raw fragment,
     not just the outer SELECT."""
 
     model_config = ConfigDict(frozen=True)

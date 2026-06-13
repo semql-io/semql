@@ -186,7 +186,7 @@ class CompiledQuery:
     # in first-mention order matching ``touched_cube_names``. Surfaces
     # the *second* place raw SQL legitimately enters the catalog
     # (the first is the outer ``sql``) so callers running
-    # :func:`semql.safe.is_safe_select` or dialect snapshots see every
+    # :func:`semql.safe.is_read_only_statement` or dialect snapshots see every
     # raw fragment, not just the compiler-generated SELECT. Plain-table
     # cubes contribute nothing here.
     derived_sources: list[str] = dc_field(default_factory=lambda: [])
@@ -255,7 +255,7 @@ def _collect_derived_sources(
 
     Order matches ``touched`` (first-mention). For each derived cube,
     any ``with_ctes`` are emitted first (declaration order) followed by
-    the main ``sql`` — so a static checker like ``is_safe_select``
+    the main ``sql`` — so a static checker like ``is_read_only_statement``
     walking ``derived_sources`` sees the same fragments that actually
     enter the compiled query."""
     out: list[str] = []

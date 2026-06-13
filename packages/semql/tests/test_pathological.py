@@ -26,7 +26,7 @@ from semql import (
     TimeDimension,
     TimeWindow,
     UnknownIdentifierError,
-    is_safe_select,
+    is_read_only_statement,
 )
 
 # ---------------------------------------------------------------------------
@@ -137,7 +137,7 @@ def test_deeply_nested_boolexpr_filter_compiles() -> None:
         ],
     )
     out = _single().compile(SemanticQuery(measures=["orders.count"], where=where))
-    assert is_safe_select(out.sql)
+    assert is_read_only_statement(out.sql)
     # Three leaf values → three bound params, none inlined.
     assert len(out.params) == 3
 
@@ -152,7 +152,7 @@ def test_equal_time_window_endpoints_compile() -> None:
             ),
         )
     )
-    assert is_safe_select(out.sql)
+    assert is_read_only_statement(out.sql)
 
 
 # ---------------------------------------------------------------------------

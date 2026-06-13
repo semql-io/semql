@@ -133,7 +133,7 @@ from semql.rewrite import (
     RewriteOp,
     rewrite,
 )
-from semql.safe import is_safe_select
+from semql.safe import is_read_only_statement
 from semql.spec import (
     BoolExpr,
     CompareWindow,
@@ -281,7 +281,7 @@ __all__ = [
     "decide_visualization",
     "diff_catalogs",
     "estimate_cost",
-    "is_safe_select",
+    "is_read_only_statement",
     "QueryBudget",
     "iter_cubes",
     "iter_fields",
