@@ -2639,6 +2639,24 @@ def _emit_simple_query(env: _CompileEnv) -> CompiledQuery:
         )
         select_node = outer
 
+    # Qualified ``cube.field`` refs for *selected* fields resolve to their
+    # output-column alias — the form the README documents
+    # (``measures=["orders.revenue"]``). Without this, a qualified measure
+    # ref falls through to the field resolver below and emits the raw inner
+    # column (``ORDER BY o.amount``), which a GROUP BY query rejects with a
+    # NOT_AN_AGGREGATE-class error on every backend. Only projected fields
+    # go in the map; ordering by an *unprojected* ``cube.field`` keeps its
+    # resolve-and-emit fallthrough.
+    qualified_to_output: dict[str, str] = {}
+    for (dim_cube, d), col_name in zip(env.dim_fields, env.dim_col_names, strict=True):
+        qualified_to_output[f"{dim_cube.name}.{d.name}"] = env.alias_map.get(col_name, col_name)
+    for (m_cube, m), col_name in zip(env.measure_fields, measure_col_names, strict=True):
+        qualified_to_output[f"{m_cube.name}.{m.name}"] = env.alias_map.get(col_name, col_name)
+    if env.time_cube is not None and env.time_dim is not None and time_col_name is not None:
+        qualified_to_output[f"{env.time_cube.name}.{env.time_dim.name}"] = env.alias_map.get(
+            time_col_name, time_col_name
+        )
+
     for ref, direction in env.plan.order.keys:
         if ref.startswith("compare."):
             raise CompileError(
@@ -2646,10 +2664,13 @@ def _emit_simple_query(env: _CompileEnv) -> CompiledQuery:
                 "references are only valid when the query sets "
                 "``compare=CompareWindow(...)``."
             )
-        # Alias key — already in the columns list, so the
-        # ``ref in columns`` branch below matches.
-        if ref in measure_alias_map or ref in columns:
-            order_target: exp.Expression = exp.column(ref)
+        # Qualified ref to a selected field → its output-column alias.
+        if ref in qualified_to_output:
+            order_target: exp.Expression = exp.column(qualified_to_output[ref])
+        # Alias key / bare name — already in the columns list or the
+        # measure alias map, so order by the output column directly.
+        elif ref in measure_alias_map or ref in columns:
+            order_target = exp.column(ref)
         else:
             try:
                 _, fld = _resolve_field(ref, env.catalog)

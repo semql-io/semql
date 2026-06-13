@@ -191,6 +191,23 @@ def _agg_func_name(func: exp.Expression) -> str | None:
     return None
 
 
+def _count_measure_name(catalog: dict[str, Cube] | None, cube_name: str | None) -> str:
+    """Resolve ``COUNT(*)`` to the cube's count measure.
+
+    A ``COUNT(*)`` projection has no inner column, so it can't be matched
+    by name like ``SUM(amount)``. Find the measure declared as a row
+    count (``agg="count"``, ``sql="*"``) and use its name. Fall back to
+    the conventional ``"count"`` when uncatalogued or unmatched — the
+    post-parse validation pass surfaces it if no such field exists."""
+    if catalog is not None and cube_name is not None:
+        cube = catalog.get(cube_name)
+        if cube is not None:
+            for m in cube.measures:
+                if m.agg == "count" and m.sql.strip() == "*":
+                    return m.name
+    return "count"
+
+
 def _inside_subquery(node: exp.Expression, root: exp.Expression) -> bool:
     """True if ``node`` sits inside a nested SELECT/subquery relative to
     ``root``.
@@ -294,6 +311,7 @@ def parse_sql_statement(
 
     measures: list[str] = []
     dimensions: list[str] = []
+    aliases: dict[str, str] = {}
     filters: list[Filter] = []
     where: BoolExpr | None = None
     having: list[Filter] = []
@@ -305,7 +323,14 @@ def parse_sql_statement(
 
     # --- SELECT list ---
     select_expressions = ast.expressions or []
-    for expr in select_expressions:
+    for raw_expr in select_expressions:
+        # ``SUM(revenue) AS rev`` / ``region AS r`` — capture the output
+        # alias, then unwrap to classify the underlying expression.
+        output_alias: str | None = None
+        expr = raw_expr
+        if isinstance(expr, exp.Alias):
+            output_alias = expr.output_name or None
+            expr = expr.this
         if isinstance(expr, exp.Star):
             # SELECT * — every dimension implicitly. We don't emit
             # anything; the compile pipeline will infer.
@@ -320,21 +345,38 @@ def parse_sql_statement(
             continue
         agg_nodes = _collect_aggregates(expr)
         if agg_nodes:
+            # One top-level aggregate → one measure. Several in a single
+            # projection means a composed expression (e.g. SUM(a)/SUM(b));
+            # only record an output alias when the projection is exactly
+            # one aggregate, so a derived expression can't mislabel a column.
+            single = len(agg_nodes) == 1
             for agg in agg_nodes:
                 inner = agg.this if hasattr(agg, "this") else None
                 field_name = _column_name(inner) if inner is not None else None
+                if field_name is None and isinstance(agg, exp.Count):
+                    # COUNT(*) → the cube's row-count measure.
+                    field_name = _count_measure_name(catalog, cube_name)
                 if field_name:
+                    # Emit a qualified ``cube.field`` ref — the form the
+                    # compiler requires (bare refs raise a resolution error).
+                    ref = f"{cube_name}.{field_name}" if cube_name else field_name
                     if cube_name:
-                        ref = f"{cube_name}.{field_name}"
                         resolved_refs[field_name] = ref
-                    measures.append(field_name)
+                    if ref not in measures:
+                        measures.append(ref)
+                    if single and output_alias and output_alias != field_name and cube_name:
+                        aliases[output_alias] = ref
         else:
             # Plain column — dimension.
             field_name = _column_name(expr)
-            if field_name and field_name not in dimensions:
+            if field_name:
+                ref = f"{cube_name}.{field_name}" if cube_name else field_name
                 if cube_name:
-                    resolved_refs[field_name] = f"{cube_name}.{field_name}"
-                dimensions.append(field_name)
+                    resolved_refs[field_name] = ref
+                if ref not in dimensions:
+                    dimensions.append(ref)
+                if output_alias and output_alias != field_name and cube_name:
+                    aliases[output_alias] = ref
 
     # --- WHERE / HAVING / GROUP BY / ORDER BY / LIMIT / OFFSET ---
     where_tree = ast.args.get("where")
@@ -349,7 +391,7 @@ def parse_sql_statement(
     if order_node is not None:
         # sqlglot stores the order clauses as a list of ``Ordered``
         # nodes on ``order_node.expressions``.
-        order = _parse_order(order_node, cube_name, resolved_refs)
+        order = _parse_order(order_node, cube_name, resolved_refs, set(aliases))
 
     limit_node = ast.args.get("limit")
     if limit_node is not None:
@@ -390,6 +432,7 @@ def parse_sql_statement(
     query = SemanticQuery(
         measures=measures,
         dimensions=dimensions,
+        aliases=aliases,
         filters=filters,
         where=where,
         time_dimension=time_dim,
@@ -528,6 +571,11 @@ def _comparison_to_filter(
     # Comparison nodes have the column on ``.left``; IN has it on
     # ``.this``.
     col_node = op_node.left if hasattr(op_node, "left") else op_node.this
+    # HAVING ``SUM(revenue) > 1000`` — the LHS is an aggregate wrapping
+    # the measure column. Unwrap it so the filter targets the measure;
+    # otherwise the predicate has no column name and is dropped.
+    if isinstance(col_node, (exp.Sum, exp.Count, exp.Avg, exp.Min, exp.Max, exp.Anonymous)):
+        col_node = col_node.this
     dim = _column_name(col_node)
     if dim is None:
         return None, [], None
@@ -665,6 +713,7 @@ def _parse_order(
     order_node: exp.Order,
     cube_name: str | None,
     resolved: dict[str, str],
+    alias_keys: set[str],
 ) -> list[tuple[str, Literal["asc", "desc"]]]:
     out: list[tuple[str, Literal["asc", "desc"]]] = []
     for o in order_node.expressions or []:
@@ -674,7 +723,12 @@ def _parse_order(
         direction: Literal["asc", "desc"] = "desc" if o.args.get("desc") else "asc"
         if isinstance(col, exp.Column):
             name = col.name
-            if cube_name:
+            if name in alias_keys:
+                # ORDER BY a SELECT alias — emit the bare alias key; the
+                # compiler resolves it against the output columns. Do NOT
+                # qualify it (``orders.rev``) — that field doesn't exist.
+                out.append((name, direction))
+            elif cube_name:
                 resolved[name] = f"{cube_name}.{name}"
                 out.append((f"{cube_name}.{name}", direction))
             else:
@@ -733,15 +787,16 @@ def _validate_refs(
     declared = {
         f.name for f in (*cube.measures, *cube.dimensions, *cube.time_dimensions, *cube.segments)
     }
-    # Measures / dimensions collected by the parser carry only the
-    # field name (we stripped the cube prefix when we built
-    # ``resolved_refs``).
+    # Measures / dimensions are qualified ``cube.field`` refs — strip the
+    # cube prefix to compare against the cube's declared field names.
     for m in measures:
-        if m not in declared:
-            errors.append(f"Unknown field {cube_name}.{m!r} in SELECT.")
+        bare = m.rsplit(".", 1)[-1]
+        if bare not in declared:
+            errors.append(f"Unknown field {m!r} in SELECT.")
     for d in dimensions:
-        if d not in declared:
-            errors.append(f"Unknown field {cube_name}.{d!r} in SELECT.")
+        bare = d.rsplit(".", 1)[-1]
+        if bare not in declared:
+            errors.append(f"Unknown field {d!r} in SELECT.")
     for f in filters:
         bare = f.dimension.rsplit(".", 1)[-1]
         if bare not in declared:

@@ -765,6 +765,43 @@ def test_order_by_output_column_alias_still_works(
     assert "region ASC" in out.sql
 
 
+def test_order_by_qualified_measure_uses_aggregate_alias(
+    catalog: dict[str, Cube],
+) -> None:
+    """ORDER BY a *selected* measure by its qualified ``cube.measure``
+    ref must resolve to the aggregate's output alias — not the raw inner
+    column. Emitting the raw column (``o.amount``) under a GROUP BY makes
+    every backend reject the query with a NOT_AN_AGGREGATE-class error.
+
+    Regression: qualified measure refs (the form the README documents,
+    ``measures=["orders.revenue"]``) previously fell through to the
+    field resolver and emitted ``ORDER BY o.amount``."""
+    q = SemanticQuery(
+        measures=["orders.revenue"],
+        dimensions=["orders.region"],
+        order=[("orders.revenue", "desc")],
+    )
+    out = compile_query(q, catalog, context=CONTEXT)
+    assert "ORDER BY revenue DESC" in out.sql
+    # The raw inner column must NOT appear in the ORDER BY clause.
+    order_clause = out.sql.upper().split("ORDER BY", 1)[1]
+    assert "O.AMOUNT" not in order_clause
+
+
+def test_order_by_qualified_dimension_uses_output_alias(
+    catalog: dict[str, Cube],
+) -> None:
+    """The same normalisation for a selected dimension referenced by its
+    qualified ``cube.dimension`` ref — orders by the output alias."""
+    q = SemanticQuery(
+        measures=["orders.revenue"],
+        dimensions=["orders.region"],
+        order=[("orders.region", "asc")],
+    )
+    out = compile_query(q, catalog, context=CONTEXT)
+    assert "ORDER BY region ASC" in out.sql
+
+
 def test_order_by_unknown_cube_field_rejected(catalog: dict[str, Cube]) -> None:
     """An unknown identifier still raises — the fallthrough goes
     through the resolver, which surfaces a precise error."""

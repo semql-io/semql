@@ -57,10 +57,10 @@ def test_select_columns_go_to_dimensions_when_no_agg() -> None:
         catalog=None,
     )
     q = out.query
-    # The parser heuristically classifies bare columns as dimensions
-    # until a catalog is provided.
-    assert "region" in q.dimensions
-    assert "status" in q.dimensions
+    # Bare columns (no aggregate) become dimensions, emitted as
+    # qualified ``cube.field`` refs (the compiler's required form).
+    assert "orders.region" in q.dimensions
+    assert "orders.status" in q.dimensions
 
 
 def test_aggregated_columns_become_measures() -> None:
@@ -70,9 +70,75 @@ def test_aggregated_columns_become_measures() -> None:
         catalog=None,
     )
     q = out.query
-    # SUM(amount) is a measure; region is a dimension.
-    assert any("amount" in m for m in q.measures)
-    assert "region" in q.dimensions
+    # SUM(amount) is a measure; region is a dimension. Both qualified.
+    assert "orders.amount" in q.measures
+    assert "orders.region" in q.dimensions
+
+
+# ---------------------------------------------------------------------------
+# SELECT aliases (``AS x``) + COUNT(*)
+# ---------------------------------------------------------------------------
+
+
+def test_select_measure_alias_captured(catalog: dict) -> None:
+    """``SUM(revenue) AS rev`` records ``rev -> orders.revenue`` in
+    ``aliases`` so the compiler relabels the output column."""
+    out = parse_sql_statement(
+        "SELECT region, SUM(revenue) AS rev FROM orders GROUP BY region",
+        catalog=catalog,
+    )
+    q = out.query
+    assert "orders.revenue" in q.measures
+    assert q.aliases == {"rev": "orders.revenue"}
+    assert out.parse_errors == ()
+
+
+def test_order_by_select_alias_uses_alias_key(catalog: dict) -> None:
+    """Ordering by a SELECT alias emits the bare alias key — not a
+    bogus qualified field (``orders.rev``). The compiler resolves the
+    alias key against the output columns."""
+    out = parse_sql_statement(
+        "SELECT region, SUM(revenue) AS rev FROM orders GROUP BY region ORDER BY rev DESC",
+        catalog=catalog,
+    )
+    q = out.query
+    assert q.aliases == {"rev": "orders.revenue"}
+    assert ("rev", "desc") in q.order
+    assert ("orders.rev", "desc") not in q.order
+
+
+def test_count_star_maps_to_count_measure(catalog: dict) -> None:
+    """``COUNT(*)`` maps to the cube's count measure (``agg=count``,
+    ``sql=*``) instead of being silently dropped."""
+    out = parse_sql_statement("SELECT COUNT(*) FROM orders", catalog=catalog)
+    q = out.query
+    assert "orders.count" in q.measures
+    assert out.parse_errors == ()
+
+
+def test_count_star_with_alias_captured(catalog: dict) -> None:
+    """``COUNT(*) AS n`` maps to the count measure and records the alias."""
+    out = parse_sql_statement(
+        "SELECT region, COUNT(*) AS n FROM orders GROUP BY region",
+        catalog=catalog,
+    )
+    q = out.query
+    assert "orders.count" in q.measures
+    assert q.aliases == {"n": "orders.count"}
+
+
+def test_having_over_aggregate_becomes_measure_filter(catalog: dict) -> None:
+    """``HAVING SUM(revenue) > 1000`` unwraps the aggregate to a filter
+    on the measure — it must not be silently dropped."""
+    out = parse_sql_statement(
+        "SELECT region, SUM(revenue) FROM orders GROUP BY region HAVING SUM(revenue) > 1000",
+        catalog=catalog,
+    )
+    q = out.query
+    assert any(
+        f.dimension == "orders.revenue" and f.op == "gt" and f.values == [1000]
+        for f in q.having
+    ), q.having
 
 
 # ---------------------------------------------------------------------------
@@ -218,9 +284,9 @@ def test_catalog_aware_resolution_validates_measures(catalog: dict) -> None:
     )
     q = out.query
     # ``revenue`` is a measure on orders; the parser identified it
-    # as a measure. ``region`` is a dimension.
-    assert "revenue" in q.measures
-    assert "region" in q.dimensions
+    # as a measure. ``region`` is a dimension. Both qualified.
+    assert "orders.revenue" in q.measures
+    assert "orders.region" in q.dimensions
     # No unknown-cube errors.
     assert out.parse_errors == ()
 
