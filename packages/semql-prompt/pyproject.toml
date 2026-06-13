@@ -1,7 +1,7 @@
 [project]
-name = "semql-mcp"
+name = "semql-prompt"
 version = "0.2.1"
-description = "MCP server that wraps a semql Catalog — compile-only by default, opt-in row execution via a caller-provided executor."
+description = "LLM-facing prompt rendering for a semql Catalog: the four-role planner/router/presenter/drilldown fragments, cacheable prompt segments, tool-description projection, and prompt-token budgeting."
 readme = "README.md"
 license = "BSD-3-Clause"
 license-files = ["LICENSE"]
@@ -10,9 +10,7 @@ authors = [
 ]
 requires-python = ">=3.12"
 dependencies = [
-    "fastmcp>=3.4.2",
     "semql>=0.2.1,<0.3",
-    "semql-prompt>=0.2.1,<0.3",
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -37,4 +35,3 @@ build-backend = "uv_build"
 
 [tool.uv.sources]
 semql = { workspace = true, editable = true }
-semql-prompt = { workspace = true, editable = true }

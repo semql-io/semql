@@ -3,7 +3,8 @@
 `Catalog` is the high-level API people import. It validates the cube
 graph at construction time, auto-appends the reflection META cubes, and
 provides convenience methods that wrap the lower-level
-``compile_query`` and ``build_planner_prompt_fragment`` functions.
+``compile_query`` function. Prompt rendering lives in the separate
+``semql-prompt`` package (``semql_prompt.planner_prompt(catalog, ...)``).
 
 Construction-time validation:
 - No duplicate cube names.
@@ -17,10 +18,10 @@ trust the input.
 from __future__ import annotations
 
 from collections.abc import Iterator
-from typing import TYPE_CHECKING, Any, TypeVar, cast
+from typing import TYPE_CHECKING, TypeVar
 
 from semql._grounding import validate_relations
-from semql.hooks import CompileHook, CubePromptHook, SqlRewriteHook
+from semql.hooks import CompileHook, SqlRewriteHook
 from semql.introspect import META_CUBES, PolicyFn, ScopeFn
 from semql.model import (
     AuthContext,
@@ -31,7 +32,6 @@ from semql.model import (
     GlossaryEntry,
     Join,
     Lookup,
-    ResolutionContext,
     View,
 )
 from semql.spec import SavedQuery
@@ -41,14 +41,14 @@ _T = TypeVar("_T", bound=BaseField)
 
 if TYPE_CHECKING:
     from semql.compile import CompiledQuery
-    from semql.prompt import CatalogPrompt
     from semql.retrieve import EmbeddingProvider, Retriever
     from semql.spec import SemanticQuery
 
 
 class Catalog:
     """A validated collection of cubes plus the convenience surface
-    (``compile``, ``prompt``, ``as_dict``) downstream code wants."""
+    (``compile``, ``as_dict``, ``with_retrieval``) downstream code wants.
+    Prompt rendering moved to the ``semql-prompt`` package."""
 
     def __init__(
         self,
@@ -503,135 +503,6 @@ class Catalog:
                     raise replacement from exc
             raise
 
-    def prompt(
-        self,
-        *,
-        only_exposed: bool = True,
-        include_introspection: bool = False,
-        viewer: AuthContext | None = None,
-        ctx: ResolutionContext | None = None,
-        user_query: str | None = None,
-        retriever: Retriever | None = None,
-        top_k: int = 10,
-        retrieval_threshold: int = 50,
-        current_date: str | None = None,
-        retrieved_snippets: list[str] | None = None,
-        extra: str | None = None,
-        cube_prompt_hooks: list[CubePromptHook] | None = None,
-    ) -> str:
-        """Render the planner prompt fragment for this catalog. Thin
-        wrapper around ``semql.prompt.build_planner_prompt_fragment``.
-
-        When ``viewer`` is provided, the catalog block shrinks to the
-        cubes the viewer is allowed to see.
-
-        ``ctx`` is the resolution context for dimension-value lookups —
-        any registered :class:`Lookup` with a loader fires here. Static
-        lookups inline regardless of ``ctx``; dynamic lookups skip
-        inlining when ``ctx`` is ``None`` and surface a tool hint
-        instead.
-
-        Retrieval mode (S7): when both ``user_query`` and ``retriever``
-        are set AND the catalog has more than ``retrieval_threshold``
-        questions across cubes + saved queries, the catalog block is
-        narrowed to the top-``top_k`` cubes the retriever returns. Below
-        the threshold the prompt is small enough to splice in full.
-        Saved-query question counts are pulled from
-        ``self.saved_queries`` automatically."""
-        from semql.prompt import build_planner_prompt_segments
-
-        segments = build_planner_prompt_segments(
-            self._by_name,
-            only_exposed=only_exposed,
-            include_introspection=include_introspection,
-            views=self.views,
-            viewer=viewer,
-            policy=self._policy,
-            lookups=self.lookups,
-            ctx=ctx,
-            glossary=self.glossary,
-            relations=self.relations,
-            user_query=user_query,
-            retriever=retriever,
-            top_k=top_k,
-            retrieval_threshold=retrieval_threshold,
-            saved_queries=list(self.saved_queries.values()),
-            cube_prompt_hooks=cube_prompt_hooks,
-        )
-        return segments.full(
-            current_date=current_date,
-            retrieved_snippets=retrieved_snippets,
-            extra=extra,
-        )
-
-    def prompt_segments(
-        self,
-        *,
-        only_exposed: bool = True,
-        include_introspection: bool = False,
-        viewer: AuthContext | None = None,
-        ctx: ResolutionContext | None = None,
-        user_query: str | None = None,
-        retriever: Retriever | None = None,
-        top_k: int = 10,
-        retrieval_threshold: int = 50,
-    ) -> CatalogPrompt:
-        """Render the planner prompt as a cacheable two-segment object.
-
-        Splits into a viewer-invariant ``static`` segment (publicly
-        visible cubes + spec contract + raw-fallback) and a per-viewer
-        ``overlay`` (role-gated cubes the viewer can see). Splice the
-        two around your Anthropic / Bedrock prompt-cache breakpoint.
-
-        Retrieval mode shares the same semantics as :meth:`prompt`;
-        when active the static segment lists only the top-k cubes
-        ranked against ``user_query``. Cache behaviour: the cache key
-        should incorporate ``user_query`` since the static segment now
-        varies with it."""
-        from semql.prompt import build_planner_prompt_segments
-
-        return build_planner_prompt_segments(
-            self._by_name,
-            only_exposed=only_exposed,
-            include_introspection=include_introspection,
-            views=self.views,
-            viewer=viewer,
-            policy=self._policy,
-            lookups=self.lookups,
-            ctx=ctx,
-            glossary=self.glossary,
-            relations=self.relations,
-            user_query=user_query,
-            retriever=retriever,
-            top_k=top_k,
-            retrieval_threshold=retrieval_threshold,
-            saved_queries=list(self.saved_queries.values()),
-        )
-
-    def prompt_hash(
-        self,
-        *,
-        only_exposed: bool = True,
-        ctx: ResolutionContext | None = None,
-    ) -> str:
-        """SHA256 hex digest of the static (viewer-invariant) prompt segment.
-
-        Stable across viewer changes — call this to key your own
-        prompt-fragment cache so a catalog mutation (renamed measure,
-        new public cube, edited lookup) invalidates entries even when
-        the viewer (and overlay) hasn't changed. Loader-backed lookups
-        change the hash when their resolved values change for ``ctx``."""
-        from semql.prompt import catalog_prompt_hash
-
-        return catalog_prompt_hash(
-            self._by_name,
-            only_exposed=only_exposed,
-            lookups=self.lookups,
-            ctx=ctx,
-            glossary=self.glossary,
-            relations=self.relations,
-        )
-
     def with_retrieval(
         self,
         *,
@@ -661,120 +532,6 @@ class Catalog:
             mmr=mmr,
             mmr_lambda=mmr_lambda,
         )
-
-    def to_openai_tools(
-        self,
-        *,
-        viewer: AuthContext | None = None,
-        only_exposed: bool = True,
-    ) -> list[dict[str, Any]]:
-        """Return one OpenAI-format tool dict per visible cube + saved query.
-
-        The list is ready for ``tools=`` in ``client.chat.completions.create``
-        or any framework that consumes OpenAI tool dicts (LangChain, pydantic-ai,
-        LlamaIndex). Role-gated cubes and saved queries are excluded unless
-        ``viewer`` holds a matching role.
-        """
-        from semql.prompt import (
-            project_tool_descriptions,
-            render_saved_query_tool_description,
-            to_openai_function,
-        )
-        from semql.spec import SemanticQuery
-
-        proj = project_tool_descriptions(
-            self._by_name,
-            only_exposed=only_exposed,
-            viewer=viewer,
-            policy=self._policy,
-        )
-        visible_cubes = {**proj.invariant, **proj.viewer_gated}
-
-        from semql.introspect import iter_cubes as _iter
-
-        tools: list[dict[str, object]] = [
-            to_openai_function(c)
-            for c in _iter(
-                self._by_name,
-                include_meta=False,
-                only_exposed=only_exposed,
-                viewer=None,  # we use proj to determine visibility
-                policy=None,
-            )
-            if c.name in visible_cubes
-        ]
-
-        for sq in self.saved_queries.values():
-            if sq.required_roles and (
-                viewer is None or not any(r in viewer.roles for r in sq.required_roles)
-            ):
-                continue
-            tools.append(
-                {
-                    "type": "function",
-                    "function": {
-                        "name": f"saved_{sq.name}",
-                        "description": render_saved_query_tool_description(sq),
-                        "parameters": SemanticQuery.model_json_schema(),
-                    },
-                }
-            )
-        return tools
-
-    def to_langchain_tools(
-        self,
-        *,
-        viewer: AuthContext | None = None,
-        only_exposed: bool = True,
-    ) -> list[object]:
-        """Return one LangChain ``StructuredTool`` per visible cube.
-
-        Requires ``langchain-core`` — raises ``ImportError`` with an
-        actionable install hint if it is not installed.
-
-        Each tool's ``func`` compiles and returns a structured result dict
-        ``{"sql": ..., "params": ...}`` so the caller decides how to execute.
-        """
-        try:
-            from langchain_core.tools import StructuredTool  # type: ignore[import-not-found]
-        except ImportError:
-            raise ImportError(
-                "langchain-core is required for to_langchain_tools(). "
-                "Install it with: pip install langchain-core"
-            ) from None
-        structured_tool_cls = cast(Any, StructuredTool)
-
-        from semql.introspect import iter_cubes
-
-        cubes = list(
-            iter_cubes(
-                self._by_name,
-                include_meta=False,
-                only_exposed=only_exposed,
-                viewer=viewer,
-                policy=self._policy,
-            )
-        )
-        tools: list[object] = []
-        for cube in cubes:
-            from semql.prompt import render_tool_description
-            from semql.spec import SemanticQuery
-
-            _cube_ref = cube
-
-            def _run(query: SemanticQuery, *, _c: object = _cube_ref) -> dict[str, object]:
-                compiled = self.compile(query, viewer=viewer)
-                return {"sql": compiled.sql, "params": compiled.params}
-
-            tools.append(
-                structured_tool_cls.from_function(
-                    func=_run,
-                    name=f"query_{cube.name}",
-                    description=render_tool_description(cube),
-                    args_schema=SemanticQuery,
-                )
-            )
-        return tools
 
     def __iter__(self) -> Iterator[Cube]:
         return iter(self._cubes)

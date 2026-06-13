@@ -27,6 +27,7 @@ from semql import (
     ResolutionContext,
 )
 from semql.model import AuthContext, LookupValues
+from semql_prompt import planner_prompt
 
 # ---------------------------------------------------------------------------
 # Lookup model validation
@@ -166,7 +167,9 @@ def test_static_lookup_inlines_values_in_prompt() -> None:
         [_orders_cube()],
         lookups=[Lookup(dimension="orders.region", values=("EMEA", "APAC", "NA"))],
     )
-    out = cat.prompt()
+    out = planner_prompt(
+        cat,
+    )
     assert "Lookup (3 values): `EMEA`, `APAC`, `NA`" in out
 
 
@@ -181,7 +184,9 @@ def test_static_lookup_with_labels_renders_pairs() -> None:
             )
         ],
     )
-    out = cat.prompt()
+    out = planner_prompt(
+        cat,
+    )
     assert "`EMEA` (Europe)" in out
     assert "`APAC` (Asia Pacific)" in out
 
@@ -193,7 +198,9 @@ def test_oversized_lookup_renders_tool_hint() -> None:
         [_orders_cube()],
         lookups=[Lookup(dimension="orders.region", values=big_values, max_inline=10)],
     )
-    out = cat.prompt()
+    out = planner_prompt(
+        cat,
+    )
     assert "100 values" in out
     assert "resolve_orders_region(query)" in out
     # Sample is rendered but not the full list.
@@ -213,7 +220,7 @@ def test_dynamic_lookup_fires_loader_with_ctx() -> None:
         lookups=[Lookup(dimension="orders.region", loader=_load)],
     )
     rc = ResolutionContext(context={"tenant_schema": "tenant42"})
-    out = cat.prompt(ctx=rc)
+    out = planner_prompt(cat, ctx=rc)
     assert "Lookup (2 values): `dyn_a`, `dyn_b`" in out
     assert len(seen_ctxs) == 1
     assert seen_ctxs[0].context["tenant_schema"] == "tenant42"
@@ -227,7 +234,9 @@ def test_dynamic_lookup_without_ctx_renders_tool_hint() -> None:
         [_orders_cube()],
         lookups=[Lookup(dimension="orders.region", loader=_load)],
     )
-    out = cat.prompt()  # no ctx
+    out = planner_prompt(
+        cat,
+    )  # no ctx
     assert "resolved at runtime" in out
     assert "resolve_orders_region(query)" in out
 
@@ -240,14 +249,16 @@ def test_loader_returning_mapping_uses_labels() -> None:
         [_orders_cube()],
         lookups=[Lookup(dimension="orders.region", loader=_load)],
     )
-    out = cat.prompt(ctx=ResolutionContext())
+    out = planner_prompt(cat, ctx=ResolutionContext())
     assert "`NA` (North America)" in out
     assert "`EMEA` (Europe)" in out
 
 
 def test_no_lookup_means_no_extra_line() -> None:
     cat = Catalog([_orders_cube()])
-    out = cat.prompt()
+    out = planner_prompt(
+        cat,
+    )
     assert "Lookup" not in out
 
 

@@ -16,6 +16,8 @@ from semql import (
     Measure,
     TimeDimension,
     View,
+)
+from semql_prompt import (
     build_drilldown_prompt_fragment,
     build_presenter_prompt_fragment,
     build_query_generator_prompt_fragment,

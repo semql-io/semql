@@ -11,11 +11,6 @@ from pydantic import ValidationError
 from semql.compile import MAX_UNGROUPED_ROWS, CompiledQuery, CompileError, compile_query
 from semql.introspect import quote_literal
 from semql.model import Backend, Cube, Measure
-from semql.prompt import (
-    build_planner_prompt_fragment,
-    build_router_prompt_fragment,
-    render_catalog_block,
-)
 from semql.spec import CompareWindow, Filter, SemanticQuery, TimeWindow
 from semql.visualize import (
     BAR_MAX_BARS,
@@ -23,6 +18,11 @@ from semql.visualize import (
     VizColumn,
     VizDecision,
     decide_visualization,
+)
+from semql_prompt import (
+    build_planner_prompt_fragment,
+    build_router_prompt_fragment,
+    render_catalog_block,
 )
 
 from .conftest import CONTEXT

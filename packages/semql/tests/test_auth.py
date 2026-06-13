@@ -1,5 +1,5 @@
 """Authorisation primitives — AuthContext + Cube.required_roles + viewer
-threading through Catalog.compile / Catalog.prompt / iter_cubes / the
+threading through Catalog.compile / semql_prompt.planner_prompt / iter_cubes / the
 prompt fragments.
 
 The contract this file pins:
@@ -29,9 +29,10 @@ from semql import (
 )
 from semql.errors import CompileError
 from semql.introspect import iter_cubes, viewer_sees
-from semql.prompt import (
+from semql_prompt import (
     build_planner_prompt_fragment,
     build_router_prompt_fragment,
+    planner_prompt,
 )
 
 # ---------------------------------------------------------------------------
@@ -283,5 +284,5 @@ def test_router_fragment_hides_unauthorised_topics() -> None:
 def test_catalog_prompt_method_threads_viewer() -> None:
     cat = _catalog()
     viewer = AuthContext(viewer_id="u1", roles=["finance"])
-    rendered = cat.prompt(viewer=viewer)
+    rendered = planner_prompt(cat, viewer=viewer)
     assert "`hr`" not in rendered  # never proposed to a non-hr viewer

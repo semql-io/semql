@@ -33,7 +33,7 @@ from semql import (
 )
 from semql.errors import FederationError
 from semql.model import Join
-from semql.prompt import render_catalog_block
+from semql_prompt import render_catalog_block
 
 
 def _orders(*, customer_id_type: str = "uuid", coerce_to: str | None = None) -> Cube:

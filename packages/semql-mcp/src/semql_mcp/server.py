@@ -215,7 +215,10 @@ class MCPServer:
             only_exposed: bool = True,
             include_introspection: bool = False,
         ) -> str:
-            return catalog.prompt(
+            from semql_prompt import planner_prompt
+
+            return planner_prompt(
+                catalog,
                 only_exposed=only_exposed,
                 include_introspection=include_introspection,
             )
@@ -530,8 +533,8 @@ def _make_query_cube_tool(
     query_cube_fn.__name__ = f"query_{cube_name}"
     # Render via the shared projection helper so the MCP tool docstring
     # and ``project_tool_descriptions`` can't drift apart — both go
-    # through ``semql.prompt.render_tool_description``.
-    from semql.prompt import render_tool_description
+    # through ``semql_prompt.render_tool_description``.
+    from semql_prompt import render_tool_description
 
     query_cube_fn.__doc__ = render_tool_description(cube)
     query_cube_fn.__annotations__ = {

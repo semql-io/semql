@@ -22,10 +22,12 @@ from semql import (
     Dimension,
     Measure,
     TimeDimension,
+)
+from semql_prompt import (
     ToolDescriptionProjection,
     project_tool_descriptions,
+    render_tool_description,
 )
-from semql.prompt import render_tool_description
 
 
 def _public_orders() -> Cube:

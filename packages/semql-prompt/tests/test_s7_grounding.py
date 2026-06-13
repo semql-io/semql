@@ -23,6 +23,7 @@ from semql import (
     SavedQuery,
     SemanticQuery,
 )
+from semql_prompt import planner_prompt, prompt_hash
 
 
 def _cube(name: str = "orders", **kwargs: Any) -> Cube:  # noqa: ANN401 — test factory
@@ -465,7 +466,9 @@ def test_prompt_omits_deprecated_cubes() -> None:
     old = _cube(name="orders_v1", stability="deprecated", replacement="orders_v2")
     new = _cube(name="orders_v2")
     cat = Catalog([old, new])
-    rendered = cat.prompt()
+    rendered = planner_prompt(
+        cat,
+    )
     assert "orders_v1" not in rendered
     assert "orders_v2" in rendered
 
@@ -473,7 +476,9 @@ def test_prompt_omits_deprecated_cubes() -> None:
 def test_prompt_annotates_beta_cubes() -> None:
     c = _cube(name="orders_b", stability="beta")
     cat = Catalog([c])
-    assert "[beta]" in cat.prompt()
+    assert "[beta]" in planner_prompt(
+        cat,
+    )
 
 
 def test_prompt_renders_per_cube_questions_and_keywords() -> None:
@@ -483,7 +488,9 @@ def test_prompt_renders_per_cube_questions_and_keywords() -> None:
         keywords=["orders", "AOV", "LTV"],
     )
     cat = Catalog([c])
-    p = cat.prompt()
+    p = planner_prompt(
+        cat,
+    )
     assert "Questions this cube answers" in p
     assert "How many orders this week?" in p
     assert "Top customers by LTV" in p
@@ -497,7 +504,9 @@ def test_prompt_renders_cube_relations() -> None:
         relations="Orders only count once payment_status='paid'.",
     )
     cat = Catalog([c])
-    p = cat.prompt()
+    p = planner_prompt(
+        cat,
+    )
     assert "Relations" in p
     assert "payment_status='paid'" in p
 
@@ -509,7 +518,9 @@ def test_prompt_renders_domain_context_glossary() -> None:
         aliases=["annual recurring revenue"],
     )
     cat = Catalog([_cube()], glossary=[g])
-    p = cat.prompt()
+    p = planner_prompt(
+        cat,
+    )
     assert "DOMAIN CONTEXT" in p
     assert "Glossary" in p
     assert "ARR" in p
@@ -522,14 +533,18 @@ def test_prompt_renders_domain_context_relations() -> None:
         [_cube()],
         relations="Orders ↔ shipments via order_id.",
     )
-    p = cat.prompt()
+    p = planner_prompt(
+        cat,
+    )
     assert "DOMAIN CONTEXT" in p
     assert "Orders ↔ shipments" in p
 
 
 def test_prompt_no_domain_context_when_empty() -> None:
     cat = Catalog([_cube()])
-    p = cat.prompt()
+    p = planner_prompt(
+        cat,
+    )
     assert "DOMAIN CONTEXT" not in p
 
 
@@ -540,17 +555,25 @@ def test_prompt_hash_includes_glossary() -> None:
         [_cube()],
         glossary=[GlossaryEntry(term="ARR", definition="x")],
     )
-    assert base.prompt_hash() != with_glossary.prompt_hash()
+    assert prompt_hash(
+        base,
+    ) != prompt_hash(
+        with_glossary,
+    )
 
 
 def test_prompt_hash_includes_catalog_relations() -> None:
     base = Catalog([_cube()])
     with_rel = Catalog([_cube()], relations="orders ↔ shipments")
-    assert base.prompt_hash() != with_rel.prompt_hash()
+    assert prompt_hash(
+        base,
+    ) != prompt_hash(
+        with_rel,
+    )
 
 
 def test_tool_description_surfaces_questions() -> None:
-    from semql import project_tool_descriptions
+    from semql_prompt import project_tool_descriptions
 
     c = _cube(name="orders", questions=["How many orders this week?"])
     cat = Catalog([c])
@@ -561,7 +584,7 @@ def test_tool_description_surfaces_questions() -> None:
 
 
 def test_tool_description_truncates_relations() -> None:
-    from semql import project_tool_descriptions
+    from semql_prompt import project_tool_descriptions
 
     long_rel = "Orders count as paid. " * 50
     c = _cube(name="orders", relations=long_rel)
@@ -574,7 +597,7 @@ def test_tool_description_truncates_relations() -> None:
 
 
 def test_tool_description_omits_deprecated_cubes() -> None:
-    from semql import project_tool_descriptions
+    from semql_prompt import project_tool_descriptions
 
     cat = Catalog(
         [
@@ -588,7 +611,7 @@ def test_tool_description_omits_deprecated_cubes() -> None:
 
 
 def test_tool_description_annotates_beta_cubes() -> None:
-    from semql import project_tool_descriptions
+    from semql_prompt import project_tool_descriptions
 
     cat = Catalog([_cube(name="orders_b", stability="beta")])
     text = project_tool_descriptions(cat.as_dict()).invariant["orders_b"]

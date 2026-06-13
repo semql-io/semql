@@ -1096,7 +1096,7 @@ class ScopePredicate(_HashableModel):
 class AuthContext(_HashableModel):
     """Identity + roles a viewer carries into a request.
 
-    Threads through ``Catalog.compile`` / ``Catalog.prompt`` / ``iter_cubes``
+    Threads through ``Catalog.compile`` / ``semql_prompt.planner_prompt`` / ``iter_cubes``
     as the ``viewer=`` kwarg. Two effects:
 
     - **Cube visibility**: ``iter_cubes(viewer=...)`` skips cubes whose
@@ -1129,7 +1129,7 @@ class ResolutionContext(_HashableModel):
 
     Loaders are pure functions of this context — same input, same
     output — so callers can cache responses keyed by it. ``viewer``
-    flows from ``Catalog.prompt(viewer=...)``; ``context`` mirrors the
+    flows from ``semql_prompt.planner_prompt(viewer=...)``; ``context`` mirrors the
     compile-time substitution dict (typically ``{"tenant_schema":
     ..., "tenant": ...}``)."""
 
@@ -1144,7 +1144,7 @@ LookupValues = Sequence[str] | Mapping[str, str]
 
 LookupLoader = Callable[[ResolutionContext], LookupValues]
 """A function from :class:`ResolutionContext` to lookup values. Fires
-when ``Catalog.prompt(...)`` renders a dynamic ``Lookup`` — never from
+when ``semql_prompt.planner_prompt(...)`` renders a dynamic ``Lookup`` — never from
 the compiler."""
 
 
@@ -1182,7 +1182,7 @@ class Lookup(_HashableModel):
     - **Static**: ``values=("EMEA", "APAC", "NA")``. Values live in the
       catalog.
     - **Dynamic**: ``loader=lambda ctx: db.fetch_regions(...)``. The
-      loader fires when ``Catalog.prompt(...)`` renders the catalog
+      loader fires when ``semql_prompt.planner_prompt(...)`` renders the catalog
       block, so the rendered values can vary per viewer / tenant.
 
     ``max_inline`` caps how many values are inlined into the prompt.
@@ -1190,7 +1190,7 @@ class Lookup(_HashableModel):
     ``resolve_<dim>`` tool (or :func:`semql.lookups.resolve`) instead.
 
     Loaders are an I/O entry point — they live in
-    ``Catalog.prompt(...)``, never in ``Catalog.compile(...)``. The
+    ``semql_prompt.planner_prompt(...)``, never in ``Catalog.compile(...)``. The
     compiler stays sans-io."""
 
     model_config = ConfigDict(frozen=True, arbitrary_types_allowed=True)

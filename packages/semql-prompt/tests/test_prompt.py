@@ -10,7 +10,7 @@ before it ships.
 from __future__ import annotations
 
 from semql.model import Backend, Cube, Dimension, Join, Measure, TimeDimension, View
-from semql.prompt import (
+from semql_prompt import (
     build_planner_prompt_fragment,
     build_router_prompt_fragment,
     render_catalog_block,

@@ -1,6 +1,6 @@
 """S7 slice 7 — retrieval-mode prompt rendering.
 
-Verifies that ``Catalog.prompt`` / ``render_catalog_*`` narrow the
+Verifies that ``semql_prompt.planner_prompt`` / ``render_catalog_*`` narrow the
 catalog to the top-k retrieved cubes when a ``user_query`` +
 ``retriever`` are supplied AND the catalog has more grounding content
 than ``retrieval_threshold``. Below the threshold the full catalog
@@ -22,6 +22,7 @@ from semql import (
     SemanticQuery,
     SQLiteBM25Retriever,
 )
+from semql_prompt import planner_prompt, planner_prompt_segments
 
 
 def _cube(name: str, **kwargs: Any) -> Cube:  # noqa: ANN401 — test factory
@@ -63,7 +64,7 @@ def test_below_threshold_renders_full_catalog() -> None:
     ]
     cat = Catalog(cubes)
     retriever = _StaticRetriever(["orders"])
-    p = cat.prompt(user_query="anything", retriever=retriever, retrieval_threshold=50)
+    p = planner_prompt(cat, user_query="anything", retriever=retriever, retrieval_threshold=50)
     assert "orders" in p
     assert "sessions" in p
     assert "payments" in p
@@ -79,7 +80,8 @@ def test_above_threshold_renders_only_top_k() -> None:
     ]
     cat = Catalog(cubes)
     retriever = _StaticRetriever(["payments"])  # only return payments
-    p = cat.prompt(
+    p = planner_prompt(
+        cat,
         user_query="how about payments?",
         retriever=retriever,
         top_k=1,
@@ -96,14 +98,14 @@ def test_retrieval_inactive_without_user_query() -> None:
     cat = Catalog(cubes)
     retriever = _StaticRetriever([])  # would return nothing
     # No user_query → retrieval inactive → full catalog renders.
-    p = cat.prompt(retriever=retriever)
+    p = planner_prompt(cat, retriever=retriever)
     assert "orders" in p
 
 
 def test_retrieval_inactive_without_retriever() -> None:
     cubes = [_cube(name="orders", questions=[f"q{i}" for i in range(60)])]
     cat = Catalog(cubes)
-    p = cat.prompt(user_query="anything")
+    p = planner_prompt(cat, user_query="anything")
     assert "orders" in p
 
 
@@ -116,7 +118,8 @@ def test_retrieval_threshold_zero_means_always_on() -> None:
     ]
     cat = Catalog(cubes)
     retriever = _StaticRetriever(["sessions"])
-    p = cat.prompt(
+    p = planner_prompt(
+        cat,
         user_query="x",
         retriever=retriever,
         top_k=1,
@@ -139,7 +142,8 @@ def test_saved_queries_count_toward_threshold() -> None:
     ]
     cat = Catalog(cubes, saved_queries=saved)
     retriever = _StaticRetriever([])  # filter to nothing
-    p = cat.prompt(
+    p = planner_prompt(
+        cat,
         user_query="x",
         retriever=retriever,
         top_k=1,
@@ -165,7 +169,7 @@ def test_retrieval_mode_annotates_header() -> None:
     ]
     cat = Catalog(cubes)
     retriever = _StaticRetriever(["orders"])
-    p = cat.prompt(user_query="x", retriever=retriever, top_k=2)
+    p = planner_prompt(cat, user_query="x", retriever=retriever, top_k=2)
     assert "top 2 cubes" in p
     assert "Retrieval-filtered" in p
 
@@ -174,7 +178,7 @@ def test_below_threshold_no_retrieval_annotation() -> None:
     cubes = [_cube(name="orders")]
     cat = Catalog(cubes)
     retriever = _StaticRetriever(["orders"])
-    p = cat.prompt(user_query="x", retriever=retriever)
+    p = planner_prompt(cat, user_query="x", retriever=retriever)
     assert "top " not in p  # no "top N cubes" header annotation
     assert "Retrieval-filtered" not in p
 
@@ -192,7 +196,8 @@ def test_retrieval_cannot_promote_role_gated_cube() -> None:
     cubes.append(_cube(name="secret", required_roles=["admin"]))
     cat = Catalog(cubes)
     retriever = _StaticRetriever(["secret"])  # tries to surface it
-    segments = cat.prompt_segments(
+    segments = planner_prompt_segments(
+        cat,
         user_query="x",
         retriever=retriever,
         top_k=5,
@@ -232,7 +237,7 @@ def test_catalog_with_retrieval_feeds_prompt() -> None:
     cat = Catalog(cubes)
     retriever: Retriever = cat.with_retrieval()  # SQLite BM25
     assert isinstance(retriever, SQLiteBM25Retriever)
-    p = cat.prompt(user_query="MRR", retriever=retriever, top_k=1)
+    p = planner_prompt(cat, user_query="MRR", retriever=retriever, top_k=1)
     # BM25 should put payments first
     assert "payments" in p
     assert "### orders " not in p

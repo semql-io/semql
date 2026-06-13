@@ -22,7 +22,7 @@ from __future__ import annotations
 import pytest
 from semql.introspect import resolve_field
 from semql.model import Backend, Cube, Dimension, Measure
-from semql.prompt import build_planner_prompt_fragment
+from semql_prompt import build_planner_prompt_fragment
 
 
 def _cube_with_aliases() -> dict:

@@ -7,6 +7,7 @@ from semql.catalog import Catalog
 from semql.introspect import META_CUBES
 from semql.model import Backend, Cube, Dimension, Join, Measure
 from semql.spec import SemanticQuery
+from semql_prompt import planner_prompt
 
 
 def _orders() -> Cube:
@@ -135,7 +136,9 @@ def test_catalog_compile_delegates() -> None:
 
 def test_catalog_prompt_returns_fragment() -> None:
     cat = Catalog([_orders()])
-    prompt = cat.prompt()
+    prompt = planner_prompt(
+        cat,
+    )
     # Catalog block must include the cube and its measure/dimension.
     assert "orders" in prompt
     assert "revenue" in prompt
@@ -152,7 +155,9 @@ def test_catalog_prompt_only_exposed_default() -> None:
         dimensions=[Dimension(name="x", sql="{h}.x", type="string")],
     )
     cat = Catalog([_orders(), hidden])
-    prompt = cat.prompt()
+    prompt = planner_prompt(
+        cat,
+    )
     assert "orders" in prompt
     # Hidden cubes don't appear by default.
     assert "### hidden" not in prompt

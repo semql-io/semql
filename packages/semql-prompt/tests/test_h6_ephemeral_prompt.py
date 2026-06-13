@@ -6,13 +6,13 @@ CatalogPrompt gains two new methods:
 - full(**kwargs) -> str
   Convenience: static + overlay + ephemeral(...)
 
-Catalog.prompt() also grows the same three kwargs, delegating to
+planner_prompt(Catalog, ) also grows the same three kwargs, delegating to
 CatalogPrompt.full() internally.
 """
 
 from __future__ import annotations
 
-from semql.prompt import CatalogPrompt
+from semql_prompt import CatalogPrompt, planner_prompt
 
 
 def _prompt(static: str = "STATIC", overlay: str = "") -> CatalogPrompt:
@@ -87,7 +87,7 @@ def test_full_equals_joined_plus_ephemeral() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Catalog.prompt() delegation
+# planner_prompt(Catalog, ) delegation
 # ---------------------------------------------------------------------------
 
 
@@ -105,7 +105,7 @@ def test_catalog_prompt_accepts_current_date_kwarg() -> None:
             )
         ]
     )
-    out = cat.prompt(current_date="2026-06-08")
+    out = planner_prompt(cat, current_date="2026-06-08")
     assert "2026-06-08" in out
 
 
@@ -123,8 +123,10 @@ def test_catalog_prompt_no_date_unchanged() -> None:
             )
         ]
     )
-    without = cat.prompt()
-    with_date = cat.prompt(current_date="2026-06-08")
+    without = planner_prompt(
+        cat,
+    )
+    with_date = planner_prompt(cat, current_date="2026-06-08")
     # Base content is preserved; extra ephemeral block is appended.
     assert without in with_date or "orders" in with_date
     assert "2026-06-08" not in without

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import pytest
 from semql import Backend, Catalog, Cube, Dimension, Measure, SemanticQuery, View
+from semql_prompt import planner_prompt
 
 
 def _orders() -> Cube:
@@ -160,7 +161,7 @@ def test_view_can_rename_fields() -> None:
 
 
 def test_prompt_includes_view_section() -> None:
-    rendered = Catalog([_orders()], views=[_checkout_view()]).prompt()
+    rendered = planner_prompt(Catalog([_orders()], views=[_checkout_view()]))
     assert "checkout" in rendered
     # The view's exposed names are what the planner sees.
     assert "`checkout.revenue`" in rendered or "checkout.revenue" in rendered

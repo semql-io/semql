@@ -16,6 +16,7 @@ members = [
     "semql-erd",
     "semql-introspect",
     "semql-mcp",
+    "semql-prompt",
     "semql-validate-db",
 ]
 
@@ -2183,13 +2184,26 @@ source = { editable = "packages/semql-mcp" }
 dependencies = [
     { name = "fastmcp" },
     { name = "semql" },
+    { name = "semql-prompt" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "fastmcp", specifier = ">=3.4.2" },
     { name = "semql", editable = "packages/semql" },
+    { name = "semql-prompt", editable = "packages/semql-prompt" },
 ]
+
+[[package]]
+name = "semql-prompt"
+version = "0.2.1"
+source = { editable = "packages/semql-prompt" }
+dependencies = [
+    { name = "semql" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "semql", editable = "packages/semql" }]
 
 [[package]]
 name = "semql-validate-db"

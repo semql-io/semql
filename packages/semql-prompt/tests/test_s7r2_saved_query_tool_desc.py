@@ -17,8 +17,9 @@ from __future__ import annotations
 
 from typing import Literal
 
-from semql import SemanticQuery, project_tool_descriptions
+from semql import SemanticQuery
 from semql.spec import SavedQuery
+from semql_prompt import project_tool_descriptions
 
 
 def _sq(
@@ -46,15 +47,15 @@ def _sq(
 
 
 def test_render_saved_query_tool_description_importable() -> None:
-    from semql.prompt import render_saved_query_tool_description
+    from semql_prompt import render_saved_query_tool_description
 
     assert render_saved_query_tool_description is not None
 
 
-def test_render_saved_query_tool_description_exported_from_semql() -> None:
-    import semql
+def test_render_saved_query_tool_description_exported_from_semql_prompt() -> None:
+    import semql_prompt
 
-    assert hasattr(semql, "render_saved_query_tool_description")
+    assert hasattr(semql_prompt, "render_saved_query_tool_description")
 
 
 # ---------------------------------------------------------------------------
@@ -63,7 +64,7 @@ def test_render_saved_query_tool_description_exported_from_semql() -> None:
 
 
 def test_default_description_when_empty() -> None:
-    from semql.prompt import render_saved_query_tool_description
+    from semql_prompt import render_saved_query_tool_description
 
     sq = _sq(description="")
     result = render_saved_query_tool_description(sq)
@@ -72,7 +73,7 @@ def test_default_description_when_empty() -> None:
 
 
 def test_uses_sq_description_when_set() -> None:
-    from semql.prompt import render_saved_query_tool_description
+    from semql_prompt import render_saved_query_tool_description
 
     sq = _sq(description="Revenue breakdown by week.")
     result = render_saved_query_tool_description(sq)
@@ -80,7 +81,7 @@ def test_uses_sq_description_when_set() -> None:
 
 
 def test_zero_arg_footer_always_present() -> None:
-    from semql.prompt import render_saved_query_tool_description
+    from semql_prompt import render_saved_query_tool_description
 
     sq = _sq()
     result = render_saved_query_tool_description(sq)
@@ -88,7 +89,7 @@ def test_zero_arg_footer_always_present() -> None:
 
 
 def test_purpose_included_when_set() -> None:
-    from semql.prompt import render_saved_query_tool_description
+    from semql_prompt import render_saved_query_tool_description
 
     sq = _sq(purpose="weekly ops report")
     result = render_saved_query_tool_description(sq)
@@ -96,7 +97,7 @@ def test_purpose_included_when_set() -> None:
 
 
 def test_purpose_omitted_when_empty() -> None:
-    from semql.prompt import render_saved_query_tool_description
+    from semql_prompt import render_saved_query_tool_description
 
     sq = _sq(purpose="")
     result = render_saved_query_tool_description(sq)
@@ -104,7 +105,7 @@ def test_purpose_omitted_when_empty() -> None:
 
 
 def test_questions_slash_joined_when_set() -> None:
-    from semql.prompt import render_saved_query_tool_description
+    from semql_prompt import render_saved_query_tool_description
 
     sq = _sq(questions=["How much revenue last week?", "Weekly revenue trend?"])
     result = render_saved_query_tool_description(sq)
@@ -114,7 +115,7 @@ def test_questions_slash_joined_when_set() -> None:
 
 
 def test_questions_omitted_when_empty() -> None:
-    from semql.prompt import render_saved_query_tool_description
+    from semql_prompt import render_saved_query_tool_description
 
     sq = _sq(questions=[])
     result = render_saved_query_tool_description(sq)
@@ -122,7 +123,7 @@ def test_questions_omitted_when_empty() -> None:
 
 
 def test_beta_prefix_when_stability_beta() -> None:
-    from semql.prompt import render_saved_query_tool_description
+    from semql_prompt import render_saved_query_tool_description
 
     sq = _sq(stability="beta")
     result = render_saved_query_tool_description(sq)
@@ -130,7 +131,7 @@ def test_beta_prefix_when_stability_beta() -> None:
 
 
 def test_no_beta_prefix_when_stable() -> None:
-    from semql.prompt import render_saved_query_tool_description
+    from semql_prompt import render_saved_query_tool_description
 
     sq = _sq(stability="stable")
     result = render_saved_query_tool_description(sq)
@@ -168,7 +169,7 @@ def test_public_saved_query_goes_in_invariant() -> None:
 
 
 def test_saved_query_description_uses_render_saved_query_tool_description() -> None:
-    from semql.prompt import render_saved_query_tool_description
+    from semql_prompt import render_saved_query_tool_description
 
     sq = _sq(description="My custom desc.")
     proj = project_tool_descriptions({}, saved_queries=[sq])

@@ -10,8 +10,8 @@ to_openai_function(cube, catalog) -> dict:
     }
   }
 
-catalog.to_openai_tools(*, viewer, policy) -> list[dict]
-catalog.to_langchain_tools(*, viewer, policy) -> list[StructuredTool]  (soft import guard)
+to_openai_tools(catalog, *, viewer, policy) -> list[dict]
+to_langchain_tools(catalog, *, viewer, policy) -> list[StructuredTool]  (soft import guard)
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ from semql import (
     Dimension,
     Measure,
 )
-from semql.prompt import render_tool_description
+from semql_prompt import render_tool_description, to_langchain_tools, to_openai_tools
 
 
 def _cube(name: str = "orders", required_roles: list[str] | None = None) -> Cube:
@@ -51,15 +51,15 @@ def _catalog() -> Catalog:
 
 
 def test_to_openai_function_importable() -> None:
-    from semql.prompt import to_openai_function
+    from semql_prompt import to_openai_function
 
     assert to_openai_function is not None
 
 
-def test_to_openai_function_exported_from_semql() -> None:
-    import semql
+def test_to_openai_function_exported_from_semql_prompt() -> None:
+    import semql_prompt
 
-    assert hasattr(semql, "to_openai_function")
+    assert hasattr(semql_prompt, "to_openai_function")
 
 
 # ---------------------------------------------------------------------------
@@ -68,7 +68,7 @@ def test_to_openai_function_exported_from_semql() -> None:
 
 
 def test_to_openai_function_returns_dict() -> None:
-    from semql.prompt import to_openai_function
+    from semql_prompt import to_openai_function
 
     cube = _cube()
     result = to_openai_function(cube)
@@ -76,7 +76,7 @@ def test_to_openai_function_returns_dict() -> None:
 
 
 def test_to_openai_function_type_field() -> None:
-    from semql.prompt import to_openai_function
+    from semql_prompt import to_openai_function
 
     cube = _cube()
     result = to_openai_function(cube)
@@ -84,7 +84,7 @@ def test_to_openai_function_type_field() -> None:
 
 
 def test_to_openai_function_has_function_key() -> None:
-    from semql.prompt import to_openai_function
+    from semql_prompt import to_openai_function
 
     cube = _cube()
     result = to_openai_function(cube)
@@ -96,7 +96,7 @@ def test_to_openai_function_has_function_key() -> None:
 
 
 def test_to_openai_function_name_is_query_prefix() -> None:
-    from semql.prompt import to_openai_function
+    from semql_prompt import to_openai_function
 
     cube = _cube("orders")
     result = to_openai_function(cube)
@@ -104,7 +104,7 @@ def test_to_openai_function_name_is_query_prefix() -> None:
 
 
 def test_to_openai_function_description_matches_render_tool_description() -> None:
-    from semql.prompt import to_openai_function
+    from semql_prompt import to_openai_function
 
     cube = _cube()
     result = to_openai_function(cube)
@@ -112,7 +112,7 @@ def test_to_openai_function_description_matches_render_tool_description() -> Non
 
 
 def test_to_openai_function_parameters_is_json_schema() -> None:
-    from semql.prompt import to_openai_function
+    from semql_prompt import to_openai_function
 
     cube = _cube()
     result = to_openai_function(cube)
@@ -124,7 +124,7 @@ def test_to_openai_function_parameters_is_json_schema() -> None:
 
 def test_to_openai_function_parameters_no_blank_descriptions() -> None:
     """All properties in the parameters schema must have a non-empty description."""
-    from semql.prompt import to_openai_function
+    from semql_prompt import to_openai_function
 
     cube = _cube()
     result = to_openai_function(cube)
@@ -140,21 +140,25 @@ def test_to_openai_function_parameters_no_blank_descriptions() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_catalog_to_openai_tools_exists() -> None:
+def test_to_openai_tools_callable_on_catalog() -> None:
     cat = _catalog()
-    assert hasattr(cat, "to_openai_tools")
+    assert isinstance(to_openai_tools(cat), list)
 
 
 def test_catalog_to_openai_tools_returns_list_of_dicts() -> None:
     cat = _catalog()
-    tools = cat.to_openai_tools()
+    tools = to_openai_tools(
+        cat,
+    )
     assert isinstance(tools, list)
     assert all(isinstance(t, dict) for t in tools)
 
 
 def test_catalog_to_openai_tools_excludes_role_gated_without_viewer() -> None:
     cat = _catalog()
-    tools = cat.to_openai_tools()
+    tools = to_openai_tools(
+        cat,
+    )
     names = [t["function"]["name"] for t in tools]
     assert "query_orders" in names
     assert "query_admin_cube" not in names
@@ -163,14 +167,16 @@ def test_catalog_to_openai_tools_excludes_role_gated_without_viewer() -> None:
 def test_catalog_to_openai_tools_includes_role_gated_with_viewer() -> None:
     cat = _catalog()
     viewer = AuthContext(viewer_id="u1", roles=["admin"])
-    tools = cat.to_openai_tools(viewer=viewer)
+    tools = to_openai_tools(cat, viewer=viewer)
     names = [t["function"]["name"] for t in tools]
     assert "query_admin_cube" in names
 
 
 def test_catalog_to_openai_tools_all_have_type_function() -> None:
     cat = _catalog()
-    for tool in cat.to_openai_tools():
+    for tool in to_openai_tools(
+        cat,
+    ):
         assert tool["type"] == "function"
 
 
@@ -179,9 +185,10 @@ def test_catalog_to_openai_tools_all_have_type_function() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_catalog_to_langchain_tools_exists() -> None:
-    cat = _catalog()
-    assert hasattr(cat, "to_langchain_tools")
+def test_to_langchain_tools_importable() -> None:
+    from semql_prompt import to_langchain_tools
+
+    assert to_langchain_tools is not None
 
 
 def test_catalog_to_langchain_tools_raises_import_error_without_langchain() -> None:
@@ -195,7 +202,9 @@ def test_catalog_to_langchain_tools_raises_import_error_without_langchain() -> N
         cat = _catalog()
         # Re-import with hidden module
         with pytest.raises(ImportError, match="langchain"):
-            cat.to_langchain_tools()
+            to_langchain_tools(
+                cat,
+            )
     finally:
         if langchain_mod is not None:
             sys.modules["langchain_core"] = langchain_mod

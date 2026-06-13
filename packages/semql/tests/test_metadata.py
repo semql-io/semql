@@ -31,6 +31,7 @@ from semql import (
 )
 from semql.compile import compile_query
 from semql.introspect import build_meta_values
+from semql_prompt import planner_prompt
 
 
 def _orders(**meta_overrides: dict[str, str]) -> Cube:
@@ -192,15 +193,15 @@ def test_dimension_metadata_does_not_affect_compiled_output() -> None:
 def test_cube_metadata_does_not_appear_in_prompt() -> None:
     cube_plain = _orders()
     cube_meta = _orders(cube_meta={"secret-marker": "META-LEAK-SENTINEL"})
-    plain_prompt = Catalog([cube_plain]).prompt()
-    meta_prompt = Catalog([cube_meta]).prompt()
+    plain_prompt = planner_prompt(Catalog([cube_plain]))
+    meta_prompt = planner_prompt(Catalog([cube_meta]))
     assert plain_prompt == meta_prompt
     assert "META-LEAK-SENTINEL" not in meta_prompt
 
 
 def test_measure_metadata_does_not_appear_in_prompt() -> None:
     cube_meta = _orders(measure_meta={"presentation/format": "PROMPT-LEAK-SENTINEL"})
-    prompt = Catalog([cube_meta]).prompt()
+    prompt = planner_prompt(Catalog([cube_meta]))
     assert "PROMPT-LEAK-SENTINEL" not in prompt
 
 

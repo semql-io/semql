@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from semql import Cube, Dimension, Measure, TimeDimension
 from semql.model import Backend
-from semql.prompt import (
+from semql_prompt import (
     build_planner_prompt_fragment,
     build_router_prompt_fragment,
     render_catalog_block,

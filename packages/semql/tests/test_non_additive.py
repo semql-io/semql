@@ -17,6 +17,7 @@ post-query summing, which the compiler doesn't perform.
 from __future__ import annotations
 
 from semql import Backend, Catalog, Cube, Dimension, Measure
+from semql_prompt import planner_prompt
 
 
 def test_measure_non_additive_defaults_false() -> None:
@@ -58,7 +59,7 @@ def test_non_additive_flag_appears_in_prompt() -> None:
         ],
         dimensions=[Dimension(name="region", sql="{u}.region", type="string")],
     )
-    rendered = Catalog([cube]).prompt()
+    rendered = planner_prompt(Catalog([cube]))
     # The non-additive measure gets a callout the planner can see.
     line = next(line for line in rendered.splitlines() if "users.active" in line)
     assert "non-additive" in line.lower()

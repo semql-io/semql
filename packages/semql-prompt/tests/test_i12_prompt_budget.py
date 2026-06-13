@@ -25,10 +25,12 @@ import pytest
 from semql import (
     AuthContext,
     Backend,
-    CatalogPrompt,
     Cube,
     Dimension,
     Measure,
+)
+from semql_prompt import (
+    CatalogPrompt,
     PromptBudget,
     render_catalog_block,
     render_catalog_segments,

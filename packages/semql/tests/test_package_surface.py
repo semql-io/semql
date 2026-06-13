@@ -47,15 +47,15 @@ def test_public_surface_includes_core_types() -> None:
         "decide_visualization",
         "VizDecision",
         "VizColumn",
-        # prompt
-        "render_catalog_block",
-        "build_planner_prompt_fragment",
-        "build_router_prompt_fragment",
         # catalog
         "Catalog",
     }
     missing = expected - set(dir(semql))
     assert not missing, f"semql is missing public exports: {sorted(missing)}"
+    # Prompt rendering moved to the semql-prompt package — core no longer
+    # exposes it (clean break).
+    assert not hasattr(semql, "build_planner_prompt_fragment")
+    assert not hasattr(semql, "render_catalog_block")
 
 
 def test_no_hello_stub() -> None:

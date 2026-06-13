@@ -6,7 +6,7 @@ CubePromptHook: a callable Protocol that takes a Cube and returns a str
 Wire as ``cube_prompt_hooks`` kwarg on:
 - ``build_planner_prompt_fragment``
 - ``build_planner_prompt_segments``
-- ``Catalog.prompt()``
+- ``planner_prompt(Catalog, )``
 """
 
 from __future__ import annotations
@@ -18,7 +18,11 @@ from semql import (
     Dimension,
     Measure,
 )
-from semql.prompt import build_planner_prompt_fragment, build_planner_prompt_segments
+from semql_prompt import (
+    build_planner_prompt_fragment,
+    build_planner_prompt_segments,
+    planner_prompt,
+)
 
 
 def _catalog() -> Catalog:
@@ -129,7 +133,7 @@ def test_build_planner_prompt_segments_accepts_hooks_kwarg() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Catalog.prompt() accepts cube_prompt_hooks
+# planner_prompt(Catalog, ) accepts cube_prompt_hooks
 # ---------------------------------------------------------------------------
 
 
@@ -139,7 +143,7 @@ def test_catalog_prompt_accepts_cube_prompt_hooks() -> None:
     def hook(cube: Cube) -> str:
         return "CATALOG_HOOK_TEXT"
 
-    result = cat.prompt(cube_prompt_hooks=[hook])
+    result = planner_prompt(cat, cube_prompt_hooks=[hook])
     assert "CATALOG_HOOK_TEXT" in result
 
 

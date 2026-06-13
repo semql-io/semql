@@ -13,7 +13,7 @@ turns lookups into something callers can *use* at request time:
   fuzzy matching.
 
 This module is the I/O surface of the lookup system. The compiler
-never touches it; ``Catalog.prompt(...)`` and any user-supplied
+never touches it; ``semql_prompt.planner_prompt(...)`` and any user-supplied
 ``resolve_<dim>`` tool do.
 """
 

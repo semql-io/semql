@@ -20,6 +20,7 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 from semql import Backend, Catalog, CompileError, Cube, Dimension, Measure, SemanticQuery
+from semql_prompt import planner_prompt
 
 
 def _funnel() -> Cube:
@@ -207,6 +208,6 @@ def test_ratio_cannot_reference_another_ratio() -> None:
 
 
 def test_prompt_marks_ratio_measures() -> None:
-    rendered = Catalog([_funnel()]).prompt()
+    rendered = planner_prompt(Catalog([_funnel()]))
     assert "conversion_rate" in rendered
     assert "agg=ratio" in rendered

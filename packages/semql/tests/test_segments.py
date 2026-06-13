@@ -23,6 +23,7 @@ from semql import (
     Segment,
     SemanticQuery,
 )
+from semql_prompt import planner_prompt
 
 
 def _orders_with_segments() -> Cube:
@@ -154,14 +155,14 @@ def test_segment_unknown_cube_rejected() -> None:
 
 
 def test_prompt_lists_segments_for_each_cube() -> None:
-    rendered = Catalog([_orders_with_segments()]).prompt()
+    rendered = planner_prompt(Catalog([_orders_with_segments()]))
     assert "**Segments:**" in rendered
     assert "`orders.paid`" in rendered
     assert "`orders.recent`" in rendered
 
 
 def test_prompt_includes_segment_descriptions() -> None:
-    rendered = Catalog([_orders_with_segments()]).prompt()
+    rendered = planner_prompt(Catalog([_orders_with_segments()]))
     assert "payment confirmed" in rendered.lower()
 
 
@@ -173,5 +174,5 @@ def test_prompt_omits_segments_section_when_none() -> None:
         alias="b",
         dimensions=[Dimension(name="x", sql="{b}.x", type="string")],
     )
-    rendered = Catalog([cube]).prompt()
+    rendered = planner_prompt(Catalog([cube]))
     assert "**Segments:**" not in rendered
