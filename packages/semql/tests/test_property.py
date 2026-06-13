@@ -1,43 +1,69 @@
-"""Hypothesis property tests on compile_query.
+"""Property-based tests for the semql compiler.
 
-The invariants under test:
+Catalogue per ``docs/specs/property-testing.md`` §2, ordered by oracle
+strength. Generation is feature-flagged swarm (``strategies.swarm``); the
+hostile-value tail is sentinel-wrapped so injection is checkable without
+false positives. Settings come from the profile registered in the root
+``conftest.py`` (``HYPOTHESIS_PROFILE=dev|ci|nightly``).
 
-1. Any ``SemanticQuery`` the catalog accepts compiles to a single
-   safe SELECT statement.
-2. ``compile_query`` is deterministic — same inputs produce the same
-   bytes (modulo bind-parameter naming, which depends on input order).
-3. ``validate`` agrees with ``compile_query``: when validate returns
-   an empty list, compile_query succeeds; when it returns errors,
-   compile_query raises something.
-4. Any valid query generated against a random catalog compiles and
-   produces a safe SELECT (random-catalog coverage via strategies.py).
-
-The fixed-catalog tests (1–3) exercise specific query shapes.
-The random-catalog tests (4) exercise arbitrary cube structures.
+Design note — *conditional agreement*: generating a guaranteed-compilable
+multi-cube query is hard (fan-out, join paths, left-join rules), so the
+differential / algebraic properties assert that two computations reach the
+*same* outcome — both succeed with equal SQL, or both refuse — rather than
+requiring success. Refusals are first-class, not skipped.
 """
 
 from __future__ import annotations
 
-from hypothesis import HealthCheck, given, settings
+import contextlib
+from typing import cast
+
+import sqlglot
+from hypothesis import HealthCheck, example, given, settings
 from hypothesis import strategies as st
 from semql import (
     Backend,
+    BoolExpr,
     Catalog,
-    CompileError,
     Cube,
     Dimension,
     Filter,
     Measure,
     SemanticQuery,
     TimeDimension,
-    TimeWindow,
+    compile_query,
     is_safe_select,
+    to_logical_plan,
     validate,
 )
+from semql.cnf import to_cnf
+from semql.compile import compile_plan
+from semql.errors import SemQLError
+from sqlglot import exp
+
+from .strategies import SENTINEL, broken_pair, swarm
+
+# Swarm catalogs/queries are richer than the default health-check budget
+# expects; suppress the timing alarm but never ``filter_too_much`` (§3.5).
+_SWARM = settings(suppress_health_check=[HealthCheck.too_slow, HealthCheck.data_too_large])
+
+
+def _outcome(thunk: object) -> tuple[str, object, object]:
+    """Normalise a compile attempt to a comparable outcome:
+    ``("ok", sql, params)`` or ``("err", ExceptionClassName, None)``."""
+    try:
+        cq = thunk()  # type: ignore[operator]
+    except SemQLError as e:
+        return ("err", type(e).__name__, None)
+    return ("ok", cq.sql, cq.params)
+
+
+# ---------------------------------------------------------------------------
+# Fixed-catalog smoke (readable, fast)
+# ---------------------------------------------------------------------------
 
 
 def _catalog() -> Catalog:
-    """Stable fixture — every property test runs against this shape."""
     orders = Cube(
         name="orders",
         backend=Backend.POSTGRES,
@@ -62,170 +88,235 @@ _MEASURES = ["orders.revenue", "orders.count"]
 _DIMS = ["orders.region", "orders.status"]
 
 
-# ---------------------------------------------------------------------------
-# Strategies
-# ---------------------------------------------------------------------------
-
-
 @st.composite
-def _string_filter(draw: st.DrawFn) -> Filter:
-    dim = draw(st.sampled_from(["orders.region", "orders.status"]))
-    op = draw(st.sampled_from(["eq", "neq", "in", "not_in", "contains"]))
-    if op in ("in", "not_in"):
-        values = draw(
-            st.lists(
-                st.text(min_size=1, max_size=5, alphabet="abcdef"),
-                min_size=1,
-                max_size=4,
-            )
-        )
-    elif op == "contains":
-        # contains is single-value.
-        values = [draw(st.text(min_size=1, max_size=5, alphabet="abcdef"))]
-    else:
-        values = [draw(st.text(min_size=1, max_size=5, alphabet="abcdef"))]
-    return Filter(dimension=dim, op=op, values=list(values))  # type: ignore[arg-type]
-
-
-@st.composite
-def _numeric_filter(draw: st.DrawFn) -> Filter:
-    op = draw(st.sampled_from(["eq", "neq", "gt", "lt", "gte", "lte"]))
-    values = [draw(st.integers(min_value=-1_000_000, max_value=1_000_000))]
-    return Filter(dimension="orders.amount", op=op, values=list(values))  # type: ignore[arg-type]
-
-
-@st.composite
-def _null_filter(draw: st.DrawFn) -> Filter:
-    dim = draw(st.sampled_from(_DIMS))
-    op = draw(st.sampled_from(["is_null", "not_null"]))
-    return Filter(dimension=dim, op=op, values=[])  # type: ignore[arg-type]
-
-
-@st.composite
-def _aggregated_query(draw: st.DrawFn) -> SemanticQuery:
+def _fixed_query(draw: st.DrawFn) -> SemanticQuery:
     measures = draw(st.lists(st.sampled_from(_MEASURES), min_size=1, max_size=2, unique=True))
     dimensions = draw(st.lists(st.sampled_from(_DIMS), max_size=2, unique=True))
-    filters = draw(
-        st.lists(
-            st.one_of(_string_filter(), _numeric_filter(), _null_filter()),
-            max_size=3,
-        )
-    )
-    limit = draw(st.one_of(st.none(), st.integers(min_value=1, max_value=1000)))
-    return SemanticQuery(
-        measures=list(measures),
-        dimensions=list(dimensions),
-        filters=list(filters),
-        limit=limit,
-    )
+    return SemanticQuery(measures=measures, dimensions=dimensions)
 
 
-@st.composite
-def _ungrouped_query(draw: st.DrawFn) -> SemanticQuery:
-    dimensions = draw(st.lists(st.sampled_from(_DIMS), min_size=1, max_size=2, unique=True))
-    filters = draw(st.lists(st.one_of(_string_filter(), _null_filter()), max_size=3))
-    limit = draw(st.integers(min_value=1, max_value=1000))
-    return SemanticQuery(
-        dimensions=list(dimensions),
-        filters=list(filters),
-        ungrouped=True,
-        limit=limit,
-    )
-
-
-@st.composite
-def _time_breakdown_query(draw: st.DrawFn) -> SemanticQuery:
-    measures = draw(st.lists(st.sampled_from(_MEASURES), min_size=1, max_size=2, unique=True))
-    granularity = draw(st.sampled_from(["hour", "day", "week", "month"]))
-    return SemanticQuery(
-        measures=list(measures),
-        time_dimension=TimeWindow(
-            dimension="orders.created_at",
-            granularity=granularity,  # type: ignore[arg-type]
-            range=("2026-01-01", "2026-02-01"),
-        ),
-    )
-
-
-_QUERY = st.one_of(_aggregated_query(), _ungrouped_query(), _time_breakdown_query())
-
-
-# ---------------------------------------------------------------------------
-# Property 1: every generated query compiles to a safe SELECT.
-# ---------------------------------------------------------------------------
-
-
-@given(query=_QUERY)
-@settings(suppress_health_check=[HealthCheck.too_slow], deadline=None, max_examples=200)
-def test_property_compile_produces_safe_select(query: SemanticQuery) -> None:
+@given(query=_fixed_query())
+def test_fixed_catalog_compiles_to_safe_select(query: SemanticQuery) -> None:
     out = _catalog().compile(query)
-    assert is_safe_select(out.sql), f"unsafe SQL produced:\n{out.sql}"
-    # Params bound exactly once per distinct value (or once per filter
-    # value in the legacy path) — the dict keys are uniquely numbered.
-    assert len(out.params) == len(set(out.params.keys()))
+    assert is_safe_select(out.sql)
 
 
 # ---------------------------------------------------------------------------
-# Property 2: compile_query is deterministic — same input, same SQL.
+# P1 — Totality (the crash-finder)
 # ---------------------------------------------------------------------------
 
 
-@given(query=_QUERY)
-@settings(suppress_health_check=[HealthCheck.too_slow], deadline=None, max_examples=100)
-def test_property_compile_is_deterministic(query: SemanticQuery) -> None:
-    a = _catalog().compile(query)
-    b = _catalog().compile(query)
-    assert a.sql == b.sql
-    assert a.params == b.params
-    assert a.columns == b.columns
+@given(a=swarm(), b=swarm())
+@_SWARM
+def test_p1_totality_compile_never_crashes(
+    a: tuple[frozenset[str], Catalog, SemanticQuery],
+    b: tuple[frozenset[str], Catalog, SemanticQuery],
+) -> None:
+    """A structurally-valid query against a *foreign* catalog (refs rarely
+    resolve) either compiles or raises ``SemQLError`` — never ``KeyError`` /
+    ``AttributeError`` / ``RecursionError`` / any non-SemQL exception."""
+    _, _, query = a
+    _, catalog, _ = b
+    # A typed refusal is the contract; any *other* exception propagates and
+    # fails the test — that's the crash this property exists to catch.
+    with contextlib.suppress(SemQLError):
+        compile_query(query, catalog.as_dict())
 
 
 # ---------------------------------------------------------------------------
-# Property 3: validate and compile_query agree on success.
+# P2 — Safe SELECT + sentinel bind-params (injection oracle)
 # ---------------------------------------------------------------------------
 
 
-@given(query=_QUERY)
-@settings(suppress_health_check=[HealthCheck.too_slow], deadline=None, max_examples=100)
-def test_property_validate_agrees_with_compile_on_success(query: SemanticQuery) -> None:
-    cat = _catalog()
-    errors = validate(query, cat)
-    if not errors:
-        # No validation errors → compile must succeed.
-        cat.compile(query)
+@given(trip=swarm())
+@_SWARM
+def test_p2_values_are_bound_never_spliced(
+    trip: tuple[frozenset[str], Catalog, SemanticQuery],
+) -> None:
+    _, catalog, query = trip
+    try:
+        out = compile_query(query, catalog.as_dict())
+    except SemQLError:
+        return
+    assert is_safe_select(out.sql)
+    # Every filter string value is sentinel-wrapped; a spliced value would
+    # carry its marker into the SQL text. The marker must never appear.
+    assert SENTINEL not in out.sql
+    # Param keys are unique (no clobbering).
+    assert len(out.params) == len(set(out.params))
+
+
+# ---------------------------------------------------------------------------
+# P3 — Dialect validity
+# ---------------------------------------------------------------------------
+
+
+@given(trip=swarm())
+@_SWARM
+def test_p3_emitted_sql_parses_under_its_dialect(
+    trip: tuple[frozenset[str], Catalog, SemanticQuery],
+) -> None:
+    _, catalog, query = trip
+    try:
+        out = compile_query(query, catalog.as_dict())
+    except SemQLError:
+        return
+    parsed = sqlglot.parse_one(out.sql, dialect=out.backend.value)
+    # ``exp.Command`` is sqlglot's "couldn't really parse this" fallback.
+    assert not isinstance(parsed, exp.Command)
+    assert not list(parsed.find_all(exp.Command)), f"unparsed fragment in:\n{out.sql}"
+
+
+# ---------------------------------------------------------------------------
+# P5 — Determinism
+# ---------------------------------------------------------------------------
+
+
+@given(trip=swarm())
+@_SWARM
+def test_p5_determinism(trip: tuple[frozenset[str], Catalog, SemanticQuery]) -> None:
+    _, catalog, query = trip
+    d = catalog.as_dict()
+    assert _outcome(lambda: compile_query(query, d)) == _outcome(lambda: compile_query(query, d))
+
+
+# ---------------------------------------------------------------------------
+# P6 — Insensitivity to catalog construction order
+# ---------------------------------------------------------------------------
+
+
+@given(trip=swarm())
+@_SWARM
+def test_p6_cube_order_does_not_change_output(
+    trip: tuple[frozenset[str], Catalog, SemanticQuery],
+) -> None:
+    _, catalog, query = trip
+    cubes = list(catalog.as_dict().values())
+    permuted = Catalog(list(reversed(cubes)))
+    assert _outcome(lambda: compile_query(query, catalog.as_dict())) == _outcome(
+        lambda: compile_query(query, permuted.as_dict())
+    )
+
+
+# ---------------------------------------------------------------------------
+# P7 — CNF semantic equivalence + idempotence
+# ---------------------------------------------------------------------------
+
+_ATOMS = [Filter(dimension=f"c.d{i}", op="eq", values=[f"v{i}"]) for i in range(5)]
+
+
+def _atom_id(f: Filter) -> str:
+    return f"{f.dimension}|{f.op}|{tuple(f.values)}"
+
+
+def _eval(node: BoolExpr | Filter, env: dict[str, bool]) -> bool:
+    if isinstance(node, Filter):
+        return env[_atom_id(node)]
+    if node.op == "not":
+        return not _eval(node.children[0], env)
+    if node.op == "and":
+        return all(_eval(c, env) for c in node.children)
+    return any(_eval(c, env) for c in node.children)
+
+
+def _cnf_expr(leaves: st.SearchStrategy[Filter]) -> st.SearchStrategy[BoolExpr]:
+    strategy = st.recursive(
+        leaves,
+        lambda sub: st.one_of(
+            st.builds(
+                lambda c: BoolExpr(op="and", children=c), st.lists(sub, min_size=2, max_size=3)
+            ),
+            st.builds(
+                lambda c: BoolExpr(op="or", children=c), st.lists(sub, min_size=2, max_size=3)
+            ),
+            st.builds(lambda c: BoolExpr(op="not", children=[c]), sub),
+        ),
+        max_leaves=6,
+    ).filter(lambda e: isinstance(e, BoolExpr))
+    return cast("st.SearchStrategy[BoolExpr]", strategy)
+
+
+@example(
+    # Regression (2026-06-13): ``a OR b OR (a AND b)`` distributed to
+    # ``(a OR b) AND (a OR b)`` and the duplicate conjunct survived the
+    # first pass — to_cnf was not idempotent. Fixed in cnf.py.
+    expr=BoolExpr(
+        op="or",
+        children=[_ATOMS[0], _ATOMS[1], BoolExpr(op="and", children=[_ATOMS[0], _ATOMS[1]])],
+    )
+)
+@given(expr=_cnf_expr(st.sampled_from(_ATOMS)))
+@_SWARM
+def test_p7_cnf_preserves_truth_table_and_is_idempotent(expr: BoolExpr) -> None:
+    converted = to_cnf(expr)
+    # Same truth table under every assignment of the (≤5) atoms.
+    ids = [_atom_id(a) for a in _ATOMS]
+    for mask in range(2 ** len(ids)):
+        env = {aid: bool(mask & (1 << i)) for i, aid in enumerate(ids)}
+        assert _eval(expr, env) == _eval(converted, env)
+    # Idempotence: a second pass changes nothing.
+    assert to_cnf(converted) == converted
+
+
+# ---------------------------------------------------------------------------
+# P9 — Path equivalence (the A1 net): two compile paths, one truth
+# ---------------------------------------------------------------------------
+
+
+@given(trip=swarm())
+@_SWARM
+def test_p9_query_path_equals_plan_path(
+    trip: tuple[frozenset[str], Catalog, SemanticQuery],
+) -> None:
+    _, catalog, query = trip
+    d = catalog.as_dict()
+    direct = _outcome(lambda: compile_query(query, d))
+    via_plan = _outcome(lambda: compile_plan(to_logical_plan(query, d), d))
+    if direct[0] == "ok" and via_plan[0] == "ok":
+        assert direct[1] == via_plan[1]  # SQL
+        assert direct[2] == via_plan[2]  # params
     else:
-        # Validation errors → compile must raise.
+        # Both paths must agree on refusal (one succeeding while the other
+        # raises would be the A1 divergence bug this guards against).
+        assert direct[0] == "err" and via_plan[0] == "err"
+
+
+# ---------------------------------------------------------------------------
+# P10 / P12 — Negative properties on one-mutation-off-valid pairs
+# ---------------------------------------------------------------------------
+
+
+@given(t=broken_pair())
+@_SWARM
+def test_p10_validate_agrees_with_compile_on_broken(
+    t: tuple[Catalog, SemanticQuery, str],
+) -> None:
+    catalog, query, _label = t
+    errors = validate(query, catalog)
+    # A breakage that ``validate`` flags must also stop ``compile``.
+    if errors:
         try:
-            cat.compile(query)
-        except CompileError:
+            catalog.compile(query)
+        except SemQLError:
             pass
-        else:  # pragma: no cover — surfaces the disagreement if it ever happens
-            raise AssertionError(f"validate reported errors but compile succeeded: {errors}")
+        else:
+            raise AssertionError("validate reported errors but compile succeeded")
 
 
-# ---------------------------------------------------------------------------
-# Property 4: random-catalog coverage.
-# ---------------------------------------------------------------------------
-# SQL uses {alias}.{field_name} everywhere so it always parses; no joins or
-# time-dimensions (kept simple so the strategy stays self-contained).
-
-
-from .strategies import catalog_and_query  # noqa: E402
-
-
-@given(pair=catalog_and_query())
-@settings(suppress_health_check=[HealthCheck.too_slow], deadline=None, max_examples=200)
-def test_property_random_catalog_compiles(pair: tuple[Catalog, SemanticQuery]) -> None:
-    catalog, query = pair
-    out = catalog.compile(query)
-    assert is_safe_select(out.sql), f"unsafe SQL from random catalog:\n{out.sql}"
-
-
-@given(pair=catalog_and_query())
-@settings(suppress_health_check=[HealthCheck.too_slow], deadline=None, max_examples=100)
-def test_property_random_catalog_deterministic(pair: tuple[Catalog, SemanticQuery]) -> None:
-    catalog, query = pair
-    a = catalog.compile(query)
-    b = catalog.compile(query)
-    assert a.sql == b.sql
-    assert a.params == b.params
+@given(t=broken_pair())
+@_SWARM
+def test_p12_broken_pair_raises_typed_error_naming_the_offender(
+    t: tuple[Catalog, SemanticQuery, str],
+) -> None:
+    catalog, query, label = t
+    try:
+        catalog.compile(query)
+    except SemQLError as e:
+        # PHILOSOPHY: errors serve machines and humans — a non-empty message.
+        assert str(e)
+    else:
+        # The only breakage that may legitimately still compile is a
+        # filter pointed at a measure when that path is lenient; the
+        # ref-not-found breakages must refuse.
+        if label in ("unknown_measure", "unknown_dimension"):
+            raise AssertionError(f"{label}: expected a typed refusal, compile succeeded")
