@@ -1,11 +1,11 @@
-"""``python -m semql.compile``  CLI.
+"""``python -m semql`` CLI.
 
 Compiles a ``SemanticQuery`` JSON spec against a Catalog declared
 in a Python module and prints the SQL + params to stdout. Useful
 for ad-hoc cube authoring (no need to write a runner script) and
 as a smoke target in CI.
 
-    python -m semql.compile --catalog mypkg.catalogs:default \\
+    python -m semql --catalog mypkg.catalogs:default \\
         '{"measures": ["orders.revenue"], "dimensions": ["orders.region"]}'
 
 The ``--catalog`` arg is ``module.path:attr`` — the module is
@@ -59,7 +59,7 @@ def _parse_context(pairs: list[str]) -> dict[str, str]:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        prog="python -m semql.compile",
+        prog="python -m semql",
         description="Compile a SemanticQuery JSON spec to SQL.",
     )
     parser.add_argument(

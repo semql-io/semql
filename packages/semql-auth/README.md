@@ -22,6 +22,17 @@ so it stays in the pure core. This package holds only the adapters, which
 carry optional third-party dependencies (PyJWT, httpx, cryptography) that
 the core shouldn't.
 
+## Install
+
+```sh
+pip install semql-auth
+pip install semql-auth[jwks]        # JWKS verifier (httpx)
+pip install semql-auth[introspect]  # OAuth2 introspection
+pip install semql-auth[x509]        # mTLS client cert decoder
+```
+
+## Quick start
+
 ```python
 from semql import Catalog
 from semql_auth import HMACVerifier, DictMapper
@@ -31,6 +42,9 @@ mapper = DictMapper({"tok-abc": ...})
 # In your transport: verify the token, map to AuthContext, then
 #   catalog.compile(query, viewer=auth_context)
 ```
+
+See [API reference](../../docs/api/semql_auth.md) for the full adapter
+surface.
 
 ## License
 

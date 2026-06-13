@@ -113,10 +113,12 @@ resolves it (along with `{schema}`-style context placeholders and
 ## Philosophy
 
 See `PHILOSOPHY.md` at the repo root. Highlights:
-- Correct SQL, not optimal. The query planner is the database's job.
-- The emitted SQL must read like something a human could have written.
+- The emitted SQL must be readable by the engineer debugging a
+  production incident at 2am.
+- Compile errors beat runtime errors; runtime errors beat wrong results.
 - `compile()` fails at the first problem; `validate()` collects them all.
-- The catalog is data; reflection isn't an afterthought.
+- Catalogs are data; the META cubes expose the catalog through the
+  same compiler path a normal query takes.
 
 ## Status
 

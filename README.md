@@ -7,8 +7,9 @@ LLM prompt pipeline.
 
 Define **semantic cubes** — dimensions, measures, filters, and joins
 over your tables. Organize them in a **catalog**. SemQL turns a
-declarative `SemanticQuery` into parameterised SQL across Postgres /
-ClickHouse / DuckDB / BigQuery / Snowflake.
+declarative `SemanticQuery` into parameterised SQL across Postgres,
+ClickHouse, DuckDB, BigQuery, and Snowflake, plus the analytics
+engines Redshift, Trino, and Databricks.
 
 - **SQL generation** — semantic spec → dialect-aware SQL with bound params
 - **Authorisation** — `AuthContext` viewer + cube `required_roles` +
@@ -16,7 +17,9 @@ ClickHouse / DuckDB / BigQuery / Snowflake.
   cube the viewer can't see, and injects row-level predicates inside
   the cube's alias subquery so outer ORs can't bypass them.
 - **Time spine** — `fill_nulls_with` emits one row per bucket in
-  range, COALESCEd, across all five backends.
+  range, COALESCEd, across the five stable backends. SQL Server,
+  MySQL, and Oracle are experimental; gap-filling time spines are
+  not yet implemented on any of them.
 - **Pipeline prompts** — four typed roles (Router / Generator /
   Presenter / Drilldown) with structured Pydantic outputs. Plug into
   any LLM client; no vendor lock-in.

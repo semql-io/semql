@@ -8,6 +8,18 @@ joins. Designed for greenfield adoption — a team with 200 tables can
 generate the mechanical 80% of a catalog in seconds, then hand-edit
 the heuristic guesses.
 
+Use this for *cold-start* scaffolding. For ongoing drift detection
+on a catalog you already have, see
+[`semql-validate-db`](../semql-validate-db) — it probes a live
+database against an authored catalog and surfaces missing tables /
+columns / join predicates that the compiler can't see at build time.
+
+## Install
+
+```sh
+pip install semql-introspect
+```
+
 ## Usage
 
 ```python

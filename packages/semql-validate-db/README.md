@@ -11,6 +11,13 @@ every compile-time check and still blow up at query time because
 upstream renamed a column. `semql-validate-db` is the out-of-band
 gate that catches it.
 
+Use this for *ongoing* drift detection on a catalog you already
+authored. For greenfield scaffolding from a database's existing
+schema, see [`semql-introspect`](../semql-introspect) — it generates
+`Cube` stubs from the information schema, which is the *opposite*
+direction: introspect goes DB → catalog, validate-db goes catalog →
+DB.
+
 ## Install
 
 ```sh

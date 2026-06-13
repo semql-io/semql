@@ -1,111 +1,53 @@
 # SemQL Philosophy
 
-Inspired by the Zen of Python — independent in spirit.
+The rules a contributor gets told "no" on.
 
----
+## Compiler
 
-## The compiler
+The compiler has no I/O. `Catalog` is Python data; `compile()` returns
+SQL + bound params. Running the SQL is the caller's job.
 
-Infer what can be inferred. Surface what was inferred.
-No decision made silently.
-
-Compile errors are better than runtime errors.
-Runtime errors are better than wrong results.
-Wrong results are the only unacceptable outcome.
-
-The compiler has no I/O.
-Catalogs are Python data; the compiler returns SQL + bound params;
-running the SQL is the caller's job.
+Compile errors beat runtime errors. Runtime errors beat wrong results.
 
 ## Authorisation
 
 Identity is the caller's. Authorisation is the compiler's.
-The caller knows who is asking; the compiler enforces what they may see.
 
-`AuthContext` is request-scoped, never global.
-A `Catalog` without a viewer compiles in the unscoped mode.
-A `Catalog` with a viewer refuses queries touching unauthorised cubes
-and injects row-level predicates inside the alias subquery.
+`AuthContext` is request-scoped. A catalog without a viewer compiles
+unscoped. A catalog with a viewer refuses queries that touch a cube
+the viewer can't see, and injects row-level predicates inside the
+cube's alias subquery — not the outer query — so outer `OR`s can't
+reach rows the scope excludes.
 
-Bypass-proof beats convenient. Scope predicates live where outer `OR`s
-cannot reach them. Identity values bind as parameters, never as literals.
+Identity values bind as parameters. Never as SQL literals.
 
-`expose_in_prompt` is a hint to language models — what to surface.
-`required_roles` and `ScopeFn` are access control — what to allow.
-Two flags, two purposes.
+`expose_in_prompt` is for LLMs. `required_roles` and `ScopeFn` are
+for access control. Don't conflate them.
 
 ## SQL
 
-The emitted SQL must be readable by the engineer debugging a production incident.
-If the output is unreadable, the abstraction has failed.
+The emitted SQL must be readable by the engineer debugging a
+production incident at 2am. If it isn't, the abstraction failed.
 
-Correct SQL, not optimal SQL.
-The query planner is the database's job.
-
-Raw SQL is a pragmatic escape hatch, not a feature.
-When raw SQL is used, SemQL says so.
-Silence implies safety.
+Raw SQL is an escape hatch. When SemQL emits it, it says so.
 
 ## Errors
 
-`compile()` fails at the first problem. `validate()` collects them all.
-Two tools, two contracts.
-
-Errors serve machines and humans.
-Structure carries the meaning; `str()` carries the message.
+`compile()` fails at the first problem. `validate()` collects them.
 
 When a field is unknown, name the closest match.
-Short retry loops serve everyone — human or LLM.
 
-## Reflection
+## Catalog
 
-The model is queryable through itself.
-The META cubes (`catalog_cubes`, `catalog_measures`, `catalog_dimensions`)
-expose the catalog via the same compile path a normal query takes —
-one compiler, one prompt contract, one execution shape.
-
-Reflection is a design choice, not an afterthought. The catalog
-is data; querying data is what the compiler does.
-
-## The catalog
-
-Python is the native language for cube definitions.
-Type safety, refactoring, and testing come free.
-
-Catalogs must be serialisable and versioned.
-A catalog that cannot cross a process boundary cannot serve a real system.
+Catalogs must be serialisable and versioned. A catalog that can't
+cross a process boundary can't serve a real system.
 
 ## Growth
 
-One package per concern. Core stays minimal.
-Dependencies you don't need should cost nothing to avoid.
+One package per concern. Core stays minimal — `CompiledQuery` in,
+`CompiledQuery` out. Executors, enrichers, MCP, prompt fragments,
+and call-site opinions live in sibling packages and stay swappable.
+
+Federation belongs out of core SemQL, declared by the caller.
 
 Break freely before v1. Lock strictly after.
-Pre-v1 is a design space. v1 is a contract.
-
-Federation belongs above SemQL, declared explicitly.
-SemQL is not Trino.
-
-## What SemQL is not
-
-Not an ORM. ORMs hide SQL; SemQL generates it.
-The SQL is the product.
-
-Not a BI tool. SemQL is a compiler and protocol layer.
-
-Not a framework. It composes with your stack — it does not own it.
-
-Core ships primitives; recipes wire them up.
-Core returns `CompiledQuery` and stays sans-io — no executors, no
-enrichers, no JSON-RPC. The opinionated layers that own a call site
-(MCP, the planner-prompt package, the planned `semql-pydantic-ai`
-sibling) live outside core as sibling packages and earn their keep
-by being replaceable. A defensive guarantee that reaches the LLM
-consumer — e.g. `enrich_result` running on every `query_execute` —
-is implemented in the recipe, not in core. Core's job is to make
-the recipe possible; the recipe's job is to make the LLM consumer
-correct.
-
-Human-first, LLM-friendly.
-The protocol does not know who is calling.
-The ergonomics are designed for people.

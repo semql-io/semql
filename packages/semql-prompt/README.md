@@ -16,6 +16,14 @@ renders a prompt. This package is the rendering layer on top:
 - **Prompt-token budgeting** — `PromptBudget`, `apply_budget`,
   `estimate_tokens`.
 
+## Install
+
+```sh
+pip install semql-prompt
+```
+
+## Quick start
+
 The catalog-level conveniences take the catalog as their first argument:
 
 ```python
@@ -27,6 +35,9 @@ segs = planner_prompt_segments(catalog)
 key  = prompt_hash(catalog)
 tools = to_openai_tools(catalog, viewer=viewer)
 ```
+
+For the lower-level per-role fragment builders, see
+[API reference](../../docs/api/semql_prompt.md).
 
 ## License
 

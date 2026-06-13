@@ -11,6 +11,10 @@ Run from the repo root:
 
 Idempotent — overwrites ``docs/api/*.md`` on each invocation. Skip
 running this from CI for now; the layer-1 ribbon mentioned it explicitly.
+
+Pass ``--strict`` to fail on public symbols that ship without a
+docstring; the default is to flag them inline so the gap is visible
+without breaking the build.
 """
 
 from __future__ import annotations
@@ -28,6 +32,11 @@ PACKAGES: tuple[tuple[str, str], ...] = (
     ("semql", "semql"),
     ("semql_mcp", "semql-mcp"),
     ("semql_erd", "semql-erd"),
+    ("semql_validate_db", "semql-validate-db"),
+    ("semql_engine", "semql-engine"),
+    ("semql_introspect", "semql-introspect"),
+    ("semql_prompt", "semql-prompt"),
+    ("semql_auth", "semql-auth"),
 )
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -66,10 +75,20 @@ def _docstring(obj: griffe.Object) -> str:
     return obj.docstring.value.strip()
 
 
-def _render_member(obj: griffe.Object) -> list[str]:
-    """One markdown section per public member: heading, signature, doc."""
+def _render_member(obj: griffe.Object, *, strict: bool) -> list[str] | None:
+    """One markdown section per public member: heading, signature, doc.
+
+    Returns ``None`` when ``strict=True`` and the symbol has no
+    docstring — callers translate that into a non-zero exit so the
+    gap can't ship unflagged.
+    """
     name = obj.name
     kind = obj.kind.value if obj.kind else "object"
+    doc = _docstring(obj)
+    if not doc:
+        if strict:
+            return None
+        doc = "_No docstring — public surface, please add one._"
     lines: list[str] = [f"### `{name}` ({kind})", ""]
 
     sig = _signature(obj)
@@ -77,10 +96,8 @@ def _render_member(obj: griffe.Object) -> list[str]:
         lines.append(f"```python\n{name}{sig}\n```")
         lines.append("")
 
-    doc = _docstring(obj)
-    if doc:
-        lines.append(doc)
-        lines.append("")
+    lines.append(doc)
+    lines.append("")
 
     return lines
 
@@ -89,7 +106,7 @@ def _public_members(module: griffe.Module) -> Iterable[griffe.Object]:
     """Yield members named in ``__all__`` (in declaration order)."""
     exports = module.exports
     if not exports:
-        return ()
+        return
     # ``exports`` is the parsed __all__ list — strings or Name nodes.
     names: list[str] = []
     for entry in exports:
@@ -105,8 +122,12 @@ def _public_members(module: griffe.Module) -> Iterable[griffe.Object]:
         yield module.members[name]  # type: ignore[misc]
 
 
-def render_package(package: str) -> str:
-    """Render one markdown document for ``package`` (top-level module)."""
+def render_package(package: str, *, strict: bool) -> tuple[str, list[str]]:
+    """Render one markdown document for ``package`` (top-level module).
+
+    Returns the rendered markdown and a list of member names that
+    shipped without a docstring (empty in non-strict mode unless they
+    truly are undocumented — the inline marker is the visible signal)."""
     module = griffe.load(package, search_paths=_search_paths())
     if not isinstance(module, griffe.Module):
         raise TypeError(f"griffe.load({package!r}) returned non-module {type(module).__name__}.")
@@ -121,24 +142,35 @@ def render_package(package: str) -> str:
         lines.append(module.docstring.value.strip())
         lines.append("")
 
+    undocumented: list[str] = []
     for member in _public_members(module):
-        lines.extend(_render_member(member))
+        rendered = _render_member(member, strict=strict)
+        if rendered is None:
+            undocumented.append(member.name)
+            continue
+        lines.extend(rendered)
 
-    return "\n".join(lines).rstrip() + "\n"
+    return "\n".join(lines).rstrip() + "\n", undocumented
 
 
 def write_docs(
     out_dir: Path,
     packages: Iterable[tuple[str, str]] = PACKAGES,
-) -> list[Path]:
+    *,
+    strict: bool = False,
+) -> tuple[list[Path], dict[str, list[str]]]:
     """Render each package and write to ``<out_dir>/<module>.md``."""
     out_dir.mkdir(parents=True, exist_ok=True)
     written: list[Path] = []
+    gaps: dict[str, list[str]] = {}
     for module_name, _ in packages:
         target = out_dir / f"{module_name}.md"
-        target.write_text(render_package(module_name))
+        text, undocumented = render_package(module_name, strict=strict)
+        target.write_text(text)
         written.append(target)
-    return written
+        if undocumented:
+            gaps[module_name] = undocumented
+    return written, gaps
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -149,11 +181,19 @@ def main(argv: list[str] | None = None) -> int:
         default=REPO_ROOT / "docs" / "api",
         help="Output directory (default: docs/api/).",
     )
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="Fail (exit 1) when any public symbol ships without a docstring.",
+    )
     args = parser.parse_args(argv)
-    written = write_docs(args.out)
+    written, gaps = write_docs(args.out, strict=args.strict)
     for path in written:
         print(f"wrote {path.relative_to(REPO_ROOT)}")
-    return 0
+    if gaps:
+        for module, names in gaps.items():
+            print(f"  {module}: {len(names)} undocumented: {', '.join(names)}", file=sys.stderr)
+    return 1 if gaps and args.strict else 0
 
 
 if __name__ == "__main__":

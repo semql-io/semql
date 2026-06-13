@@ -9,6 +9,12 @@ then runs the plan's merge SQL against the assembled tables.
 turns a `FederatedPlan` into result rows when you want the cross-source
 execution done for you.
 
+## Install
+
+```sh
+pip install semql-engine
+```
+
 ## Quickstart
 
 ```python
@@ -61,3 +67,9 @@ v1 mirrors `compile_federated_query` v1:
 
 The engine itself is small; most of the federation logic lives in
 `semql.federate`.
+
+## Status
+
+Early development. The `Adapter` contract is stable; the federation
+shape mirrors `compile_federated_query` v1 (sum / count / avg and
+equality bridge joins only).
