@@ -2,8 +2,17 @@
 
 Pure-Python compiler from a semantic spec to backend SQL. Define
 cubes (dimensions, measures, time-dimensions, joins) once; emit
-correct, parameterised SQL for Postgres, ClickHouse, DuckDB and
-(via the strategy seam) Snowflake / BigQuery.
+correct, parameterised SQL for Postgres, ClickHouse, DuckDB,
+Snowflake, BigQuery, and the analytics engines Redshift, Trino and
+Databricks.
+
+SQL Server, MySQL and Oracle ship as **experimental / opt-in**
+dialects: sqlglot transpiles their `date_trunc` / percentile to
+best-effort forms that aren't exercised in CI, so enable them
+deliberately by passing `experimental_dialects()` through the
+compiler's `dialects=` override and verify the SQL on a live
+instance. (Gap-filling time-spines — `fill_nulls` — are not yet
+implemented for any of the six new dialects.)
 
 `semql` does **no I/O**: catalogs are Python data; the compiler
 returns SQL + bound params; running the SQL is the caller's job.

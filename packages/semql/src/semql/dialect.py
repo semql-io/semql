@@ -49,6 +49,14 @@ _BACKEND_TO_DIALECT: dict[Dialect, str] = {
     Dialect.DUCKDB: "duckdb",
     Dialect.BIGQUERY: "bigquery",
     Dialect.SNOWFLAKE: "snowflake",
+    # R1 first-class analytics engines.
+    Dialect.REDSHIFT: "redshift",
+    Dialect.TRINO: "trino",
+    Dialect.DATABRICKS: "databricks",
+    # R1 experimental OLTP engines. ``sqlserver`` maps to sqlglot's ``tsql``.
+    Dialect.SQLSERVER: "tsql",
+    Dialect.MYSQL: "mysql",
+    Dialect.ORACLE: "oracle",
     # META cubes are materialised as portable VALUES literals; the
     # Postgres dialect is neutral enough to parse them without rewrites.
     Dialect.META: "postgres",

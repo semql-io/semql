@@ -233,7 +233,22 @@ def test_separate_cubes_dont_share_default_lists() -> None:
 
 
 def test_backend_has_expected_members() -> None:
-    expected = {"postgres", "clickhouse", "duckdb", "bigquery", "snowflake", "meta"}
+    expected = {
+        "postgres",
+        "clickhouse",
+        "duckdb",
+        "bigquery",
+        "snowflake",
+        # R1 first-class analytics engines.
+        "redshift",
+        "trino",
+        "databricks",
+        # R1 experimental OLTP engines (opt-in via experimental_dialects()).
+        "sqlserver",
+        "mysql",
+        "oracle",
+        "meta",
+    }
     assert {b.value for b in Dialect} == expected
 
 

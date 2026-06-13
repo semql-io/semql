@@ -385,6 +385,123 @@ class SnowflakeDialect(_StdSqlDialect):
         return inner
 
 
+class _TranspilingSqlDialect(_StdSqlDialect):
+    """Base for the R1 backends — engines sqlglot can transpile to from
+    its canonical nodes (Redshift, Trino, Databricks, SQL Server, MySQL,
+    Oracle).
+
+    Where ``_StdSqlDialect`` pins ``date_trunc`` / ``PERCENTILE_CONT`` to
+    ``exp.Anonymous`` (verbatim, no transpilation — correct for the five
+    backends that share Postgres' spelling), this base emits the
+    *canonical* sqlglot nodes (``exp.TimestampTrunc``, ``exp.PercentileCont``)
+    so sqlglot's per-dialect renderer rewrites them to each engine's
+    native idiom: ``DATE_TRUNC`` on Redshift/Trino/Databricks,
+    ``DATETRUNC`` on SQL Server, the ``DATE_ADD`` trick on MySQL,
+    ``TIMESTAMP_TRUNC`` on Oracle; percentile becomes ``APPROX_PERCENTILE``
+    (Trino), ``PERCENTILE_APPROX`` (Databricks), or native
+    ``PERCENTILE_CONT ... WITHIN GROUP`` (Redshift/Oracle/SQL Server/MySQL).
+
+    ``placeholder`` / ``emit_contains`` / ``emit_source`` are inherited:
+    ``placeholder_for`` already yields the right paramstyle per dialect
+    (``%(name)s`` on Redshift, ``:name`` elsewhere), and sqlglot transpiles
+    the ``ILIKE`` AST to ``LOWER(...) LIKE LOWER(...)`` where a backend
+    lacks ``ILIKE``.
+
+    ``emit_time_spine`` is deferred: the gap-fill row generator differs
+    sharply per backend (sequence/UNNEST vs recursive CTE vs CONNECT BY)
+    and is a separable follow-up — it raises ``NotImplementedError``."""
+
+    def trunc(
+        self, granularity: str, expr: exp.Expression, timezone: str | None = None
+    ) -> exp.Expression:
+        target = (
+            expr
+            if timezone is None
+            else exp.AtTimeZone(this=expr, zone=exp.Literal.string(timezone))
+        )
+        # exp.TimestampTrunc is sqlglot's canonical truncation node; the
+        # renderer rewrites it to each dialect's native spelling on emit.
+        return exp.TimestampTrunc(this=target, unit=exp.Var(this=granularity.upper()))
+
+    def emit_percentile(self, q: float, expr: exp.Expression) -> exp.Expression:
+        # The quantile is the *only* argument to PercentileCont; the column
+        # lives in the WITHIN GROUP ordering. This is the shape sqlglot
+        # transpiles correctly (Trino → APPROX_PERCENTILE(expr, q),
+        # Databricks → PERCENTILE_APPROX, ANSI engines keep WITHIN GROUP).
+        return exp.WithinGroup(
+            this=exp.PercentileCont(this=exp.Literal.number(q)),
+            expression=exp.Order(expressions=[exp.Ordered(this=expr)]),
+        )
+
+    def emit_time_spine(
+        self,
+        granularity: str,  # noqa: ARG002
+        start: exp.Expression,  # noqa: ARG002
+        end: exp.Expression,  # noqa: ARG002
+        bucket_alias: str,  # noqa: ARG002
+    ) -> exp.Expression:
+        raise NotImplementedError(
+            f"Time-spine (fill_nulls) emission is not yet implemented for "
+            f"{self.dialect.value!r}. Each backend's row-generation idiom "
+            "(sequence/UNNEST, recursive CTE, CONNECT BY) is a separate "
+            "follow-up; gap-filling time series is unsupported on this "
+            "dialect for now."
+        )
+
+
+class RedshiftDialect(_TranspilingSqlDialect):
+    """Redshift convention. Placeholders render as ``%(name)s`` (psycopg2
+    paramstyle); ``DATE_TRUNC`` and native ``PERCENTILE_CONT ... WITHIN
+    GROUP`` are first-class."""
+
+    dialect = Dialect.REDSHIFT
+
+
+class TrinoDialect(_TranspilingSqlDialect):
+    """Trino convention. Placeholders render as ``:name`` (the SQLAlchemy
+    Trino paramstyle). Percentile transpiles to ``APPROX_PERCENTILE`` —
+    an approximation, documented as such on ``AggLiteral``."""
+
+    dialect = Dialect.TRINO
+
+
+class DatabricksDialect(_TranspilingSqlDialect):
+    """Databricks (Spark SQL) convention. Placeholders render as ``:name``.
+    Percentile transpiles to ``PERCENTILE_APPROX`` — an approximation."""
+
+    dialect = Dialect.DATABRICKS
+
+
+class SqlServerDialect(_TranspilingSqlDialect):
+    """SQL Server (T-SQL) — **experimental** (opt-in via
+    ``experimental_dialects()``). ``date_trunc`` transpiles to
+    ``DATETRUNC`` (SQL Server 2022+); percentile transpiles to
+    ``PERCENTILE_CONT ... WITHIN GROUP``, which on real SQL Server is a
+    *window* function (requires ``OVER()``) — verify on a live instance
+    before relying on it."""
+
+    dialect = Dialect.SQLSERVER
+
+
+class MySqlDialect(_TranspilingSqlDialect):
+    """MySQL — **experimental** (opt-in via ``experimental_dialects()``).
+    MySQL has no ``DATE_TRUNC``; sqlglot expands it to a
+    ``DATE_ADD``/``TIMESTAMPDIFF`` trick. ``PERCENTILE_CONT`` is not native
+    to MySQL — verify on a live instance before relying on it."""
+
+    dialect = Dialect.MYSQL
+
+
+class OracleDialect(_TranspilingSqlDialect):
+    """Oracle — **experimental** (opt-in via ``experimental_dialects()``).
+    sqlglot emits ``TIMESTAMP_TRUNC`` (Oracle's native truncation is
+    ``TRUNC(date, fmt)``) and native ``PERCENTILE_CONT ... WITHIN GROUP``
+    — verify the truncation spelling on a live instance before relying
+    on it."""
+
+    dialect = Dialect.ORACLE
+
+
 class ClickHouseDialect:
     """ClickHouse convention. Placeholders are typed (``{name:Type}``);
     truncation uses the ``toStartOf<Hour|Day|Week|Month>`` family;
@@ -538,7 +655,42 @@ _DEFAULTS: dict[Dialect, DialectStrategy] = {
     Dialect.DUCKDB: DuckDBDialect(),
     Dialect.BIGQUERY: BigQueryDialect(),
     Dialect.SNOWFLAKE: SnowflakeDialect(),
+    # R1 first-class analytics engines.
+    Dialect.REDSHIFT: RedshiftDialect(),
+    Dialect.TRINO: TrinoDialect(),
+    Dialect.DATABRICKS: DatabricksDialect(),
 }
+
+
+# R1 experimental OLTP engines. Deliberately NOT in ``_DEFAULTS`` — sqlglot
+# transpiles their date_trunc / percentile to best-effort forms we can't
+# exercise in CI (no live instances). Callers opt in via
+# ``experimental_dialects()`` passed through the ``dialects=`` override.
+_EXPERIMENTAL: dict[Dialect, DialectStrategy] = {
+    Dialect.SQLSERVER: SqlServerDialect(),
+    Dialect.MYSQL: MySqlDialect(),
+    Dialect.ORACLE: OracleDialect(),
+}
+
+
+def experimental_dialects() -> dict[Dialect, DialectStrategy]:
+    """Opt-in strategies for the SQL Server / MySQL / Oracle backends.
+
+    These OLTP engines lack the native ``date_trunc`` / percentile idioms
+    of the analytics backends, so sqlglot transpiles them to best-effort
+    forms that aren't exercised in CI (no live instances to run against).
+    They are kept out of the default registry; enable them explicitly by
+    passing the returned dict through the compiler's ``dialects=``
+    override::
+
+        from semql.backend import experimental_dialects
+
+        out = compile_query(q, catalog, dialects=experimental_dialects())
+
+    Verify the emitted SQL against a live instance before relying on it.
+    Returns a fresh dict each call, so callers can mutate / merge freely.
+    """
+    return dict(_EXPERIMENTAL)
 
 
 def dialect_for(
@@ -556,9 +708,15 @@ def dialect_for(
         return overrides[dialect]
     if dialect in _DEFAULTS:
         return _DEFAULTS[dialect]
+    if dialect in _EXPERIMENTAL:
+        raise KeyError(
+            f"{dialect!r} is an experimental dialect and is not registered "
+            "by default. Enable it by passing `experimental_dialects()` "
+            "through the compiler's `dialects=` override."
+        )
     raise KeyError(
         f"No registered DialectStrategy for {dialect!r}. "
-        "Pass one via the `strategies` kwarg on compile_query."
+        "Pass one via the `dialects` kwarg on compile_query."
     )
 
 
@@ -581,12 +739,19 @@ __all__ = [
     "DialectStrategy",
     "BigQueryDialect",
     "ClickHouseDialect",
+    "DatabricksDialect",
     "DuckDBDialect",
     "MetaDialect",
+    "MySqlDialect",
+    "OracleDialect",
     "ParamBinder",
     "PostgresDialect",
+    "RedshiftDialect",
     "SnowflakeDialect",
     "SqlResolver",
+    "SqlServerDialect",
+    "TrinoDialect",
     "render",
     "dialect_for",
+    "experimental_dialects",
 ]

@@ -61,6 +61,16 @@ class Dialect(StrEnum):
     DUCKDB = "duckdb"
     BIGQUERY = "bigquery"
     SNOWFLAKE = "snowflake"
+    # R1 analytics engines — first-class (registered by default).
+    REDSHIFT = "redshift"
+    TRINO = "trino"
+    DATABRICKS = "databricks"
+    # R1 OLTP engines — experimental / opt-in (see ``experimental_dialects``).
+    # sqlglot transpiles their date_trunc / percentile to best-effort forms
+    # we can't exercise in CI, so they're not registered by default.
+    SQLSERVER = "sqlserver"
+    MYSQL = "mysql"
+    ORACLE = "oracle"
     META = "meta"  # reflection over the catalog itself; see introspect.py
 
 
