@@ -1425,10 +1425,17 @@ class _CompileEnv:
         self.scope_fns = scope_fns
 
         # Compile context: caller-supplied substitutions + viewer
-        # auto-flattening for ``{ctx.viewer_id}``.
+        # auto-flattening for ``{ctx.viewer_id}`` and the identity's
+        # canonical ``tenant``. The tenant carried by the identity is the
+        # default source for schema-mode ``{tenant_schema}`` substitution
+        # and single-column discriminator binding — an explicit context
+        # value still wins (``setdefault``).
         ctx = dict(context or {})
         if viewer is not None:
             ctx.setdefault("ctx.viewer_id", viewer.viewer_id)
+            if viewer.tenant is not None:
+                ctx.setdefault("tenant_schema", viewer.tenant)
+                ctx.setdefault("tenant", viewer.tenant)
         self.ctx = ctx
         self.views_map: dict[str, View] = views or {}
 
@@ -1743,6 +1750,28 @@ class _CompileEnv:
 
         return _CTX_PLACEHOLDER_RE.sub(_ctx_repl, resolved)
 
+    def _resolve_tenant_value(self, cube: Cube, col: str) -> str:
+        """Resolve the bind value for a discriminator tenancy column.
+
+        Priority: an explicit ``context`` entry under the column name,
+        then the same key in ``viewer.attrs`` (structured claims), then —
+        for a single-column cube only — the canonical ``tenant`` key
+        (which ``viewer.tenant`` populates). A column with no resolvable
+        value raises ``CompileError`` rather than silently dropping the
+        predicate and crossing tenants."""
+        if col in self.ctx:
+            return self.ctx[col]
+        if self.viewer is not None and col in self.viewer.attrs:
+            return str(self.viewer.attrs[col])
+        if len(cube.tenancy_columns) == 1 and "tenant" in self.ctx:
+            return self.ctx["tenant"]
+        raise CompileError(
+            f"Cube {cube.name!r} declares tenancy='discriminator' with "
+            f"tenancy_columns={cube.tenancy_columns!r}, but no value for "
+            f"column {col!r} was provided. Set viewer.tenant (single-column "
+            f"cubes) or pass context={{{col!r}: <value>}} / viewer.attrs."
+        )
+
     def wrap_for_tenancy(self, cube: Cube, source: exp.Expression) -> exp.Expression:
         """Wrap a cube's FROM source in an isolation subquery.
 
@@ -1752,19 +1781,17 @@ class _CompileEnv:
         predicates: list[exp.Expression] = []
 
         if cube.tenancy == "discriminator":
-            if "tenant" not in self.ctx:
-                raise CompileError(
-                    f"Cube {cube.name!r} declares tenancy='discriminator' but "
-                    "no 'tenant' value was provided in compile context. "
-                    "Pass context={'tenant': <tenant_id>, ...}."
+            # One bound predicate per tenancy column, AND-composed. Each
+            # column's value is resolved by column name; a missing value
+            # is a hard refusal — emitting the source without the tenant
+            # predicate would expose every tenant's rows.
+            for col in cube.tenancy_columns:
+                predicates.append(
+                    exp.EQ(
+                        this=exp.column(col, table=cube.alias),
+                        expression=self.bind(self._resolve_tenant_value(cube, col), "string"),
+                    )
                 )
-            assert cube.tenancy_column is not None
-            predicates.append(
-                exp.EQ(
-                    this=exp.column(cube.tenancy_column, table=cube.alias),
-                    expression=self.bind(self.ctx["tenant"], "string"),
-                )
-            )
 
         if cube.security_sql:
             resolved_sql = self._resolve_security_sql(cube, cube.security_sql)

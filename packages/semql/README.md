@@ -82,9 +82,13 @@ resolves it (along with `{schema}`-style context placeholders and
 - **Explicit raw SQL** — every hand-written fragment (`Measure.sql`,
   `Join.on`, `Cube.base_predicate`, …) is wrapped in a `RawSQL` marker
   at validation: when raw SQL is used, the model says so.
-- **Tenancy** — per-cube `SCHEMA` (default; `{tenant_schema}`
-  substitution) or `DISCRIMINATOR` (compiler wraps the source in a
-  subquery with `WHERE tenancy_column = $tenant`).
+- **Tenancy** — per-cube `NONE` (default; honestly unscoped),
+  `SCHEMA` (`{tenant_schema}` substituted from the identity's `tenant`,
+  required when declared) or `DISCRIMINATOR` (compiler wraps the source
+  in a subquery with one bound `WHERE` predicate per `tenancy_columns`
+  entry, so composite tenant keys need no workaround). `tenant` is
+  first-class on `AuthContext`; `Catalog(strict_tenancy=True)` rejects
+  any cube left with no isolation, scope, or `required_roles`.
 - **Row-level security** — `Cube.security_sql` AND-composes with
   tenancy inside the isolation subquery; `{ctx.X}` placeholders bind
   as parameters, never inline as literals.

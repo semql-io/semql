@@ -82,6 +82,24 @@ class BaseCompileHook:
         pass
 
 
+def _audit_tenant(
+    viewer: AuthContext | None,
+    context: dict[str, str] | None,
+) -> str | None:
+    """Tenant identifier recorded on an audit event.
+
+    Prefers the identity's canonical ``viewer.tenant`` — that covers
+    both schema and discriminator tenancy, so "who from tenant X queried
+    what" is answerable regardless of mode. Falls back to the legacy
+    ``context['tenant_schema']`` / ``context['tenant']`` for callers that
+    still thread tenancy through the context dict."""
+    if viewer is not None and viewer.tenant is not None:
+        return viewer.tenant
+    if context:
+        return context.get("tenant_schema") or context.get("tenant")
+    return None
+
+
 @dataclass(frozen=True)
 class AuditEvent:
     timestamp: datetime
@@ -156,7 +174,7 @@ class AuditHook(BaseCompileHook):
         context: dict[str, str] | None = None,
     ) -> None:
         viewer_id = viewer.viewer_id if viewer else None
-        tenant = context.get("tenant_schema") if context else None
+        tenant = _audit_tenant(viewer, context)
 
         event = AuditEvent(
             timestamp=datetime.now(UTC),
@@ -183,7 +201,7 @@ class AuditHook(BaseCompileHook):
         context: dict[str, str] | None = None,
     ) -> None:
         viewer_id = viewer.viewer_id if viewer else None
-        tenant = context.get("tenant_schema") if context else None
+        tenant = _audit_tenant(viewer, context)
 
         event = AuditEvent(
             timestamp=datetime.now(UTC),

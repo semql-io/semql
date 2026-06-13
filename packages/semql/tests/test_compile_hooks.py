@@ -259,6 +259,22 @@ def test_audit_hook_ok_event() -> None:
     assert ev.error_code is None
 
 
+def test_audit_hook_sources_tenant_from_viewer() -> None:
+    """The identity's ``viewer.tenant`` is recorded even with no
+    ``context['tenant_schema']`` — so discriminator-mode queries (whose
+    tenant never lived in context) are no longer audited as tenant=None."""
+    from semql.hooks import AuditEvent, AuditHook
+    from semql.model import AuthContext
+
+    events: list[AuditEvent] = []
+    cat = _catalog(compile_hooks=[AuditHook(events.append)])
+    cat.compile(
+        SemanticQuery(measures=["orders.revenue"]),
+        viewer=AuthContext(viewer_id="u1", tenant="acme"),
+    )
+    assert events[0].tenant == "acme"
+
+
 def test_audit_hook_error_event() -> None:
     from semql.hooks import AuditEvent, AuditHook
 

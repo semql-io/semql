@@ -91,7 +91,7 @@ def test_cube_discriminator_rejects_tenant_schema_in_derived_sql() -> None:
             source=DerivedTable(sql="SELECT * FROM {tenant_schema}.raw"),
             alias="c",
             tenancy="discriminator",
-            tenancy_column="tenant_id",
+            tenancy_columns=["tenant_id"],
         )
 
 
@@ -189,7 +189,7 @@ def test_discriminator_wraps_derived_source() -> None:
         source=DerivedTable(sql="SELECT id, tenant_id, kind FROM events_raw"),
         alias="e",
         tenancy="discriminator",
-        tenancy_column="tenant_id",
+        tenancy_columns=["tenant_id"],
         measures=[Measure(name="n", sql="*", agg="count")],
         dimensions=[Dimension(name="kind", sql="{e}.kind", type="string")],
     )
@@ -395,7 +395,7 @@ def test_with_ctes_rejected_with_tenant_schema_under_discriminator() -> None:
             ),
             alias="b",
             tenancy="discriminator",
-            tenancy_column="tenant_id",
+            tenancy_columns=["tenant_id"],
         )
 
 

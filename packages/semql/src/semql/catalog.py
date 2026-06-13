@@ -49,6 +49,7 @@ from semql.model import (
     BaseField,
     Cube,
     DerivedTable,
+    Dialect,
     Dimension,
     GlossaryEntry,
     Join,
@@ -574,6 +575,7 @@ class Catalog:
         error_transform: object | None = None,
         compile_hooks: list[CompileHook] | None = None,
         sql_rewrite_hooks: list[SqlRewriteHook] | None = None,
+        strict_tenancy: bool = False,
     ) -> None:
         self.compile_hooks = compile_hooks or []
         self.sql_rewrite_hooks = sql_rewrite_hooks or []
@@ -681,6 +683,31 @@ class Catalog:
 
         self._cubes: list[Cube] = merged
         self._by_name: dict[str, Cube] = {c.name: c for c in merged}
+
+        # Default-deny lint (opt-in). A cube with tenancy='none', no
+        # ``scope`` and no ``required_roles`` has *no* access control of
+        # any kind — every viewer sees every row. That's legitimate for
+        # public lookups, but for a catalog of sensitive data it's almost
+        # always an oversight (and the 'none' default makes it easy to
+        # reach by simply not thinking about tenancy). ``strict_tenancy``
+        # turns that oversight into a construction error. META reflection
+        # cubes are exempt — they describe the catalog, not tenant data.
+        if strict_tenancy:
+            unguarded = [
+                c.name
+                for c in merged
+                if c.dialect != Dialect.META
+                and c.tenancy == "none"
+                and c.scope is None
+                and not c.required_roles
+            ]
+            if unguarded:
+                raise ValueError(
+                    "Catalog(strict_tenancy=True): these cubes have no access "
+                    f"control — tenancy='none', no scope, no required_roles: "
+                    f"{unguarded}. Give each a tenancy mode, a scope, or "
+                    "required_roles (or drop strict_tenancy to allow open cubes)."
+                )
 
         # Validate views: every field target must resolve to a real
         # cube.field, and view names can't collide with cube names.

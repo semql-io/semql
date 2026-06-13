@@ -820,13 +820,23 @@ class Cube(BaseModel):
     default_chart_type: ChartTypeLiteral | None = None
     metadata: Metadata = Field(default_factory=dict)
     # Tenant isolation strategy — see the ``TenancyMode`` docstring.
-    # Defaults to ``"schema"`` so existing catalogs that rely on
-    # ``{tenant_schema}`` substitution keep working.
-    tenancy: TenancyMode = "schema"
-    # The column that carries the tenant identifier in DISCRIMINATOR
-    # mode. Required when ``tenancy == "discriminator"``; ignored
-    # otherwise.
-    tenancy_column: str | None = None
+    # Defaults to ``"none"``: a cube that says nothing about tenancy gets
+    # *no* isolation, and says so honestly (the old ``"schema"`` default
+    # silently emitted nothing unless the table happened to contain
+    # ``{tenant_schema}``). Opt in explicitly to ``"schema"`` /
+    # ``"discriminator"``; ``Catalog(strict_tenancy=True)`` flags cubes
+    # left at ``"none"`` with no other access control.
+    tenancy: TenancyMode = "none"
+    # Columns that carry the tenant identifier in DISCRIMINATOR mode. Each
+    # is AND-composed into one bound predicate inside the isolation
+    # subquery, so composite tenant keys (e.g. ``["org_id", "region"]``)
+    # need no ``security_sql`` workaround. Required (non-empty) when
+    # ``tenancy == "discriminator"``; ignored otherwise. At compile time
+    # each column ``C`` binds to the value found under key ``C`` in the
+    # resolution context / ``viewer.attrs`` (a single-column cube also
+    # accepts the canonical ``tenant`` key, which ``viewer.tenant``
+    # populates).
+    tenancy_columns: list[str] = []
     # Caller-attached row-level security predicate. AND-composes with
     # the tenancy filter inside the isolation subquery, so an outer
     # predicate the planner emits cannot bypass it. May contain
@@ -1174,36 +1184,51 @@ class Cube(BaseModel):
 
     @model_validator(mode="after")
     def _check_tenancy_consistency(self) -> Cube:
+        # Schema-tenancy isolates by substituting ``{tenant_schema}`` into
+        # the source. A schema-mode cube whose source never mentions the
+        # placeholder would emit no isolation at all — the old silent-inert
+        # default. Require it explicitly (the mirror of the discriminator
+        # check below).
+        if self.tenancy == "schema" and "{tenant_schema}" not in self._all_source_sql():
+            raise ValueError(
+                f"Cube {self.name!r} declares tenancy='schema' but no "
+                "source SQL contains '{tenant_schema}' — it would emit "
+                "zero tenant isolation. Add the placeholder, or set "
+                "tenancy='none' if the cube is genuinely unscoped."
+            )
         if self.tenancy == "discriminator":
-            if not self.tenancy_column:
+            if not self.tenancy_columns:
                 raise ValueError(
                     f"Cube {self.name!r} declares tenancy='discriminator' but "
-                    "has no tenancy_column — the compiler can't emit a "
+                    "has no tenancy_columns — the compiler can't emit a "
                     "WHERE predicate without a column to filter on."
                 )
             # ``{tenant_schema}`` is the schema-tenancy substitution marker —
-            # it has no meaning under discriminator tenancy. Check every
-            # place a source SQL can live.
-            offenders: list[str] = []
-            if "{tenant_schema}" in self.table:
-                offenders.append("table")
-            if isinstance(self.source, PhysicalTable) and "{tenant_schema}" in self.source.table:
-                offenders.append("source.table")
-            if isinstance(self.source, DerivedTable) and "{tenant_schema}" in self.source.sql:
-                offenders.append("source.sql")
-            if isinstance(self.source, DerivedTable):
-                for cte in self.source.with_ctes:
-                    if "{tenant_schema}" in cte.sql:
-                        offenders.append(f"source.with_ctes[{cte.name!r}]")
-                        break
-            if offenders:
+            # it has no meaning under discriminator tenancy. The two
+            # isolation strategies are mutually exclusive.
+            if "{tenant_schema}" in self._all_source_sql():
                 raise ValueError(
                     f"Cube {self.name!r} declares tenancy='discriminator' "
-                    f"but ``{offenders[0]}`` contains '{{tenant_schema}}'. "
-                    "The two isolation strategies are mutually exclusive "
-                    "— pick one."
+                    "but its source SQL contains '{tenant_schema}'. The two "
+                    "isolation strategies are mutually exclusive — pick one."
                 )
         return self
+
+    def _all_source_sql(self) -> str:
+        """Every place a source SQL string can live, concatenated.
+
+        Used by tenancy validation to test for the ``{tenant_schema}``
+        marker across the table shorthand, an explicit ``PhysicalTable``
+        / ``DerivedTable`` source (plus its hoisted CTEs), and every
+        time-partitioned physical source."""
+        parts: list[str] = [self.table]
+        if isinstance(self.source, PhysicalTable):
+            parts.append(self.source.table)
+        elif isinstance(self.source, DerivedTable):
+            parts.append(self.source.sql)
+            parts.extend(cte.sql for cte in self.source.with_ctes)
+        parts.extend(src.table for src in self.physical_sources)
+        return "\n".join(parts)
 
     @property
     def resolved_source(self) -> CubeSource:
@@ -1272,6 +1297,15 @@ class AuthContext(_HashableModel):
       cubes that scope to "rows owned by the viewer" can declare
       ``security_sql="{t}.assignee_id = {ctx.viewer_id}"`` once and
       have it bound as a parameter (never as a SQL literal).
+    - **Tenancy**: ``tenant`` is the canonical tenant identifier
+      carried *by the identity* rather than threaded through the loose
+      ``context`` dict. When set, ``compile`` uses it as the default
+      ``{tenant_schema}`` substitution (schema mode) and the default
+      single-column discriminator value, and the audit hook records it.
+      Making tenancy a property of *who is asking* — not of a context
+      argument the application has to remember to pass — removes the
+      class of bug where a plumbing slip silently crosses tenants. An
+      explicit ``context`` value still overrides it.
 
     ``metadata`` is the same caller-owned escape hatch the catalog
     types carry: opaque string→string the platform never reads.
@@ -1279,6 +1313,10 @@ class AuthContext(_HashableModel):
 
     model_config = ConfigDict(frozen=True)
     viewer_id: str
+    # Canonical tenant identifier for this identity (see class docstring).
+    # ``None`` means the identity carries no tenant — a cube that requires
+    # tenancy then refuses unless the value is supplied via ``context``.
+    tenant: str | None = None
     roles: list[str] = Field(default_factory=list)
     metadata: Metadata = Field(default_factory=dict)
     # Typed bag for arbitrary JWT claims / auth attributes. Unlike

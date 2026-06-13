@@ -83,10 +83,11 @@ def _render_cube(cube: object) -> list[str]:  # cube: Cube
     if cube.required_filters:
         reqs = ", ".join(f"`{r}`" for r in cube.required_filters)
         facts.append(f"- **Required filters:** {reqs}")
-    if cube.tenancy != "schema":
+    if cube.tenancy != "none":
         facts.append(f"- **Tenancy:** `{cube.tenancy}`")
-    if cube.tenancy_column:
-        facts.append(f"- **Tenancy column:** `{cube.tenancy_column}`")
+    if cube.tenancy_columns:
+        cols = ", ".join(f"`{c}`" for c in cube.tenancy_columns)
+        facts.append(f"- **Tenancy columns:** {cols}")
     if cube.security_sql:
         facts.append(f"- **Security SQL:** `{cube.security_sql}`")
     if cube.default_chart_type:
