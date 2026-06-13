@@ -494,17 +494,42 @@ def build_join_graph(
     # touched cube when none qualifies — unchanged for the no-left-join
     # default, where every edge is an inner join.
     root = next((c for c in touched if c.name not in left_set), touched[0])
+    rerooted = bool(left_set) and root.name != touched[0].name
     join_edges: list[tuple[Cube, Cube, ModelJoin]] = []
     cubes_in_from: list[Cube] = [root]
     for c in touched:
         if c is root:
             continue
-        path = find_join_path(
-            root.name,
-            c.name,
-            catalog,
-            bidirectional=c.name in left_set,
-        )
+        try:
+            path = find_join_path(
+                root.name,
+                c.name,
+                catalog,
+                bidirectional=c.name in left_set,
+            )
+        except JoinPathError:
+            # When ``left_joins`` re-rooted the FROM clause off ``touched[0]``,
+            # a non-left target that the *un*-re-rooted root could have reached
+            # is now stranded because it sits only behind a left-joined cube
+            # (e.g. spine → left-fact → target). Such a target would emit NULL
+            # dimensions for unmatched spine rows, so refuse with the real
+            # cause rather than a bare "no join path". A target that the old
+            # root also could not reach is a genuine no-path — let it stand.
+            if (
+                rerooted
+                and c.name not in left_set
+                and _old_root_reached(touched[0].name, c.name, catalog, c.name in left_set)
+            ):
+                raise CompileError(
+                    f"Cannot place cube {c.name!r} in this query: ``left_joins`` "
+                    f"({', '.join(sorted(left_set))}) forces the FROM root to "
+                    f"{root.name!r}, but {c.name!r} is only reachable through a "
+                    "left-joined cube. A cube reached only via a LEFT-joined cube "
+                    "produces NULL dimensions for unmatched spine rows. Drop the "
+                    f"intermediate cube from left_joins, or declare a direct join "
+                    f"to {c.name!r}."
+                ) from None
+            raise
         cursor = root
         for next_name, j in path:
             tgt = catalog[next_name]
@@ -513,6 +538,19 @@ def build_join_graph(
                 cubes_in_from.append(tgt)
             cursor = tgt
     return cubes_in_from, join_edges
+
+
+def _old_root_reached(
+    old_root: str, target: str, catalog: dict[str, Cube], bidirectional: bool
+) -> bool:
+    """Whether the un-re-rooted root (``touched[0]``) could reach ``target``
+    under the same bidirectionality the live walk used. Distinguishes a
+    target stranded by the ``left_joins`` re-root from a genuine no-path."""
+    try:
+        find_join_path(old_root, target, catalog, bidirectional=bidirectional)
+    except JoinPathError:
+        return False
+    return True
 
 
 def find_join_path(

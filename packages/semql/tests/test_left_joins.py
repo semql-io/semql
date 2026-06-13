@@ -171,3 +171,55 @@ def test_left_joins_idempotent_with_existing_forward_edge() -> None:
     out = catalog.compile(q)
     assert "INNER JOIN" in out.sql.upper()
     assert "LEFT JOIN" not in out.sql.upper()
+
+
+# ---------------------------------------------------------------------------
+# D9 re-root edge: a cube reachable only *through* a left-joined cube
+# ---------------------------------------------------------------------------
+
+
+def test_left_join_strands_cube_behind_the_fact_refuses_clearly() -> None:
+    """D9 re-roots the FROM clause off the left-joined cube so the fact
+    lands on the right (``kind="left"``). In a chain ``orders → customers``
+    and ``orders → products``, left-joining ``orders`` roots at a spoke
+    (``customers``); ``products`` is then reachable only *through* the
+    left-joined ``orders`` and would emit NULL dimensions for unmatched
+    spine rows. The compiler refuses with a message that names the real
+    cause (the left_joins root), not a bare ``no join path``."""
+    from semql import Join
+
+    orders = Cube(
+        name="orders",
+        alias="o",
+        table="orders",
+        backend=Backend.POSTGRES,
+        measures=[Measure(name="revenue", sql="{o}.amt", agg="sum")],
+        dimensions=[Dimension(name="id", sql="{o}.id", type="string")],
+        joins=[
+            Join(to="customers", relationship="many_to_one", on="{o}.cid = {c}.id"),
+            Join(to="products", relationship="many_to_one", on="{o}.pid = {p}.id"),
+        ],
+    )
+    customers = Cube(
+        name="customers",
+        alias="c",
+        table="customers",
+        backend=Backend.POSTGRES,
+        dimensions=[Dimension(name="name", sql="{c}.name", type="string")],
+    )
+    products = Cube(
+        name="products",
+        alias="p",
+        table="products",
+        backend=Backend.POSTGRES,
+        dimensions=[Dimension(name="pname", sql="{p}.name", type="string")],
+    )
+    catalog = Catalog([orders, customers, products])
+
+    q = SemanticQuery(
+        measures=["orders.revenue"],
+        dimensions=["customers.name", "products.pname"],
+        left_joins=["orders"],
+    )
+    with pytest.raises(CompileError, match=r"(?i)left_joins.*reachable through a left-joined"):
+        catalog.compile(q)
