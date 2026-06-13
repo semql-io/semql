@@ -697,14 +697,17 @@ def test_decide_rejects_measure_in_dimensions_list(catalog: dict[str, Cube]) -> 
         compile_query(q, catalog, context=CONTEXT)
 
 
-def test_decide_multi_measure_y_axes(catalog: dict[str, Cube]) -> None:
+def test_decide_two_measures_one_dim_is_scatter(catalog: dict[str, Cube]) -> None:
+    # Two measures + one dimension → scatter: the measures are the X/Y
+    # axes and the dimension labels the points.
     q = SemanticQuery(
         measures=["orders.revenue", "orders.count"],
         dimensions=["orders.region"],
     )
     _, viz = _compile_and_decide(q, catalog, n_rows=5)
-    assert viz.chart_type == "bar_chart"
-    assert len(viz.y_axes) == 2
+    assert viz.chart_type == "scatter_chart"
+    assert viz.x_axis is not None
+    assert len(viz.y_axes) == 1
 
 
 def test_decide_unknown_column_gets_humanised_label(catalog: dict[str, Cube]) -> None:

@@ -21,11 +21,18 @@ from dataclasses import dataclass
 from typing import Literal
 
 from semql.compile import ColumnMeta, CompiledQuery
-from semql.model import ChartTypeLiteral, Cube, FormatLiteral
+from semql.model import ChartTypeLiteral, Cube, FormatLiteral, StorageType
 from semql.spec import SemanticQuery
 
 PIE_MAX_SLICES = 10
 BAR_MAX_BARS = 30
+
+# Chart types the picker can emit, plus the ``text_only`` viz-only fallback.
+VizChartType = ChartTypeLiteral | Literal["text_only"]
+
+# Numeric storage types — a single one of these on a dimension axis marks a
+# distribution (histogram) rather than a categorical breakdown (bar).
+_NUMERIC_STORAGE: frozenset[StorageType] = frozenset({"integer", "float", "number"})
 
 
 @dataclass
@@ -46,16 +53,21 @@ class VizColumn:
     is_time: bool
     unit: str | None = None
     display_unit: str | None = None
+    storage_type: StorageType | None = None
 
 
 @dataclass
 class VizDecision:
-    chart_type: ChartTypeLiteral | Literal["text_only"]
+    chart_type: VizChartType
     title: str
     x_axis: str | None
     y_axes: list[str]
     columns: list[VizColumn]
     reason: str = ""
+    # The breakdown/series dimension for a ``stacked_bar_chart`` (the second
+    # dimension whose values become the stacks). ``None`` for every other
+    # chart type.
+    series: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -119,7 +131,8 @@ def _pick_chart_type(
     query: SemanticQuery,
     touched_cubes: list[Cube],
     n_rows: int,
-) -> tuple[ChartTypeLiteral | Literal["text_only"], str]:
+    columns: list[VizColumn],
+) -> tuple[VizChartType, str]:
     overrides: set[ChartTypeLiteral] = {
         c.default_chart_type for c in touched_cubes if c.default_chart_type is not None
     }
@@ -135,12 +148,34 @@ def _pick_chart_type(
         query.time_dimension is not None and query.time_dimension.granularity is not None
     )
     n_dims = len(query.dimensions) + (1 if has_time_breakdown else 0)
+    # Categorical (non-measure, non-time) axis columns — the dimensions a
+    # chart breaks down by. Used to tell a numeric distribution (histogram)
+    # from a categorical breakdown (bar / stacked bar).
+    cat_dims = [c for c in columns if not c.is_measure and not c.is_time]
 
     if n_measures >= 1 and n_dims == 0:
         return "text_only", "single-value answer"
 
+    # Time series. Several measures composing over time → stacked area; a
+    # single series → line.
     if has_time_breakdown:
+        if n_measures >= 2:
+            return "area_chart", f"time series, {n_measures} measures (stacked composition)"
         return "line_chart", "time series with granularity"
+
+    # Two measures with one labelling dimension → XY scatter.
+    if n_measures == 2 and n_dims == 1:
+        return "scatter_chart", "2 measures plotted against each other"
+
+    # One measure over a single *numeric* dimension → frequency distribution.
+    if (
+        n_dims == 1
+        and n_measures == 1
+        and len(cat_dims) == 1
+        and cat_dims[0].storage_type in _NUMERIC_STORAGE
+        and n_rows <= BAR_MAX_BARS
+    ):
+        return "histogram", "1 measure over a numeric dimension (distribution)"
 
     if n_dims == 1 and n_measures == 1 and n_rows <= PIE_MAX_SLICES:
         return "pie_chart", f"1 dim, 1 measure, n_rows={n_rows} <= {PIE_MAX_SLICES}"
@@ -148,7 +183,32 @@ def _pick_chart_type(
     if n_dims == 1 and n_rows <= BAR_MAX_BARS:
         return "bar_chart", f"1 dim, n_rows={n_rows} <= {BAR_MAX_BARS}"
 
+    # Two categorical dimensions + one measure → a primary axis broken down
+    # by the second dimension (stacked bars).
+    if n_dims == 2 and n_measures == 1 and len(cat_dims) == 2 and n_rows <= BAR_MAX_BARS:
+        return "stacked_bar_chart", f"2 dims, 1 measure, n_rows={n_rows} (primary axis + breakdown)"
+
     return "data_table", f"multi-dim or n_rows={n_rows} too large for a chart"
+
+
+def _apply_supported(
+    chart_type: VizChartType,
+    reason: str,
+    supported: frozenset[VizChartType] | None,
+) -> tuple[VizChartType, str]:
+    """Constrain the natural choice to the client's declared capabilities.
+
+    ``supported`` is the set of chart types the caller's renderer can draw.
+    ``None`` (or empty) means no constraint. When the picked chart isn't
+    supported, fall back to the most universal supported option
+    (``data_table`` then ``text_only``), else the first supported type."""
+    if not supported or chart_type in supported:
+        return chart_type, reason
+    for fallback in ("data_table", "text_only"):
+        if fallback in supported:
+            return fallback, f"{reason}; {chart_type} unsupported by client → {fallback}"
+    chosen = sorted(supported)[0]
+    return chosen, f"{reason}; {chart_type} unsupported by client → {chosen}"
 
 
 def _viz_column(meta: ColumnMeta) -> VizColumn:
@@ -160,6 +220,7 @@ def _viz_column(meta: ColumnMeta) -> VizColumn:
         is_time=meta.kind == "time",
         unit=meta.unit,
         display_unit=meta.display_unit,
+        storage_type=meta.storage_type,
     )
 
 
@@ -174,6 +235,7 @@ def decide_visualization(
     n_rows: int,
     *,
     catalog: dict[str, Cube],
+    supported_charts: frozenset[VizChartType] | None = None,
 ) -> VizDecision:
     """Return chart_type + axis labels + per-column formats for a query.
 
@@ -185,23 +247,41 @@ def decide_visualization(
     ``CompiledQuery`` (``ungrouped`` flag, time-dimension granularity).
     ``n_rows`` is the actual row count; pass ``0`` for dry-run / explain
     paths.
+
+    ``supported_charts`` lets the *calling renderer* declare which chart
+    types it can draw. Chart support is a property of the rendering client,
+    not the data model, so it's a call-time argument rather than a catalog
+    field. When the naturally-best chart isn't in the set, the decision
+    falls back to a supported type (``data_table`` / ``text_only`` first).
+    ``None`` imposes no constraint.
     """
     touched_cubes = [catalog[name] for name in compiled.touched_cube_names if name in catalog]
-    chart_type, reason = _pick_chart_type(query, touched_cubes, n_rows)
-
     ordered: list[VizColumn] = [_viz_column(m) for m in compiled.column_meta]
+    chart_type, reason = _pick_chart_type(query, touched_cubes, n_rows, ordered)
+    chart_type, reason = _apply_supported(chart_type, reason, supported_charts)
 
     x_axis: str | None = None
     y_axes: list[str] = []
-    if chart_type in ("bar_chart", "line_chart"):
-        non_measures = [c for c in ordered if not c.is_measure]
-        measures_out = [c for c in ordered if c.is_measure]
+    series: str | None = None
+    non_measures = [c for c in ordered if not c.is_measure]
+    measures_out = [c for c in ordered if c.is_measure]
+    if chart_type in ("bar_chart", "line_chart", "area_chart", "histogram"):
         if non_measures:
             x_axis = non_measures[0].display_name
         y_axes = [c.display_name for c in measures_out]
+    elif chart_type == "stacked_bar_chart":
+        # First dimension is the primary axis; the second becomes the stack.
+        if non_measures:
+            x_axis = non_measures[0].display_name
+        if len(non_measures) >= 2:
+            series = non_measures[1].display_name
+        y_axes = [c.display_name for c in measures_out]
+    elif chart_type == "scatter_chart":
+        # Both axes are measures; the dimension labels the points.
+        if len(measures_out) >= 2:
+            x_axis = measures_out[0].display_name
+            y_axes = [measures_out[1].display_name]
     elif chart_type == "pie_chart":
-        non_measures = [c for c in ordered if not c.is_measure]
-        measures_out = [c for c in ordered if c.is_measure]
         x_axis = non_measures[0].display_name if non_measures else None
         y_axes = [measures_out[0].display_name] if measures_out else []
 
@@ -224,6 +304,7 @@ def decide_visualization(
         y_axes=y_axes,
         columns=ordered,
         reason=reason,
+        series=series,
     )
 
 

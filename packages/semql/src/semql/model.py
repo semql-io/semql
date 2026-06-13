@@ -151,7 +151,21 @@ WeekStartLiteral = Literal["monday", "sunday"]
 # mutable field's declared type is the same notion as a dimension's.
 FieldType = DimTypeLiteral
 FormatLiteral = Literal["raw", "integer", "percent", "currency", "duration"]
-ChartTypeLiteral = Literal["pie_chart", "bar_chart", "line_chart", "data_table"]
+ChartTypeLiteral = Literal[
+    "pie_chart",
+    "bar_chart",
+    "line_chart",
+    "data_table",
+    # Added in the chart-vocabulary expansion. ``scatter_chart`` plots two
+    # measures against each other; ``area_chart`` is a stacked time series
+    # (multi-measure composition over time); ``stacked_bar_chart`` breaks a
+    # primary dimension down by a second; ``histogram`` is a frequency
+    # distribution over a numeric dimension.
+    "scatter_chart",
+    "area_chart",
+    "stacked_bar_chart",
+    "histogram",
+]
 
 # Per-cube tenant isolation strategy:
 # - schema       : tenant lives in its own DB schema; the cube's ``table``

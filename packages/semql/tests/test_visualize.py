@@ -1,3 +1,7 @@
+# mypy: disable-error-code=type-arg
+# (Test helpers pass bare ``frozenset`` literals of chart-type strings to
+# ``supported_charts``; annotating each as ``frozenset[VizChartType]`` adds
+# no test value and the literal-narrowing gymnastics aren't worth it here.)
 """Unit tests for ``semql.visualize``.
 
 The decision table inside ``_pick_chart_type`` is the only place
@@ -78,7 +82,13 @@ def _catalog(*cubes: Cube) -> dict[str, Cube]:
     return {c.name: c for c in cubes}
 
 
-def _decide(query: SemanticQuery, n_rows: int, *, catalog: dict[str, Cube]) -> VizDecision:
+def _decide(
+    query: SemanticQuery,
+    n_rows: int,
+    *,
+    catalog: dict[str, Cube],
+    supported_charts: frozenset | None = None,
+) -> VizDecision:
     """Compile the query against the catalog and feed the resulting
     ``CompiledQuery`` bundle to ``decide_visualization``. Tests pass through
     this wrapper so they don't have to construct a ``CompiledQuery`` by hand
@@ -88,7 +98,13 @@ def _decide(query: SemanticQuery, n_rows: int, *, catalog: dict[str, Cube]) -> V
     from semql.compile import compile_query
 
     out = compile_query(query, catalog)
-    return decide_visualization(query=query, compiled=out, n_rows=n_rows, catalog=catalog)
+    return decide_visualization(
+        query=query,
+        compiled=out,
+        n_rows=n_rows,
+        catalog=catalog,
+        supported_charts=supported_charts,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -251,8 +267,9 @@ def test_pie_chart_off_by_one_falls_to_bar() -> None:
     assert decision.chart_type == "bar_chart"
 
 
-def test_pie_chart_requires_exactly_one_measure() -> None:
-    """2 measures + 1 dim → bar chart (or data_table at large n)."""
+def test_two_measures_one_dim_is_scatter() -> None:
+    """2 measures + 1 dim → scatter: the two measures are the X/Y axes and
+    the dimension labels the points — never pie, never bar."""
     decision = _decide(
         SemanticQuery(
             measures=["orders.revenue", "orders.orders"],
@@ -261,7 +278,9 @@ def test_pie_chart_requires_exactly_one_measure() -> None:
         n_rows=3,
         catalog=_catalog(_orders()),
     )
-    assert decision.chart_type == "bar_chart"
+    assert decision.chart_type == "scatter_chart"
+    assert decision.x_axis == "Revenue"
+    assert decision.y_axes == ["Orders"]
 
 
 # ---------------------------------------------------------------------------
@@ -289,17 +308,40 @@ def test_bar_chart_off_by_one_falls_to_data_table() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Branch: data_table — multi-dim
+# Branch: stacked_bar_chart — 2 categorical dims + 1 measure, manageable n
 # ---------------------------------------------------------------------------
 
 
-def test_multi_dim_returns_data_table() -> None:
+def test_two_dims_one_measure_is_stacked_bar() -> None:
+    """2 categorical dims + 1 measure (manageable n) → stacked bar: the
+    first dim is the primary axis, the second becomes the stack series."""
     decision = _decide(
         SemanticQuery(
             measures=["orders.revenue"],
             dimensions=["orders.region", "orders.status"],
         ),
         n_rows=4,
+        catalog=_catalog(_orders()),
+    )
+    assert decision.chart_type == "stacked_bar_chart"
+    assert decision.x_axis == "Region"
+    assert decision.series == "Status"
+    assert decision.y_axes == ["Revenue"]
+
+
+# ---------------------------------------------------------------------------
+# Branch: data_table — multi-dim too large for a chart
+# ---------------------------------------------------------------------------
+
+
+def test_large_multi_dim_returns_data_table() -> None:
+    """Two dims past BAR_MAX_BARS rows is too dense to stack → data_table."""
+    decision = _decide(
+        SemanticQuery(
+            measures=["orders.revenue"],
+            dimensions=["orders.region", "orders.status"],
+        ),
+        n_rows=BAR_MAX_BARS + 1,
         catalog=_catalog(_orders()),
     )
     assert decision.chart_type == "data_table"
@@ -437,7 +479,7 @@ def test_data_table_has_no_axes() -> None:
             measures=["orders.revenue"],
             dimensions=["orders.region", "orders.status"],
         ),
-        n_rows=4,
+        n_rows=BAR_MAX_BARS + 1,
         catalog=_catalog(_orders()),
     )
     assert decision.chart_type == "data_table"
@@ -581,3 +623,83 @@ def test_dimension_unit_fields_surface_on_viz_column() -> None:
     assert dur.unit == "seconds"
     assert dur.display_unit == "minutes"
     assert dur.format == "duration"
+
+
+# ---------------------------------------------------------------------------
+# Expanded chart vocabulary: area, histogram
+# ---------------------------------------------------------------------------
+
+
+def test_area_chart_for_multi_measure_time_series() -> None:
+    """A time series with several measures composes over time → stacked
+    area (a single-measure time series stays a line)."""
+    decision = _decide(
+        SemanticQuery(
+            measures=["orders.revenue", "orders.orders"],
+            time_dimension=TimeWindow(
+                dimension="orders.created_at",
+                granularity="day",
+                range=("2026-01-01", "2026-02-01"),
+            ),
+        ),
+        n_rows=31,
+        catalog=_catalog(_orders()),
+    )
+    assert decision.chart_type == "area_chart"
+    assert decision.y_axes == ["Revenue", "Orders"]
+
+
+def test_histogram_for_numeric_dimension() -> None:
+    """One measure over a single *numeric* dimension is a distribution →
+    histogram (a categorical dimension would be a bar/pie)."""
+    cube = _orders().model_copy(
+        update={"dimensions": [Dimension(name="bucket", sql="{o}.bucket", type="number")]}
+    )
+    decision = _decide(
+        SemanticQuery(measures=["orders.revenue"], dimensions=["orders.bucket"]),
+        n_rows=12,
+        catalog={"orders": cube},
+    )
+    assert decision.chart_type == "histogram"
+    assert decision.x_axis == "Bucket"
+    assert decision.y_axes == ["Revenue"]
+
+
+# ---------------------------------------------------------------------------
+# Client-declared chart capabilities (supported_charts)
+# ---------------------------------------------------------------------------
+
+
+def test_supported_charts_falls_back_when_pick_unsupported() -> None:
+    """1 dim + 1 measure (small n) naturally picks a pie; a client that
+    only draws bar/table falls back to data_table and says so."""
+    decision = _decide(
+        SemanticQuery(measures=["orders.revenue"], dimensions=["orders.region"]),
+        n_rows=3,
+        catalog=_catalog(_orders()),
+        supported_charts=frozenset({"bar_chart", "data_table"}),
+    )
+    assert decision.chart_type == "data_table"
+    assert "unsupported" in decision.reason
+
+
+def test_supported_charts_respected_when_available() -> None:
+    """When the natural pick is in the supported set, it is used unchanged."""
+    decision = _decide(
+        SemanticQuery(measures=["orders.revenue"], dimensions=["orders.region"]),
+        n_rows=3,
+        catalog=_catalog(_orders()),
+        supported_charts=frozenset({"pie_chart", "data_table"}),
+    )
+    assert decision.chart_type == "pie_chart"
+
+
+def test_supported_charts_none_imposes_no_constraint() -> None:
+    """The default (no declaration) leaves the natural pick untouched."""
+    decision = _decide(
+        SemanticQuery(measures=["orders.revenue"], dimensions=["orders.region"]),
+        n_rows=3,
+        catalog=_catalog(_orders()),
+        supported_charts=None,
+    )
+    assert decision.chart_type == "pie_chart"
