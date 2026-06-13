@@ -170,7 +170,8 @@ def test_static_lookup_inlines_values_in_prompt() -> None:
     out = planner_prompt(
         cat,
     )
-    assert "Lookup (3 values): `EMEA`, `APAC`, `NA`" in out
+    # DB-sourced lookup values are fenced as untrusted data (S9).
+    assert "Lookup (3 values): <untrusted-data>`EMEA`, `APAC`, `NA`</untrusted-data>" in out
 
 
 def test_static_lookup_with_labels_renders_pairs() -> None:
@@ -221,7 +222,7 @@ def test_dynamic_lookup_fires_loader_with_ctx() -> None:
     )
     rc = ResolutionContext(context={"tenant_schema": "tenant42"})
     out = planner_prompt(cat, ctx=rc)
-    assert "Lookup (2 values): `dyn_a`, `dyn_b`" in out
+    assert "Lookup (2 values): <untrusted-data>`dyn_a`, `dyn_b`</untrusted-data>" in out
     assert len(seen_ctxs) == 1
     assert seen_ctxs[0].context["tenant_schema"] == "tenant42"
 
