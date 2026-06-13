@@ -121,7 +121,10 @@ catalog. Run with `uv run demos/pipeline_demo.py`.
 ## Surface to LLMs
 
 ```python
-print(catalog.prompt(viewer=viewer))   # planner-facing fragment, viewer-filtered
+from semql_prompt import build_planner_prompt_fragment
+
+# planner-facing fragment, viewer-filtered
+print(build_planner_prompt_fragment(catalog.as_dict(), viewer=viewer))
 ```
 
 Catalog cubes the viewer can't see vanish from the rendered prompt.

@@ -17,9 +17,9 @@ import textwrap
 
 from semql import (
     AuthContext,
-    Backend,
     Catalog,
     Cube,
+    Dialect,
     Dimension,
     DrilldownSuggestion,
     DrilldownSuggestions,
@@ -34,12 +34,14 @@ from semql import (
     TimeDimension,
     TimeWindow,
     View,
+)
+from semql.introspect import iter_cubes
+from semql_prompt import (
     build_drilldown_prompt_fragment,
     build_presenter_prompt_fragment,
     build_query_generator_prompt_fragment,
     build_router_prompt_fragment,
 )
-from semql.introspect import iter_cubes
 
 # ---------------------------------------------------------------------------
 # A small realistic catalog
@@ -47,7 +49,7 @@ from semql.introspect import iter_cubes
 
 ORDERS = Cube(
     name="orders",
-    backend=Backend.POSTGRES,
+    dialect=Dialect.POSTGRES,
     table="orders",
     alias="o",
     primary_key="id",
@@ -82,7 +84,7 @@ ORDERS = Cube(
 
 REPS = Cube(
     name="reps",
-    backend=Backend.POSTGRES,
+    dialect=Dialect.POSTGRES,
     table="reps",
     alias="r",
     primary_key="id",
@@ -98,7 +100,7 @@ REPS = Cube(
 
 FINANCE_LEDGER = Cube(
     name="finance_ledger",
-    backend=Backend.POSTGRES,
+    dialect=Dialect.POSTGRES,
     table="finance_ledger",
     alias="fl",
     description="Confidential GL entries; restricted to the finance role.",
@@ -184,7 +186,7 @@ def stage_router() -> RouterDecision:
 
     section("Catalog surface visible to this viewer")
     for c in iter_cubes(CATALOG, viewer=VIEWER):
-        print(f"  - {c.name} ({c.backend.value})")
+        print(f"  - {c.name} ({c.dialect.value})")
     print("\n  (finance_ledger is hidden — viewer lacks 'finance' role)")
 
     section("Stubbed LLM output (what pydantic-ai would parse)")

@@ -76,7 +76,7 @@ Always registered:
 
 | Tool | Description |
 |---|---|
-| `query_semantic(spec, context?)` | Compile a SemanticQuery; return `{backend, sql, params, columns}`. |
+| `query_semantic(spec, context?)` | Compile a SemanticQuery; return `{dialect, sql, params, columns}`. |
 | `validate(spec)` | Collect-all static validation; returns `list[ValidationError]`. Empty when the query would compile cleanly. |
 | `explain(spec, context?)` | Compile and return just the SQL string. |
 | `catalog_prompt(only_exposed=True, include_introspection=False)` | Render the planner prompt fragment for the catalog. |

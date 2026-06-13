@@ -75,7 +75,7 @@ gives the full picture instead of bailing on the first failure.
   Schema is necessary, not sufficient.
 - Cross-table referential integrity. The probes are `LIMIT 0`; they
   parse, they don't sample.
-- Backend-specific feature drift (a function got dialect-renamed).
+- Dialect-specific feature drift (a function got dialect-renamed).
   Use the compiler's snapshot tests for that.
 
 ## Why `LIMIT 0`?

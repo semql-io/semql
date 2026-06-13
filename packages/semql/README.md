@@ -7,9 +7,8 @@ correct, parameterised SQL for Postgres, ClickHouse, DuckDB and
 
 `semql` does **no I/O**: catalogs are Python data; the compiler
 returns SQL + bound params; running the SQL is the caller's job.
-Prompt-fragment rendering for LLM planners ships in the core
-(`semql.prompt`). Sibling packages add MCP exposure (`semql-mcp`)
-and ER diagrams (`semql-erd`).
+Sibling packages add LLM-planner prompt fragments (`semql-prompt`),
+MCP exposure (`semql-mcp`) and ER diagrams (`semql-erd`).
 
 ## Install
 
@@ -46,7 +45,7 @@ catalog = Catalog([orders])
 compiled = catalog.compile(
     SemanticQuery(measures=["orders.revenue"], dimensions=["orders.region"]),
 )
-# compiled.sql, compiled.params, compiled.columns, compiled.backend
+# compiled.sql, compiled.params, compiled.columns, compiled.dialect
 ```
 
 The `{o}` placeholder in a cube's `sql` is its alias; the compiler
@@ -59,11 +58,11 @@ resolves it (along with `{schema}`-style context placeholders and
 |---|---|
 | Cube / Measure / Dimension / TimeDimension / Join | `semql.model` |
 | SemanticQuery / Filter / TimeWindow / CompareWindow | `semql.spec` |
-| Catalog wrapper (validation, prompt, compile entry) | `semql.catalog` |
+| Catalog wrapper (validation, compile entry) | `semql.catalog` |
 | Compiler — sqlglot AST → dialect SQL | `semql.compile` |
 | Collect-all static validator | `semql.validate` |
 | Reflection cubes (catalog_cubes, ...) | `semql.introspect` |
-| Planner / router prompt fragments | `semql.prompt` |
+| Planner / router prompt fragments | `semql-prompt` (sibling package) |
 | Dialect strategies + sqlglot dialect adapter | `semql.backend`, `semql.dialect` |
 | Visualisation decision (chart type, axes, formats) | `semql.visualize` |
 | `is_read_only_statement` post-hoc SQL guard | `semql.safe` |
@@ -75,14 +74,23 @@ resolves it (along with `{schema}`-style context placeholders and
   the inner query in `current` / `prior` CTEs joined via `FULL OUTER
   JOIN` and emits `{m}_current` / `{m}_prior` / `{m}_delta` /
   `{m}_pct_change` columns per measure.
+- **Temporal model** — time dimensions group by `hour` / `day` /
+  `week` / `month` / `quarter` / `year`; a `type="date"` time dimension
+  drops sub-day grain and timezone shifts; per-cube `timezone` makes
+  `date_trunc` tenant-correct and transpiles per dialect (`AT TIME
+  ZONE`, `CONVERT_TIMEZONE`, ClickHouse's native arg, …).
+- **Explicit raw SQL** — every hand-written fragment (`Measure.sql`,
+  `Join.on`, `Cube.base_predicate`, …) is wrapped in a `RawSQL` marker
+  at validation: when raw SQL is used, the model says so.
 - **Tenancy** — per-cube `SCHEMA` (default; `{tenant_schema}`
   substitution) or `DISCRIMINATOR` (compiler wraps the source in a
   subquery with `WHERE tenancy_column = $tenant`).
 - **Row-level security** — `Cube.security_sql` AND-composes with
   tenancy inside the isolation subquery; `{ctx.X}` placeholders bind
   as parameters, never inline as literals.
-- **MCP-ready** — `Catalog.prompt()` produces the planner system-prompt
-  fragment; `semql-mcp` wraps it as a server.
+- **MCP-ready** — `build_planner_prompt_fragment(catalog.as_dict())`
+  (in `semql-prompt`) produces the planner system-prompt fragment;
+  `semql-mcp` wraps it as a server.
 - **Pluggable backends** — `DialectStrategy` Protocol lets out-of-tree
   Snowflake / BigQuery adapters slot in without forking the compiler.
 

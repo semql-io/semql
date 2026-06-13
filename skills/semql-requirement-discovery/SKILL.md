@@ -45,7 +45,7 @@ The doc lists **intent-level** facts only:
 - Who's allowed to see what (in business terms).
 
 It does **not** list:
-- Backend / dialect choices.
+- Dialect choices (Postgres, ClickHouse, …).
 - SQL fragments or column expressions.
 - Specific aggregations or granularities.
 - Exact join predicates.

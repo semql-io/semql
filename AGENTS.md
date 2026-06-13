@@ -145,7 +145,7 @@ which can use relative imports.
 - Identifier resolution → join graph BFS → sqlglot AST composition →
   dialect render. Each phase is independently testable.
 - Dialect-specific shapes (placeholder syntax, `date_trunc`,
-  contains) come from `BackendDialect` — not branches in the
+  contains) come from `DialectStrategy` — not branches in the
   compiler body.
 
 ### Commits

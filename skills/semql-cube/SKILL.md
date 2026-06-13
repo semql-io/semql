@@ -26,7 +26,7 @@ entities relate?"
 
 ## A cube is a logical table
 
-It declares where rows live (`backend`, `table`), the always-on
+It declares where rows live (`dialect`, `table`), the always-on
 membership predicate (`base_predicate`), the addressable fields
 (*measures*, *dimensions*, *time dimensions*, *segments*), and the
 *joins* to other cubes.
@@ -36,30 +36,30 @@ A **catalog** is a validated `list[Cube]` plus optional `views`,
 `as_dict`, and acts as the iteration root for the introspection
 primitives.
 
-## Step 1: pick the backend
+## Step 1: pick the dialect
 
 ```python
-from semql import Backend
+from semql import Dialect
 
-Backend.POSTGRES     # %(name)s placeholder, native ILIKE, generate_series spine
-Backend.CLICKHOUSE   # {name:Type} placeholder, toStartOf<Gran>, numbers() spine
-Backend.DUCKDB       # $name placeholder, native ILIKE, generate_series spine
-Backend.BIGQUERY     # @name placeholder, LOWER LIKE LOWER, UNNEST(GENERATE_DATE_ARRAY) spine
-Backend.SNOWFLAKE    # :name placeholder, native ILIKE, TABLE(GENERATOR) + SEQ4 spine
-Backend.META         # in-memory VALUES; reflection only — see META_CUBES
+Dialect.POSTGRES     # %(name)s placeholder, native ILIKE, generate_series spine
+Dialect.CLICKHOUSE   # {name:Type} placeholder, toStartOf<Gran>, numbers() spine
+Dialect.DUCKDB       # $name placeholder, native ILIKE, generate_series spine
+Dialect.BIGQUERY     # @name placeholder, LOWER LIKE LOWER, UNNEST(GENERATE_DATE_ARRAY) spine
+Dialect.SNOWFLAKE    # :name placeholder, native ILIKE, TABLE(GENERATOR) + SEQ4 spine
+Dialect.META         # in-memory VALUES; reflection only — see META_CUBES
 ```
 
-Cross-backend queries are rejected at compile time. If one query
-needs columns from two backends, split it.
+Cross-dialect queries are rejected at compile time. If one query
+needs columns from two dialects, split it.
 
 ## Step 2: declare the cube
 
 ```python
-from semql import Cube, Dimension, Measure, TimeDimension, Backend
+from semql import Cube, Dimension, Measure, TimeDimension, Dialect
 
 orders = Cube(
     name="orders",
-    backend=Backend.POSTGRES,
+    dialect=Dialect.POSTGRES,
     table="public.orders",            # may contain {schema} / {tenant_schema}
     alias="o",                        # what the FROM clause uses
     base_predicate="{o}.deleted_at IS NULL",
@@ -84,11 +84,18 @@ orders = Cube(
     time_dimensions=[
         TimeDimension(
             name="created_at", sql="{o}.created_at",
-            granularities=("hour", "day", "week", "month"),
+            # any of: hour, day, week, month, quarter, year
+            granularities=("hour", "day", "week", "month", "quarter", "year"),
         ),
     ],
 )
 ```
+
+A `TimeDimension(type="date", ...)` is a calendar date: it rejects the
+`hour` granularity and is never timezone-shifted. For sub-day columns,
+set `Cube(timezone="America/New_York")` so `date_trunc` buckets land on
+the tenant's day boundary (the compiler transpiles the shift per
+dialect); leave it `None` to truncate in the column's stored zone.
 
 ### The `{alias}` placeholder
 
@@ -152,6 +159,7 @@ sums.
 | `string`         | default; filter values must be strings      |
 | `number`         | numeric comparisons (`gt`/`lt`/…)           |
 | `time`           | filter values must parse as ISO-8601        |
+| `date`           | calendar date — no sub-day grain / tz shift |
 | `bool`           | filter values must be Python `bool`         |
 | `uuid`           | filter values must parse as UUIDs           |
 
@@ -438,22 +446,26 @@ the response with the matching model.
 
 | Role | Fragment | Output |
 |---|---|---|
-| Router | `build_router_prompt_fragment(catalog, viewer=...)` | `RouterDecision { route_to, cubes, views }` |
-| Generator | `build_query_generator_prompt_fragment(catalog, scope_to=decision.cubes+decision.views, viewer=...)` | `QueryPlan { steps: list[QueryStep] }` |
+| Router | `build_router_prompt_fragment(catalog.as_dict(), viewer=...)` | `RouterDecision { route_to, cubes, views }` |
+| Generator | `build_query_generator_prompt_fragment(catalog.as_dict(), scope_to=decision.cubes+decision.views, viewer=...)` | `QueryPlan { steps: list[QueryStep] }` |
 | Presenter | `build_presenter_prompt_fragment(query_labels=..., result_summary=...)` | `Presentation { summary, highlights, caveats }` |
 | Drilldown | `build_drilldown_prompt_fragment(cube, focused_row=...)` | `DrilldownSuggestions { suggestions }` |
 
 ```python
-from semql import build_router_prompt_fragment
+from semql_prompt import build_router_prompt_fragment
 
 router_prompt = build_router_prompt_fragment(catalog.as_dict(), viewer=viewer)
 # ... send to LLM, parse RouterDecision, feed cubes+views into Generator ...
 ```
 
-See `demos/pipeline_demo.py` for the full data flow without an LLM.
+The fragment builders live in the `semql-prompt` sibling package and
+take `catalog.as_dict()` (a `dict[str, Cube]`), not the `Catalog`
+object. See `demos/pipeline_demo.py` for the full data flow without an
+LLM.
 
-The single-stage `catalog.prompt(viewer=...)` is still available for
-callers that don't want the four-stage breakdown.
+The single-stage `build_planner_prompt_fragment(catalog.as_dict(),
+viewer=...)` is available for callers that don't want the four-stage
+breakdown.
 
 ## Common pitfalls
 
@@ -493,7 +505,7 @@ from semql import TimePartition, TimePartitionedSource
 
 orders = Cube(
     name="orders",
-    backend=Backend.POSTGRES,
+    dialect=Dialect.POSTGRES,
     alias="o",
     time_partition=TimePartition(time_dimension="placed_at"),
     physical_sources=[
@@ -567,7 +579,7 @@ design record and the test surface.
 
 ## See also
 
-- `skills/semql-requirement-discovery.md` — upstream skill that
+- `skills/semql-requirement-discovery/SKILL.md` — upstream skill that
   captures intent at the domain level. Hand off via a markdown
   requirements doc.
 - `demos/pipeline_demo.py` — runnable end-to-end demo.
