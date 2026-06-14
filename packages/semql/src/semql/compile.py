@@ -300,7 +300,11 @@ def _empty_source_for(cube: Cube) -> exp.Subquery:
     empty by construction — no rows leak across the time
     boundary, and the cube is still queryable (the rest of the
     pipeline continues to run)."""
-    inner = exp.Select().select(exp.Literal.number(1)).where(exp.Boolean(this=False))
+    inner = (
+        exp.Select()
+        .select(exp.Literal.number(1), copy=False)
+        .where(exp.Boolean(this=False), copy=False)
+    )
     return exp.Subquery(
         this=inner,
         alias=exp.TableAlias(this=exp.to_identifier(cube.alias)),
@@ -353,7 +357,7 @@ def _apply_with_clause(
     sqlglot_dialect = sqlglot_dialect_for(dialect)
     out: exp.Select = select_node
     for name, body_sql in ctes:
-        out = out.with_(name, as_=body_sql, dialect=sqlglot_dialect)
+        out = out.with_(name, as_=body_sql, dialect=sqlglot_dialect, copy=False)
     return out
 
 
@@ -1837,7 +1841,12 @@ class _CompileEnv:
         for p in predicates[1:]:
             where_expr = exp.And(this=where_expr, expression=p)
 
-        inner = exp.Select().select(exp.Star()).from_(source).where(where_expr)
+        inner = (
+            exp.Select()
+            .select(exp.Star(), copy=False)
+            .from_(source, copy=False)
+            .where(where_expr, copy=False)
+        )
         return exp.Subquery(
             this=inner,
             alias=exp.TableAlias(this=exp.to_identifier(cube.alias)),
@@ -1972,7 +1981,7 @@ class _CompileEnv:
             )
         else:
             source = self.strategy.emit_source(root, self.catalog, self.resolve_in_ctx)
-        sel = sel.from_(self.wrap_for_tenancy(root, source))
+        sel = sel.from_(self.wrap_for_tenancy(root, source), copy=False)
         for plan_join in plan_joins:
             tgt = plan_join.right
             j = plan_join.model
@@ -1988,6 +1997,7 @@ class _CompileEnv:
                 self.wrap_for_tenancy(tgt, target_source),
                 on=self.parse(j.on),
                 join_type=plan_join.kind,
+                copy=False,
             )
         return sel
 
@@ -2074,7 +2084,7 @@ class _CompileEnv:
                 )
             else:  # "computed" — derived / inline measure, deferred to ``_emit_simple_query``
                 continue
-            sel = sel.select(exp.alias_(expr, out_name))
+            sel = sel.select(exp.alias_(expr, out_name), copy=False)
 
         if self.plan.aggregate is not None and measure_count == 0:
             # Row-listing mode with no measures — DISTINCT collapses
@@ -2123,7 +2133,7 @@ class _CompileEnv:
             )
 
         if where_terms:
-            sel = sel.where(*where_terms)
+            sel = sel.where(*where_terms, copy=False)
         return sel
 
     def _predicate_term(self, expr: BoolExpr | Filter) -> exp.Expression:
@@ -2213,10 +2223,10 @@ class _CompileEnv:
         for col in self.plan.project.columns:
             if col.kind == "dimension":
                 if self.group_by_alias:
-                    sel = sel.group_by(exp.column(self.dim_col_names[dim_idx]))
+                    sel = sel.group_by(exp.column(self.dim_col_names[dim_idx]), copy=False)
                 else:
                     assert col.field is not None
-                    sel = sel.group_by(self.parse(col.field.sql))
+                    sel = sel.group_by(self.parse(col.field.sql), copy=False)
                 dim_idx += 1
 
         if aggregate.time is not None and self.time_col_name is not None:
@@ -2224,7 +2234,7 @@ class _CompileEnv:
             granularity = self.plan.time_window.granularity
             assert granularity is not None
             if self.group_by_alias:
-                sel = sel.group_by(exp.column(self.time_col_name))
+                sel = sel.group_by(exp.column(self.time_col_name), copy=False)
             else:
                 # Find the time-dim field for the trunc source.
                 td = next(
@@ -2249,7 +2259,8 @@ class _CompileEnv:
                             self.parse(td.sql),
                             tz,
                             week_start=aggregate.time.cube.week_start,
-                        )
+                        ),
+                        copy=False,
                     )
         return sel
 
@@ -2343,8 +2354,8 @@ def _emit_compare_query(env: _CompileEnv) -> CompiledQuery:
     prior_inner = env.build_inner(prior_range, apply_aliases=False)
 
     outer = exp.Select()
-    outer = outer.with_("current", current_inner)
-    outer = outer.with_("prior", prior_inner)
+    outer = outer.with_("current", current_inner, copy=False)
+    outer = outer.with_("prior", prior_inner, copy=False)
 
     outer_columns: list[str] = []
     for col_name in dim_col_names:
@@ -2358,7 +2369,8 @@ def _emit_compare_query(env: _CompileEnv) -> CompiledQuery:
                     ],
                 ),
                 col_name,
-            )
+            ),
+            copy=False,
         )
         outer_columns.append(col_name)
     if env.has_time_breakdown:
@@ -2373,7 +2385,8 @@ def _emit_compare_query(env: _CompileEnv) -> CompiledQuery:
                     ],
                 ),
                 time_col_name,
-            )
+            ),
+            copy=False,
         )
         outer_columns.append(time_col_name)
 
@@ -2385,8 +2398,8 @@ def _emit_compare_query(env: _CompileEnv) -> CompiledQuery:
         delta_col = f"{col_name}_delta"
         pct_col = f"{col_name}_pct_change"
 
-        outer = outer.select(exp.alias_(cur_ref.copy(), cur_col))
-        outer = outer.select(exp.alias_(pri_ref.copy(), pri_col))
+        outer = outer.select(exp.alias_(cur_ref.copy(), cur_col), copy=False)
+        outer = outer.select(exp.alias_(pri_ref.copy(), pri_col), copy=False)
 
         # delta: COALESCE both to 0 so the diff is meaningful when one
         # period is missing the entity.
@@ -2400,7 +2413,8 @@ def _emit_compare_query(env: _CompileEnv) -> CompiledQuery:
             exp.alias_(
                 exp.Sub(this=coalesced_cur, expression=coalesced_pri),
                 delta_col,
-            )
+            ),
+            copy=False,
         )
 
         # pct_change: divide-by-zero guard. ``exp.Paren`` around the
@@ -2427,11 +2441,11 @@ def _emit_compare_query(env: _CompileEnv) -> CompiledQuery:
             ],
             default=exp.Null(),
         )
-        outer = outer.select(exp.alias_(pct_expr, pct_col))
+        outer = outer.select(exp.alias_(pct_expr, pct_col), copy=False)
 
         outer_columns.extend([cur_col, pri_col, delta_col, pct_col])
 
-    outer = outer.from_(exp.to_table("current"))
+    outer = outer.from_(exp.to_table("current"), copy=False)
     join_dims = dim_col_names + ([time_col_name] if time_col_name else [])
     if join_dims:
         on_expr: exp.Expression | None = None
@@ -2441,18 +2455,21 @@ def _emit_compare_query(env: _CompileEnv) -> CompiledQuery:
                 expression=exp.column(jd, table="prior"),
             )
             on_expr = eq if on_expr is None else exp.And(this=on_expr, expression=eq)
-        outer = outer.join(exp.to_table("prior"), on=on_expr, join_type="full outer")
+        outer = outer.join(exp.to_table("prior"), on=on_expr, join_type="full outer", copy=False)
     else:
         # No dims, no time bucket — cross product of single rows.
         outer = outer.join(
             exp.to_table("prior"),
             on=exp.Boolean(this=True),
             join_type="full outer",
+            copy=False,
         )
 
     for ref, direction in env.plan.order.keys:
         col = _resolve_compare_outer_ref(ref, outer_columns, measure_col_names, what="ORDER BY")
-        outer = outer.order_by(exp.Ordered(this=exp.column(col), desc=(direction == "desc")))
+        outer = outer.order_by(
+            exp.Ordered(this=exp.column(col), desc=(direction == "desc")), copy=False
+        )
 
     # HAVING — compare mode supports it against any outer column,
     # including the synthetic ``compare.<measure>.delta`` form. Most
@@ -2463,12 +2480,14 @@ def _emit_compare_query(env: _CompileEnv) -> CompiledQuery:
         col = _resolve_compare_outer_ref(
             hf.dimension, outer_columns, measure_col_names, what="HAVING"
         )
-        outer = outer.having(_filter_node(hf, exp.column(col), "number", env.strategy, env.bind))
+        outer = outer.having(
+            _filter_node(hf, exp.column(col), "number", env.strategy, env.bind), copy=False
+        )
 
     if env.plan.limit.limit is not None:
-        outer = outer.limit(int(env.plan.limit.limit))
+        outer = outer.limit(int(env.plan.limit.limit), copy=False)
     if env.plan.limit.offset is not None and env.plan.limit.offset > 0:
-        outer = outer.offset(int(env.plan.limit.offset))
+        outer = outer.offset(int(env.plan.limit.offset), copy=False)
 
     outer = _apply_with_clause(
         outer, _collect_hoisted_ctes(env.touched, env.resolve_in_ctx), env.dialect
@@ -2546,7 +2565,7 @@ def _emit_simple_query(env: _CompileEnv) -> CompiledQuery:
     # address them by the derived measure's ``name``.
     for ir in q.derived_measures:
         node = _build_inline_derived_expr(ir, env, columns)
-        select_node = select_node.select(exp.alias_(node, ir.name))
+        select_node = select_node.select(exp.alias_(node, ir.name), copy=False)
         columns.append(ir.name)
         measure_alias_map[ir.name] = node
 
@@ -2582,7 +2601,7 @@ def _emit_simple_query(env: _CompileEnv) -> CompiledQuery:
         else:
             target_node = measure_alias_map[lookup_name].copy()
         select_node = select_node.having(
-            _filter_node(hf, target_node, "number", env.strategy, env.bind)
+            _filter_node(hf, target_node, "number", env.strategy, env.bind), copy=False
         )
 
     # Time spine — wrap the aggregation in a CTE and LEFT JOIN a
@@ -2624,9 +2643,9 @@ def _emit_simple_query(env: _CompileEnv) -> CompiledQuery:
         spine_inner = env.strategy.emit_time_spine(granularity_val, start_ph, end_ph, time_col_name)
 
         outer = exp.Select()
-        outer = outer.with_("agg", select_node)
-        outer = outer.with_("spine", spine_inner)
-        outer = outer.select(exp.column(time_col_name, table="spine"))
+        outer = outer.with_("agg", select_node, copy=False)
+        outer = outer.with_("spine", spine_inner, copy=False)
+        outer = outer.select(exp.column(time_col_name, table="spine"), copy=False)
         for col_name in measure_col_names:
             outer = outer.select(
                 exp.alias_(
@@ -2638,9 +2657,10 @@ def _emit_simple_query(env: _CompileEnv) -> CompiledQuery:
                         ],
                     ),
                     col_name,
-                )
+                ),
+                copy=False,
             )
-        outer = outer.from_(exp.to_table("spine"))
+        outer = outer.from_(exp.to_table("spine"), copy=False)
         outer = outer.join(
             exp.to_table("agg"),
             on=exp.EQ(
@@ -2648,6 +2668,7 @@ def _emit_simple_query(env: _CompileEnv) -> CompiledQuery:
                 expression=exp.column(time_col_name, table="agg"),
             ),
             join_type="left",
+            copy=False,
         )
         select_node = outer
 
@@ -2701,13 +2722,13 @@ def _emit_simple_query(env: _CompileEnv) -> CompiledQuery:
             else:
                 order_target = env.parse(fld.sql)
         select_node = select_node.order_by(
-            exp.Ordered(this=order_target, desc=(direction == "desc"))
+            exp.Ordered(this=order_target, desc=(direction == "desc")), copy=False
         )
 
     if env.plan.limit.limit is not None:
-        select_node = select_node.limit(int(env.plan.limit.limit))
+        select_node = select_node.limit(int(env.plan.limit.limit), copy=False)
     if env.plan.limit.offset is not None and env.plan.limit.offset > 0:
-        select_node = select_node.offset(int(env.plan.limit.offset))
+        select_node = select_node.offset(int(env.plan.limit.offset), copy=False)
 
     select_node = _apply_with_clause(
         select_node,
