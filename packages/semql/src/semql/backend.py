@@ -27,6 +27,7 @@ this module.
 
 from __future__ import annotations
 
+import functools
 from collections.abc import Callable
 from typing import Any, Protocol, runtime_checkable
 
@@ -128,6 +129,21 @@ def _sunday_from_monday_week(
     return exp.Sub(this=monday_trunc(shifted), expression=one_day.copy())
 
 
+@functools.lru_cache(maxsize=512)
+def _ident_needs_quote(name: str, dialect: str) -> bool:
+    """Whether ``name`` must be quoted to survive as a bare identifier
+    under ``dialect`` — true when the dialect tokenizer reads it as a
+    keyword rather than a plain VAR/IDENTIFIER (e.g. ``USING``, ``SELECT``).
+
+    The tokenize + dialect resolution this performs is the expensive part
+    of :func:`_ident` and is a pure function of ``(name, dialect)`` over a
+    tiny key space (table / schema / alias names), so it is memoised.
+    The boolean is cached — never the ``Identifier`` node, which callers
+    reparent into distinct trees and must therefore receive fresh."""
+    toks = sqlglot.tokenize(name, dialect=dialect)
+    return not toks or toks[0].token_type not in (_TT.VAR, _TT.IDENTIFIER)
+
+
 def _ident(name: str, dialect: str = "postgres") -> exp.Identifier:
     """Return an Identifier for ``name``, quoted if the dialect tokenizer
     would treat it as a keyword (e.g. USING, SELECT, TABLE).
@@ -136,9 +152,7 @@ def _ident(name: str, dialect: str = "postgres") -> exp.Identifier:
     dialect-specific (``sample`` is a ClickHouse keyword but an ordinary
     word in Postgres), so a table name has to be tested against the same
     dialect it will be emitted under or it slips through unquoted."""
-    toks = sqlglot.tokenize(name, dialect=dialect)
-    needs_quote = not toks or toks[0].token_type not in (_TT.VAR, _TT.IDENTIFIER)
-    return exp.to_identifier(name, quoted=needs_quote)
+    return exp.to_identifier(name, quoted=_ident_needs_quote(name, dialect))
 
 
 def _aliased_source(cube: Cube, resolve_sql: SqlResolver) -> exp.Expression:
