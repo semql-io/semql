@@ -237,8 +237,8 @@ def _run_cases(
 
 def _repo_cases(*, raw: bool, include_boolexpr: bool) -> list[dict[str, Any]]:
     """Build cases from the schemas this library actually ships."""
+    from semql import flatten_root_ref
     from semql.spec import BoolExpr, SemanticQuery
-    from semql_prompt.bedrock import flatten_root_ref
 
     cases: list[dict[str, Any]] = [
         {

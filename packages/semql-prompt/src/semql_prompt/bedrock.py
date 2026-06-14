@@ -26,11 +26,11 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-# Re-exported from the shared schema helper so the Bedrock adapter and the
-# OpenAI / LangChain projections flatten root ``$ref``\\ s through one
-# implementation. Kept importable here for back-compat (``__init__`` and
-# callers import ``flatten_root_ref`` from this module).
-from semql_prompt._schema import flatten_root_ref
+# The root-$ref flattener lives in core (``semql.flatten_root_ref``) — its
+# single public home, since the recursion is a property of a core type. Imported
+# here only for ``to_bedrock_converse_tools``'s defensive re-flatten.
+from semql import flatten_root_ref
+
 from semql_prompt.catalog_tools import to_openai_tools
 
 if TYPE_CHECKING:
@@ -72,6 +72,4 @@ def to_bedrock_converse_tools(
     return tools
 
 
-# ``flatten_root_ref`` is re-exported (it now lives in ``_schema``); name it
-# here so importing it from this module is an explicit public re-export.
-__all__ = ["flatten_root_ref", "to_bedrock_converse_tools"]
+__all__ = ["to_bedrock_converse_tools"]

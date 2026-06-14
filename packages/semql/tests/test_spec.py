@@ -358,6 +358,22 @@ def _missing_descriptions(model_cls: type[BaseModel]) -> list[str]:
     ]
 
 
+def test_tool_json_schema_is_object_rooted_despite_recursion() -> None:
+    """``SemanticQuery`` is recursive (``semi_joins[].source`` is itself a
+    ``SemanticQuery``), so ``model_json_schema()`` emits a root ``$ref``.
+    ``tool_json_schema`` must flatten it to an object root for tool-calling
+    APIs while keeping ``$defs`` so the self-reference still resolves."""
+    raw = SemanticQuery.model_json_schema()
+    assert "$ref" in raw  # recursion makes the raw schema root-ref'd
+
+    schema = SemanticQuery.tool_json_schema()
+    assert schema.get("type") == "object"
+    assert "$ref" not in schema
+    assert "semi_joins" in schema["properties"]
+    assert "SemanticQuery" in schema["$defs"]
+    assert schema["$defs"]["SemiJoin"]["properties"]["source"]["$ref"] == "#/$defs/SemanticQuery"
+
+
 @pytest.mark.parametrize(
     "model_cls",
     [SemanticQuery, Filter, TimeWindow, CompareWindow],

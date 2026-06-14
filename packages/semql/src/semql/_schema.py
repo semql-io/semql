@@ -1,13 +1,13 @@
-"""JSON-Schema post-processing shared by the tool-description projections.
+"""JSON-Schema post-processing for tool-calling projections.
 
 Pydantic emits a *root* ``$ref`` whenever the root model is recursive — which
-``SemanticQuery`` became once ``semi_joins[].source`` referenced
-``SemanticQuery`` itself (and which a self-referential :class:`BoolExpr`
-exported as a tool root would also produce). A bare root ``$ref`` is not an
+:class:`~semql.spec.SemanticQuery` is (``semi_joins[].source`` is itself a
+``SemanticQuery``), and which a self-referential :class:`~semql.spec.BoolExpr`
+exported as a tool root would also produce. A bare root ``$ref`` is not an
 object-rooted schema, and OpenAI / Anthropic / Bedrock tool-calling all expect
-``{"type": "object", "properties": {...}}`` at the top. Bedrock Converse in
-particular rejects a root ``$ref`` on every model family (verified against the
-live API, 2026-06).
+``{"type": "object", "properties": {...}}`` at the top (Bedrock Converse
+rejects a root ``$ref`` on every model family — verified against the live API,
+2026-06).
 
 :func:`flatten_root_ref` splices the referenced definition up to the root while
 keeping ``$defs`` and every *internal* (recursive) ``$ref`` intact, so the
@@ -17,8 +17,9 @@ copy) on an already object-rooted schema, and raises if the schema cannot be
 made object-rooted (a ``RootModel`` over a union or scalar), since such a model
 cannot be a tool input.
 
-This is the single source of truth for root-``$ref`` flattening; the Bedrock
-adapter re-exports it.
+This lives in core because the recursion is a property of a core type;
+:meth:`SemanticQuery.tool_json_schema` is the front door, and the prompt /
+Bedrock projection layers reuse :func:`flatten_root_ref` for arbitrary schemas.
 """
 
 from __future__ import annotations

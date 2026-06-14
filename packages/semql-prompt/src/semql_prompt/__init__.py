@@ -14,10 +14,7 @@ argument.
 
 from __future__ import annotations
 
-from semql_prompt.bedrock import (
-    flatten_root_ref,
-    to_bedrock_converse_tools,
-)
+from semql_prompt.bedrock import to_bedrock_converse_tools
 from semql_prompt.catalog_tools import (
     planner_prompt,
     planner_prompt_segments,
@@ -80,6 +77,5 @@ __all__ = [
     "to_langchain_tools",
     "to_openai_tools",
     # Bedrock Converse adaptation
-    "flatten_root_ref",
     "to_bedrock_converse_tools",
 ]

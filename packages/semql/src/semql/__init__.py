@@ -9,6 +9,7 @@ prompt rendering, etc.).
 
 from __future__ import annotations
 
+from semql._schema import flatten_root_ref
 from semql.catalog import Catalog
 from semql.compile import MAX_UNGROUPED_ROWS, ColumnMeta, CompiledQuery, compile_query
 from semql.cost import BudgetExceededError, CostEstimate, QueryBudget, estimate_cost
@@ -340,6 +341,7 @@ __all__ = [
     "decide_visualization",
     "diff_catalogs",
     "estimate_cost",
+    "flatten_root_ref",
     "is_read_only_statement",
     "QueryBudget",
     "iter_cubes",

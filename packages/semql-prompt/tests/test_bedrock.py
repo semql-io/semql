@@ -14,9 +14,9 @@ from __future__ import annotations
 import json
 
 import pytest
-from semql import AuthContext, Catalog, Cube, Dialect, Dimension, Measure
+from semql import AuthContext, Catalog, Cube, Dialect, Dimension, Measure, flatten_root_ref
 from semql.spec import BoolExpr, SemanticQuery
-from semql_prompt.bedrock import flatten_root_ref, to_bedrock_converse_tools
+from semql_prompt.bedrock import to_bedrock_converse_tools
 
 
 def _cube(name: str = "orders", required_roles: list[str] | None = None) -> Cube:

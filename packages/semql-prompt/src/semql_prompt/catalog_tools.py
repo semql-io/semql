@@ -183,8 +183,6 @@ def to_openai_tools(
     matching role."""
     from semql.spec import SemanticQuery
 
-    from semql_prompt._schema import flatten_root_ref
-
     cubes, saved = _visible_tool_targets(catalog, viewer=viewer, only_exposed=only_exposed)
     tools: list[dict[str, Any]] = [to_openai_function(c) for c in cubes]
     for sq in saved:
@@ -194,7 +192,7 @@ def to_openai_tools(
                 "function": {
                     "name": f"saved_{sq.name}",
                     "description": render_saved_query_tool_description(sq),
-                    "parameters": flatten_root_ref(SemanticQuery.model_json_schema()),
+                    "parameters": SemanticQuery.tool_json_schema(),
                 },
             }
         )

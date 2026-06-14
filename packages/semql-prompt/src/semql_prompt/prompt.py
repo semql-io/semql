@@ -731,14 +731,12 @@ def to_openai_function(cube: Cube) -> dict[str, Any]:
     """
     from semql.spec import SemanticQuery
 
-    from semql_prompt._schema import flatten_root_ref
-
     return {
         "type": "function",
         "function": {
             "name": f"query_{cube.name}",
             "description": render_tool_description(cube),
-            "parameters": flatten_root_ref(SemanticQuery.model_json_schema()),
+            "parameters": SemanticQuery.tool_json_schema(),
         },
     }
 

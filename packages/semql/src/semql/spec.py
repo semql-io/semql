@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import uuid as _uuid
 from datetime import datetime
-from typing import TYPE_CHECKING, Annotated, Literal
+from typing import TYPE_CHECKING, Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -457,6 +457,21 @@ class SemanticQuery(BaseModel):
                 "(aggregated mode)."
             )
         return self
+
+    @classmethod
+    def tool_json_schema(cls) -> dict[str, Any]:
+        """Object-rooted JSON schema for LLM tool-calling parameters.
+
+        ``model_json_schema()`` emits a root ``$ref`` because this model is
+        recursive (``semi_joins[].source`` is itself a ``SemanticQuery``), and
+        OpenAI / Anthropic / Bedrock tool-calling all require an object root.
+        This returns the flattened, object-rooted form — keeping ``$defs`` and
+        the recursive internal refs intact. Prefer this over a raw
+        ``model_json_schema()`` anywhere the schema is shipped as a tool spec.
+        """
+        from semql._schema import flatten_root_ref
+
+        return flatten_root_ref(cls.model_json_schema())
 
     def rewrite(self, op: RewriteOp) -> SemanticQuery:
         """Apply a :class:`semql.rewrite.RewriteOp` and return a new query.
