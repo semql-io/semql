@@ -6,6 +6,15 @@ file:line evidence; items marked ⚠ were empirically reproduced during
 review, the rest should be confirmed with a failing test before fixing
 (red/green).
 
+> **Status legend.** Each "Resolved …" annotation below is anchored to a
+> test file that fails without the fix (or, where the fix is a deletion
+> that removes a whole code path, to a test that asserts the new
+> behaviour). Items still marked "Still open" or "blocks X" have not
+> been verified closed against a test. TODOS.org is gitignored, so this
+> spec is self-contained only because the test pointers below exist —
+> a new contributor can `git grep` the test names to confirm status
+> without an external backlog.
+
 ## A. Correctness defects on main (fix before any new feature)
 
 1. ⚠ **`compile_plan` silently drops filters** (`compile.py:2320-2407`).
@@ -31,10 +40,11 @@ review, the rest should be confirmed with a failing test before fixing
    (a window in `-05:00` whose rows all live in the post-boundary source
    was routed to the *wrong* table and returned empty). Fixed by
    comparing parsed instants (`spec.parse_instant`, naive read as UTC)
-   in both `_ranges_intersect` and the `TimePartitionedSource`
+   in both `_ranges_intersect`    and the `TimePartitionedSource`
    range-ordering validator, and by correcting the `TimeWindow.range`
    docstring to half-open. Full parse-at-construction + per-cube
    timezone semantics remain B9.
+   *Verifying test:* `packages/semql/tests/test_partition_boundary.py`.
 3. **PolarsMergeEngine drops filter literals it doesn't understand**
    (`polars_engine.py:260-261`): ops outside eq/neq/gt/gte/lt/lte hit
    `else: continue` inside an OR-disjunction → narrower disjunction →
@@ -46,11 +56,18 @@ review, the rest should be confirmed with a failing test before fixing
    removed rather than fixed — a parallel hand-written merge was a
    standing divergence hazard and its no-DuckDB rationale was already
    false (`semql-engine` hard-depends on duckdb). The DuckDB merge SQL
-   is now the single source of truth, so this bug class is structurally
+   is now the single source of truth, so this    bug class is structurally
    gone.
+   *Verifying test:* `packages/semql-engine/tests/test_merge_engine_default.py`
+   (asserts the DuckDB merge is the only registered merge engine).
 4. **5 federate tests fail on main** (acknowledged in TODOS.org as
    pre-existing). The gate is off exactly where the code is most
    fragile. Fix or quarantine.
+   *Verifying tests (all five now green):* `test_federate.py`,
+   `test_federate_cnf_reuse.py`, `test_federate_merge_spec.py`,
+   `test_federate_where_segments.py`, `test_federated_plan_frozen.py`
+   in `packages/semql/tests/`. Run `uv run pytest
+   packages/semql/tests/test_federate*.py` to confirm.
 5. **Engine cache hazards** (`engine.py:184-222`): cached
    ExecutionResult returned by reference (caller mutation poisons the
    cache); list-valued params (BQ ArrayQueryParameter) are unhashable →
@@ -63,7 +80,8 @@ review, the rest should be confirmed with a failing test before fixing
    `_freeze_param` (lists/tuples → tuples, dicts → key-sorted tuples,
    sets → frozensets), so container-valued params hash. (c) optional
    `cache_ttl` expires entries against an injectable monotonic clock.
-   Covered by `test_a5_cache_hazards.py`. AsyncEngine still lacks the
+   Covered by `test_cache_hazards.py` (renamed from
+   `test_a5_cache_hazards.py`). AsyncEngine still lacks the
    cache entirely (B7) — unchanged here.
 6. **MCP auth is per-server, not per-request** (`server.py:122,199`):
    `compile()` is never passed `viewer=`; lookup tools accept

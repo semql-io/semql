@@ -99,8 +99,8 @@ real bugs. (Item #59 in `TODOS.org` is to revisit this trade-off.)
 ### Testing
 
 Red / Green TDD is the default cadence — write a failing test first,
-then make it pass. The test suite (756+ as of the auth + pipeline
-landing) acts as the regression guard for refactors.
+then make it pass. The test suite (2,576 as of mid-June 2026) acts as
+the regression guard for refactors.
 
 Per-module unit-tests live next to the package they target
 (`packages/semql/tests/test_<module>.py`). Hypothesis property tests

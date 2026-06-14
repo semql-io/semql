@@ -315,7 +315,7 @@ them):
 Cube(
     ...,
     tenancy="discriminator",     # schema | discriminator | none
-    tenancy_column="tenant_id",  # required for discriminator
+    tenancy_columns=["tenant_id"],  # required (non-empty) for discriminator
 )
 ```
 

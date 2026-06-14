@@ -345,3 +345,155 @@ analytic layer, which already supports `ungrouped=True` row listing).
    row-listing already exists in the IR (`logical.py` `to_logical_plan`
    step 4), and `LogicalPlan` carries live model objects — it is
    explicitly an internal middle representation, not a wire contract.
+
+## Appendix A — Implementation status & review notes (2026-06-13)
+
+Review of the codebase against this spec. Records what exists, the
+gaps in the existing stub, and concerns to resolve in the spec before
+code lands.
+
+### A.1 Status: implementation landed
+
+As of mid-June 2026, milestones M1–M5 have all shipped. The current
+shape — for the code-as-written today, not as this spec proposed — is:
+
+- `Entity`, `MutableEntity`, `MutableField` in `semql.model`
+  (`packages/semql/src/semql/model.py:1859, 1844`).
+- `EntityFetch`, `EntityList`, `RowPlan`, `RowPred`, `SourceRef`,
+  `CompiledEntityQuery` in `semql.rows` (`packages/semql/src/semql/rows.py`).
+- `SemanticMutation`, `CompiledMutation`, `compile_mutation` in
+  `semql.mutate` (`packages/semql/src/semql/mutate.py:58, 69, 176`).
+- `compile_fetch` / `compile_list` (`semql.rows:292, 345`).
+- `Catalog.entities`, `Catalog.allow_mutations`, `Catalog.fetch`,
+  `Catalog.list_rows`, `Catalog.mutate`, `Catalog.compile_collect_all`
+  (`packages/semql/src/semql/catalog.py`).
+- Per-entity MCP tool factories `get_<entity>`, `list_<entity>`,
+  `mutate_<entity>` in `semql-mcp/server.py:863, 902, 979`.
+- New types `Op`, `CtxRef`, `FieldType` defined and exported
+  (`semql.__init__:226-294`).
+- All re-exported from `semql.__init__`.
+
+The audit table below is kept for the historical record — it shows what
+the codebase looked like when this spec was drafted, not what it looks
+like now.
+
+| Spec component | In code? (as drafted) | In code? (as of 2026-06-15) |
+|---|---|---|
+| `Entity` (read-only vocabulary model) | partial — `model.py` stub, see A.2 | landed; catalog-validated |
+| `MutableEntity`, `MutableField` | not built | landed (`model.py:1844, 1859`) |
+| `EntityFetch` / `EntityList` / `RowPlan` / `RowPred` | not built | landed (`rows.py:59, 71, 102, 116`) |
+| `compile_fetch` / `compile_list` | not built | landed (`rows.py:292, 345`) |
+| `SemanticMutation` / `compile_mutation` | not built | landed (`mutate.py:58, 176`) |
+| `Catalog.entities`, `Catalog.allow_mutations`, gates | not built | landed (`catalog.py`) |
+| `RowCapableAdapter.execute_rows`, MCP `get_/list_/mutate_` tools | not built | landed (`server.py:863, 902, 979`) |
+| assumed new types `Op`, `CtxRef`, `FieldType`, `max_list_limit` | not built | landed (`model.py:89, 152, 1823`) |
+
+The "still open" A.4 concerns below (six of the seven) remain
+substantive design questions even though the implementation exists.
+
+### A.2 Critique of the existing `Entity` stub
+
+> Historical note (A.2 was written 2026-06-13, before M1 landed).
+> Items 1 and 2 are now closed by the catalog wiring milestone; item 3
+> was a forward-looking note that is moot now that the public surface
+> has stabilised.
+
+1. **The docstring overstates validation (foot-gun).** `Entity`'s
+   docstring claims "The Catalog validates the entity's references at
+   construction time so callers can trust the surface." It does not —
+   `Catalog` has no `entities` field and never sees an `Entity`. So
+   `Entity(name="X", cubes=["does_not_exist"], key="bogus.col")`
+   constructs cleanly and silently. The only validation is
+   self-contained format checks (non-empty `cubes`, `cube.dim` shape).
+   `test_entity.py` admits "Catalog wiring lives in…" — but it lives
+   nowhere. M1 fixes this; until then the docstring should not promise
+   it.
+   *Closed 2026-06-15:* `Catalog._validate_entities`
+   (`packages/semql/src/semql/catalog.py:435`) wires the validation the
+   docstring promised.
+2. **Dead aspirational comment.** `Entity._check_grounding` says "The
+   Catalog wraps the entity in a copy-and-replace path when dedupe
+   matters for prompt hashing" — no such path exists, so keyword dedup
+   silently does not happen for entities.
+3. **Already in the public `__all__`.** `Entity` is a v1 surface
+   commitment before it does anything; when M1 lands it gains
+   catalog-validation semantics — a behaviour change on an exported
+   type. Acceptable pre-v1, but note it in the API-break log.
+
+### A.3 Feasibility: the substrate already exists
+
+The design is buildable as written because it leans on primitives that
+already work:
+
+- **Row reads** lower to `ungrouped=True` `LogicalPlan` — implemented
+  in `logical.py` (confirms D8).
+- **Scope injection** (the bypass-proof part) is exactly
+  `_CompileEnv.wrap_for_tenancy` in `compile.py` — reusable verbatim
+  for entity reads and mutation WHEREs.
+- **Per-entity MCP tools** clone the existing `_make_query_cube_tool`
+  pattern in `semql-mcp`.
+- The bind-parameter discipline (`_CompileEnv.bind`) for never-inline
+  values already exists.
+
+### A.4 Design concerns to resolve before building
+
+The design is security-first and largely excellent (four independent
+opt-in gates, PK-default + predicate opt-in, pinned ctx values, custom-
+backend structured-scope refusal, preview/confirm in the recipe, no
+distributed transactions). Open concerns:
+
+1. **Wire the post-compile statement-shape guard — and invoke it.**
+   `safe.py:is_read_only_statement` ships today but is *never called*
+   on the read path. The mutation compiler needs the analogous guard
+   (assert the DML is exactly one INSERT/UPDATE/DELETE, WHERE present
+   for update/delete) and it must actually be invoked, not just
+   defined. The "exactly one of pk/where" rule (§5) already prevents
+   WHERE-less DML structurally — keep it; belt-and-braces it.
+2. **Bind, never inline — as a hard, tested invariant.** This codebase
+   already inlines filter values as SQL literals in `federate.py`
+   (`_lit`, quote-doubling only). The `RowPlan` / mutation path must
+   route every value through bound parameters. §5 says "parameterised
+   DML"; make it an asserted, tested invariant given the contrary
+   precedent.
+3. **INSERT scope cannot use a WHERE.** A scoped/tenancy cube must
+   *force-pin* its discriminator column on INSERT, or an INSERT can
+   write a row the viewer cannot read back. `pinned_values` is the
+   mechanism; add the rule "scoped/tenancy target cube ⇒ discriminator
+   must be pinned on insert" as a construction/compile **refusal**.
+4. **Preview/confirm TOCTOU.** With no server-side token (v1, §11),
+   `confirm=true` recompiles and may affect a different row set than
+   the previewed count approved. Return the *actual* affected count
+   (driver rowcount / `RETURNING`) and surface a mismatch; document the
+   window loudly.
+5. **Cap LLM-driven predicate mutations.** Predicate-targeted
+   UPDATE/DELETE is the single most dangerous op in the library. Add a
+   max-affected-rows cap (refuse when preview exceeds a threshold unless
+   explicitly raised), on top of the existing gates.
+6. **Mutations must invalidate the analytic read cache.** The
+   `semql-engine` cache keys on SQL+params with no table-level
+   invalidation; after a write, stale aggregates persist. §7 (Cache)
+   should cover post-write invalidation of overlapping read-cache
+   entries.
+7. **Loose ends.** `EntityList.limit` is "capped by catalog policy" but
+   no such field exists (define `max_list_limit` or similar);
+   `Op` / `CtxRef` / `FieldType` are new types to add; multi-cube fetch
+   flattening must reject one-to-many spans (reuse `compile.py`'s
+   `_check_fan_out`) or a "fetch one" returns duplicate rows.
+
+### A.5 "No second library" goal — met
+
+Read/write *compile* sits in `semql` (core), execution in
+`semql-engine`, tools in `semql-mcp`. A user wanting MCP writes installs
+exactly the packages they already install for reads — no new
+dependency. The only philosophical strain is that mutations expand
+core's scope past "the SQL is the product / not an ORM"; `compile_mutation`
+as a pure `spec → DML + params` function is a legitimate primitive and
+fits, but call it out when touching PHILOSOPHY.md.
+
+### A.6 Recommended first step
+
+Build **M1 (model + Catalog wiring)** first: add `Catalog.entities`,
+validate refs at construction, add `MutableEntity` / `MutableField`,
+delete the dead grounding comment, and correct the `Entity` docstring.
+Small, self-contained, unblocks the rest, and fixes the stub's false
+validation claim (A.2).
