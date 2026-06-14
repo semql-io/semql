@@ -13,7 +13,14 @@ executor may consume the spec however it likes.
 v1 restrictions, refused with :class:`FederationError`:
 
 - Measures must live on a single "primary" backend partition. Dim
-  cubes on other backends contribute lookup attributes only.
+  cubes on other backends contribute lookup attributes only. The one
+  exception is cross-backend *symmetric aggregation*: two or more
+  additive (``sum`` / ``count``) measures on different backends that
+  all conform to one shared bridge cube and group by a bridge
+  dimension. Those pre-aggregate per fact on their own backend and
+  LEFT-join onto the bridge at the merge — fan-safe because each fact
+  reaches the grouping grain before the cross-fragment join (see
+  :func:`_detect_cross_backend_symmetric`).
 - Bridge joins between partitions must be equality on a single column
   pair, with both sides declared as ``Dimension``\\s on their cubes
   (the federation layer cannot project columns the catalog hasn't
@@ -1550,6 +1557,259 @@ def _compile_raw_rows(
     )
 
 
+# ---------------------------------------------------------------------------
+# Cross-backend symmetric aggregation
+#
+# The federated twin of :func:`semql.logical._detect_symmetric_agg`. Two or
+# more additive-measure facts that conform to one shared bridge cube, but live
+# on *different* backends, can still be combined safely: pre-aggregate each
+# fact to the conformed key on its own backend, then LEFT-join the per-fact
+# results onto the bridge (the entity universe) at the merge. Because each
+# fact aggregates to the grouping grain *before* the cross-fragment join, there
+# is no fan-out — this is categorically different from the join-before-aggregate
+# chasm trap. Making the bridge the primary fragment keeps the merge to plain
+# LEFT joins with single-source dimensions, the shapes the renderer already
+# emits.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _SymmetricFact:
+    cube: Cube
+    key_dim: str  # dimension on the fact exposing its conformed key to the bridge
+    measure_refs: tuple[str, ...]  # qualified measure refs owned by this fact
+
+
+@dataclass(frozen=True)
+class _CrossBackendSymmetric:
+    bridge: Cube
+    bridge_key_dim: str  # dimension on the bridge exposing the conformed key
+    facts: tuple[_SymmetricFact, ...]
+
+
+def _detect_cross_backend_symmetric(
+    q: SemanticQuery, catalog: dict[str, Cube], touched: list[Cube]
+) -> _CrossBackendSymmetric | None:
+    """Recognise the cross-backend symmetric shape, or ``None`` to fall back
+    to the ``measures_span_backends`` refusal.
+
+    Conservative on purpose — mirrors the single-backend detector: two or more
+    fact cubes each carrying an additive (``sum`` / ``count``) measure, all the
+    *many* side of a join to one shared bridge cube that is the only non-fact
+    touched cube; every projected dimension on the bridge; conformed keys are
+    simple ``{a}.col = {b}.col`` equality on the same bridge column; no time
+    breakdown, where-tree, derived measures, segments, having, compare, or
+    ungrouped. Anything outside that stays a refusal so the emit path never
+    sees a half-supported query."""
+    if (
+        q.ungrouped
+        or q.where is not None
+        or q.derived_measures
+        or q.segments
+        or q.having
+        or q.compare is not None
+        or q.time_dimension is not None
+    ):
+        return None
+    if not q.measures:
+        return None
+    # Require a grouping dimension on the bridge. Without one the bridge isn't
+    # even referenced (so it never enters ``touched``), and pure cross-backend
+    # totals are two independent scalar aggregates — a simpler plan than this
+    # symmetric one. Refuse that here; it can grow its own path later.
+    if not q.dimensions:
+        return None
+
+    fact_order: list[str] = []
+    fact_by_name: dict[str, Cube] = {}
+    measures_by_fact: dict[str, list[str]] = {}
+    for ref in q.measures:
+        owner = _resolve_field_to_cube(ref, catalog)
+        m_name = ref.rsplit(".", 1)[1]
+        m = next((x for x in owner.measures if x.name == m_name), None)
+        if m is None or m.agg not in ("sum", "count"):
+            return None
+        if owner.name not in fact_by_name:
+            fact_by_name[owner.name] = owner
+            fact_order.append(owner.name)
+        measures_by_fact.setdefault(owner.name, []).append(ref)
+    if len(fact_order) < 2:
+        return None
+    # Must genuinely span backends — otherwise a non-federated path applies.
+    if len({fact_by_name[n].dialect for n in fact_order}) < 2:
+        return None
+
+    # Shared many-side parent (the bridge), from declared joins among touched
+    # cubes — same basis as the chasm-trap guard.
+    in_scope = {c.name for c in touched}
+    parents: dict[str, set[str]] = {}
+    join_by_pair: dict[tuple[str, str], Join] = {}
+    for cube in touched:
+        for j in cube.joins:
+            if j.to not in in_scope:
+                continue
+            join_by_pair[(cube.name, j.to)] = j
+            if j.relationship == "many_to_one":
+                parents.setdefault(cube.name, set()).add(j.to)
+            elif j.relationship == "one_to_many":
+                parents.setdefault(j.to, set()).add(cube.name)
+    shared = set(parents.get(fact_order[0], set()))
+    for name in fact_order[1:]:
+        shared &= parents.get(name, set())
+    shared -= set(fact_order)
+    if len(shared) != 1:
+        return None
+    bridge_name = next(iter(shared))
+    if bridge_name not in catalog:
+        return None
+    bridge = catalog[bridge_name]
+    # The bridge must be the only non-fact touched cube.
+    if {c.name for c in touched} != set(fact_order) | {bridge_name}:
+        return None
+    # Every projected dimension must live on the bridge.
+    for ref in q.dimensions:
+        if _resolve_field_to_cube(ref, catalog).name != bridge_name:
+            return None
+
+    facts: list[_SymmetricFact] = []
+    bridge_key_dims: set[str] = set()
+    for name in fact_order:
+        fact_cube = fact_by_name[name]
+        fwd = join_by_pair.get((name, bridge_name))
+        rev = join_by_pair.get((bridge_name, name))
+        # _parse_bridge validates simple equality + key-type compatibility. A
+        # non-simple join means the shape isn't eligible (fall back to the
+        # generic refusal); a real type-coercion hazard is worth surfacing.
+        try:
+            if fwd is not None:
+                br = _parse_bridge(fact_cube, bridge, fwd)
+                fact_dim, bridge_dim = br.left_dim, br.right_dim
+            elif rev is not None:
+                br = _parse_bridge(bridge, fact_cube, rev)
+                fact_dim, bridge_dim = br.right_dim, br.left_dim
+            else:
+                return None
+        except FederationError as exc:
+            if exc.reason == "cross_cube_type_coercion":
+                raise
+            return None
+        bridge_key_dims.add(bridge_dim)
+        facts.append(
+            _SymmetricFact(
+                cube=fact_cube, key_dim=fact_dim, measure_refs=tuple(measures_by_fact[name])
+            )
+        )
+    # All facts must conform on the same bridge column.
+    if len(bridge_key_dims) != 1:
+        return None
+    return _CrossBackendSymmetric(
+        bridge=bridge, bridge_key_dim=bridge_key_dims.pop(), facts=tuple(facts)
+    )
+
+
+def _compile_cross_backend_symmetric(
+    q: SemanticQuery,
+    sym: _CrossBackendSymmetric,
+    *,
+    context: dict[str, str] | None,
+    group_by_alias: bool,
+    having_alias: bool,
+    dialects: dict[Dialect, DialectStrategy] | None,
+    views: dict[str, View] | None,
+    viewer: AuthContext | None,
+    policy: PolicyFn | None,
+    scope_fns: dict[str, ScopeFn] | None,
+) -> FederatedPlan:
+    """Emit the cross-backend symmetric plan: a bridge fragment (the entity
+    universe + the requested dimensions) plus one pre-aggregated fragment per
+    fact, LEFT-joined to the bridge on the conformed key at the merge."""
+
+    def _compile(sub: SemanticQuery, cubes: list[Cube]) -> CompiledQuery:
+        return compile_query(
+            sub,
+            _scoped_catalog(cubes),
+            context=context,
+            group_by_alias=group_by_alias,
+            having_alias=having_alias,
+            dialects=dialects,
+            views=views,
+            viewer=viewer,
+            policy=policy,
+            scope_fns=scope_fns,
+        )
+
+    # Fragment 0 (primary): the bridge, projecting requested dims + the
+    # conformed key (needed for the join, not necessarily output).
+    bridge_key_ref = f"{sym.bridge.name}.{sym.bridge_key_dim}"
+    bridge_dims = list(q.dimensions)
+    if bridge_key_ref not in bridge_dims:
+        bridge_dims.append(bridge_key_ref)
+    bridge_frag = _compile(SemanticQuery(measures=[], dimensions=bridge_dims), [sym.bridge])
+    fragments: list[CompiledQuery] = [bridge_frag]
+
+    bridges: list[BridgeJoin] = []
+    measure_outputs: list[MeasureOutput] = []
+    for idx, fact in enumerate(sym.facts, start=1):
+        fact_key_ref = f"{fact.cube.name}.{fact.key_dim}"
+        frag = _compile(
+            SemanticQuery(measures=list(fact.measure_refs), dimensions=[fact_key_ref]),
+            [fact.cube],
+        )
+        fragments.append(frag)
+        bridges.append(
+            BridgeJoin(
+                left=FragmentColumn(0, sym.bridge_key_dim),
+                right=FragmentColumn(idx, fact.key_dim),
+            )
+        )
+        for ref in fact.measure_refs:
+            m_name = ref.rsplit(".", 1)[1]
+            meta = next(m for m in frag.column_meta if m.name == m_name)
+            # Each fragment already aggregated to the conformed key; the merge
+            # sums per group (identity when grouping by the key, a real fold
+            # when grouping by a coarser bridge dimension). ``count`` reduces
+            # to a sum-of-counts, exactly as the distributive path does.
+            measure_outputs.append(
+                MeasureOutput(
+                    output_name=m_name,
+                    merge_agg="sum",
+                    source=FragmentColumn(idx, m_name),
+                    column_meta=meta,
+                )
+            )
+
+    dimension_outputs: list[DimensionOutput] = []
+    for ref in q.dimensions:
+        alias = ref.rsplit(".", 1)[1]
+        meta = next(m for m in bridge_frag.column_meta if m.name == alias)
+        dimension_outputs.append(
+            DimensionOutput(output_name=alias, sources=[FragmentColumn(0, alias)], column_meta=meta)
+        )
+
+    merge_spec = MergeSpec(
+        primary_index=0,
+        bridges=bridges,
+        dimensions=dimension_outputs,
+        measures=measure_outputs,
+        having=[],
+        order_by=list(q.order),
+        limit=q.limit,
+        offset=q.offset,
+        mode="distributive",
+        cross_partition_clauses=(),
+    )
+    output_columns = [d.output_name for d in dimension_outputs]
+    output_columns += [m.output_name for m in measure_outputs]
+    output_column_meta = [d.column_meta for d in dimension_outputs]
+    output_column_meta += [m.column_meta for m in measure_outputs]
+    return FederatedPlan(
+        fragments=fragments,
+        merge_spec=merge_spec,
+        columns=output_columns,
+        column_meta=output_column_meta,
+    )
+
+
 def compile_federated_query(
     q: SemanticQuery,
     catalog: dict[str, Cube],
@@ -1628,9 +1888,29 @@ def compile_federated_query(
 
     if q.measures:
         primary_partition = _resolve_field_to_cube(q.measures[0], catalog).dialect
-        for ref in q.measures[1:]:
-            if _resolve_field_to_cube(ref, catalog).dialect is not primary_partition:
-                raise FederationError("Measures span backends.", reason="measures_span_backends")
+        measures_span = any(
+            _resolve_field_to_cube(ref, catalog).dialect is not primary_partition
+            for ref in q.measures[1:]
+        )
+        if measures_span:
+            # Cross-backend additive measures conforming to one shared bridge
+            # are fan-safe — pre-aggregate per fact, then LEFT-join onto the
+            # bridge. Anything else still refuses.
+            sym = _detect_cross_backend_symmetric(q, catalog, touched)
+            if sym is not None:
+                return _compile_cross_backend_symmetric(
+                    q,
+                    sym,
+                    context=context,
+                    group_by_alias=group_by_alias,
+                    having_alias=having_alias,
+                    dialects=dialects,
+                    views=views,
+                    viewer=viewer,
+                    policy=policy,
+                    scope_fns=scope_fns,
+                )
+            raise FederationError("Measures span backends.", reason="measures_span_backends")
     else:
         primary_partition = touched[0].dialect
 

@@ -842,3 +842,133 @@ def test_raw_rows_fragment_is_ungrouped_with_large_limit_ok() -> None:
     plan = compile_federated_query(q, catalog, mode="raw_rows")
     # Fragment sql has no LIMIT clause — raw-row mode releases the cap.
     assert "LIMIT" not in plan.fragments[0].sql.upper()
+
+
+# ---------------------------------------------------------------------------
+# Cross-backend symmetric aggregation: two additive-measure facts on
+# different backends, conformed to one shared bridge cube.
+# ---------------------------------------------------------------------------
+
+
+def _activity_fact(dialect: Dialect = Dialect.POSTGRES) -> Cube:
+    return Cube(
+        name="activity",
+        dialect=dialect,
+        table="activity",
+        alias="a",
+        primary_key="id",
+        measures=[
+            Measure(name="active_secs", sql="{a}.secs", agg="sum", unit="duration"),
+            Measure(name="avg_secs", sql="{a}.secs", agg="avg", unit="duration"),
+        ],
+        dimensions=[
+            Dimension(name="id", sql="{a}.id", type="number"),
+            Dimension(
+                name="employee_id", sql="{a}.employee_id", type="number", foreign_key="employees"
+            ),
+        ],
+        joins=[Join(to="employees", relationship="many_to_one", on="{a}.employee_id = {e}.id")],
+    )
+
+
+def _worklog_fact(dialect: Dialect = Dialect.BIGQUERY) -> Cube:
+    return Cube(
+        name="worklog",
+        dialect=dialect,
+        table="worklog",
+        alias="w",
+        primary_key="id",
+        measures=[Measure(name="hours", sql="{w}.hours", agg="sum", unit="duration")],
+        dimensions=[
+            Dimension(name="id", sql="{w}.id", type="number"),
+            Dimension(
+                name="employee_id", sql="{w}.employee_id", type="number", foreign_key="employees"
+            ),
+        ],
+        joins=[Join(to="employees", relationship="many_to_one", on="{w}.employee_id = {e}.id")],
+    )
+
+
+def _employees_bridge(dialect: Dialect = Dialect.POSTGRES) -> Cube:
+    return Cube(
+        name="employees",
+        dialect=dialect,
+        table="employees",
+        alias="e",
+        primary_key="id",
+        dimensions=[
+            Dimension(name="id", sql="{e}.id", type="number"),
+            Dimension(name="name", sql="{e}.name", type="string"),
+        ],
+    )
+
+
+def _symmetric_catalog() -> dict[str, Cube]:
+    return _catalog(_activity_fact(), _worklog_fact(), _employees_bridge())
+
+
+def test_cross_backend_symmetric_compiles_to_bridge_plus_facts() -> None:
+    """Two additive measures on two backends, conformed to one bridge,
+    grouped by a bridge dimension — emits a bridge-primary plan with each
+    fact LEFT-joined on the conformed key (no measures_span refusal)."""
+    plan = compile_federated_query(
+        SemanticQuery(
+            measures=["activity.active_secs", "worklog.hours"],
+            dimensions=["employees.name"],
+        ),
+        _symmetric_catalog(),
+    )
+    assert isinstance(plan, FederatedPlan)
+    assert len(plan.fragments) == 3  # bridge + 2 facts
+    spec = plan.merge_spec
+    assert spec.primary_index == 0  # bridge is the FROM target
+    # One LEFT join per fact, both anchored on the bridge fragment.
+    assert len(spec.bridges) == 2
+    assert all(b.left.fragment_index == 0 and b.join_kind == "left" for b in spec.bridges)
+    assert {b.right.fragment_index for b in spec.bridges} == {1, 2}
+    # Both measures re-aggregate with SUM (sum-of-sums / sum-of-counts).
+    assert [m.merge_agg for m in spec.measures] == ["sum", "sum"]
+    assert [m.output_name for m in spec.measures] == ["active_secs", "hours"]
+    # Dimension comes from the bridge fragment only.
+    assert [d.output_name for d in spec.dimensions] == ["name"]
+    assert spec.dimensions[0].sources == [plan.merge_spec.dimensions[0].sources[0]]
+    assert plan.columns == ["name", "active_secs", "hours"]
+
+
+def test_cross_backend_symmetric_requires_a_bridge_dimension() -> None:
+    """No grouping dimension: v1 refuses (the bridge isn't referenced, and
+    pure cross-backend totals are a separate, simpler plan)."""
+    with pytest.raises(FederationError) as exc:
+        compile_federated_query(
+            SemanticQuery(measures=["activity.active_secs", "worklog.hours"]),
+            _symmetric_catalog(),
+        )
+    assert exc.value.reason == "measures_span_backends"
+
+
+def test_cross_backend_symmetric_avg_falls_back_to_refusal() -> None:
+    """Non-additive measure (avg) is out of the conservative shape — the
+    generic measures_span refusal still fires."""
+    with pytest.raises(FederationError) as exc:
+        compile_federated_query(
+            SemanticQuery(
+                measures=["activity.avg_secs", "worklog.hours"],
+                dimensions=["employees.name"],
+            ),
+            _symmetric_catalog(),
+        )
+    assert exc.value.reason == "measures_span_backends"
+
+
+def test_cross_backend_symmetric_non_bridge_dimension_refuses() -> None:
+    """A dimension on a fact (not the shared bridge) changes the grain the
+    emit path doesn't model — refuse rather than risk a wrong shape."""
+    with pytest.raises(FederationError) as exc:
+        compile_federated_query(
+            SemanticQuery(
+                measures=["activity.active_secs", "worklog.hours"],
+                dimensions=["activity.employee_id"],
+            ),
+            _symmetric_catalog(),
+        )
+    assert exc.value.reason == "measures_span_backends"
