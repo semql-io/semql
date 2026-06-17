@@ -235,7 +235,7 @@ unique/high-distinct ≈ few keys; otherwise a configurable default. This is a
 never correctness (semi-join and bridge-merge return identical rows; only ATTACH
 changes agg capability).
 
-### Resolution split & disambiguation contract (resolved)
+### Resolution split & disambiguation contract (resolved — SHIPPED in `semql/lookups.py`)
 
 Resolution (human phrase → canonical key) is **I/O** (a `loader` or reference-table
 query), so it stays at the edge — never in the sans-io compiler. There is already a
@@ -260,6 +260,14 @@ Two clean stages:
 2. **Auto-Planner stage** (`autoplan.py`, sans-io). Receives a query whose
    cross-source filters already hold canonical values; decides strategy + injects
    SemiJoins. Never does I/O — preserving the compiler invariant.
+
+**Shipped** as `ResolutionOutcome` / `resolve_outcome` (per-phrase classifier) +
+`QueryResolution` / `resolve_query_filters` (query-level splice, atomic per
+filter, `.blocked` / `.ok`) in `semql/lookups.py`, exported from `semql`.
+Pipeline: `Catalog → resolve_query_filters → autoplan(res.query,
+catalog.as_dict(), lookups=catalog.lookups)`. Covers membership ops
+(eq/neq/in/not_in) on Lookup-backed dims; `q.where` out of scope. **Not yet
+wired** into the MCP server / prompt pipeline (callers invoke it explicitly).
 
 **Scope for P1:** the planner auto-resolves only **Lookup-backed** dimensions to
 keys via this contract. Open-text dims with no `Lookup` (e.g. `customers.name`)
