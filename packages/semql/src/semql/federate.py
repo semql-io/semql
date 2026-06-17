@@ -90,7 +90,12 @@ class FragmentColumn:
 class BridgeJoin:
     left: FragmentColumn
     right: FragmentColumn
-    join_kind: Literal["left", "full_outer"] = "left"
+    # ``left`` preserves all host rows (the foreign side is a pure lookup that
+    # only contributes attributes). ``inner`` *restricts* the host to rows with
+    # a match — required when the foreign side carries a filter, so non-matching
+    # facts are dropped instead of leaking through (Gap C). ``full_outer`` is
+    # reserved for symmetric aggregation.
+    join_kind: Literal["left", "inner", "full_outer"] = "left"
 
 
 @dataclass(frozen=True)
@@ -719,13 +724,19 @@ def _build_merge_joins(
     partitions: Sequence[_MergePartition],
     bridges: list[_Bridge],
     primary_idx: int,
+    restricting_cubes: frozenset[str] = frozenset(),
 ) -> list[BridgeJoin]:
-    """Resolve the bridge graph into an ordered list of LEFT JOINs.
+    """Resolve the bridge graph into an ordered list of merge joins.
 
     BFS out from the primary partition so each :class:`BridgeJoin` has
     its ``left`` (host) side already joined when the ``right`` (new) side
     is added — the renderer joins them in this order. Raises if the
     partitions don't form a connected graph.
+
+    A bridge onto a partition that owns a cube in ``restricting_cubes`` is an
+    ``inner`` join: that partition's fragment carries a filter, so it holds only
+    matching keys and the host must be restricted to them (Gap C). Otherwise the
+    join is ``left`` — a pure attribute lookup that preserves host rows.
     """
     cube_to_idx = {c.name: i for i, p in enumerate(partitions) for c in p.cubes}
     bridge_joins: list[BridgeJoin] = []
@@ -751,10 +762,12 @@ def _build_merge_joins(
                 n_cube, n_dim = b.left_cube.name, b.left_dim
             host_col = partitions[host_idx].bridge_columns[f"{h_cube}.{h_dim}"]
             new_col = partitions[new_idx].bridge_columns[f"{n_cube}.{n_dim}"]
+            new_is_restricting = any(c.name in restricting_cubes for c in partitions[new_idx].cubes)
             bridge_joins.append(
                 BridgeJoin(
                     left=FragmentColumn(host_idx, host_col),
                     right=FragmentColumn(new_idx, new_col),
+                    join_kind="inner" if new_is_restricting else "left",
                 )
             )
             joined.add(new_idx)
@@ -823,7 +836,12 @@ def _build_merge_spec(
             )
         )
 
-    bridge_joins = _build_merge_joins(partitions, bridges, primary_idx)
+    # A foreign partition that carries a flat (pure-AND) filter on one of its
+    # cubes must INNER-JOIN at the merge so non-matching host rows are dropped
+    # (Gap C). Scoped to ``q.filters`` only — ``q.where`` may carry OR/NOT whose
+    # cross-partition rows are handled by the merge WHERE, not a join promotion.
+    restricting_cubes = frozenset(f.dimension.split(".", 1)[0] for f in q.filters)
+    bridge_joins = _build_merge_joins(partitions, bridges, primary_idx, restricting_cubes)
     resolved_cross = _resolve_cross_clauses(cross_partition_clauses or [], cube_to_idx)
 
     # HAVING refusal (compile-time): every HAVING target must be one of

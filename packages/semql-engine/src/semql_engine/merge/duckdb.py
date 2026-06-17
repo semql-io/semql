@@ -196,7 +196,9 @@ def render_merge_sql(spec: MergeSpec) -> tuple[str, dict[str, object]]:
     """Render ``spec`` into ``(duckdb_sql, params)``.
 
     Fragments are aliased ``f0``, ``f1``, …; the primary fragment is the
-    FROM target and bridges become ordered LEFT JOINs. The SELECT list is
+    FROM target and bridges become ordered joins, each honouring its
+    ``join_kind`` (``left`` lookup, ``inner`` filter-restriction). The SELECT
+    list is
     dimensions (the time bucket among them), then measures — so the
     positional GROUP BY lines up. An all-passthrough spec (the degenerate
     single-backend plan) renders as a plain projection with no GROUP BY.
@@ -212,12 +214,13 @@ def render_merge_sql(spec: MergeSpec) -> tuple[str, dict[str, object]]:
     select = exp.select(*select_list).from_(
         exp.alias_(exp.to_table(f"frag_{primary}"), f"f{primary}")
     )
+    join_type_for = {"left": "LEFT", "inner": "INNER", "full_outer": "FULL OUTER"}
     for b in spec.bridges:
         new_idx = b.right.fragment_index
         select = select.join(
             exp.alias_(exp.to_table(f"frag_{new_idx}"), f"f{new_idx}"),
             on=exp.EQ(this=_frag_col(b.left), expression=_frag_col(b.right)),
-            join_type="LEFT",
+            join_type=join_type_for[getattr(b, "join_kind", "left")],
         )
 
     for clause in spec.cross_partition_clauses:
