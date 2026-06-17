@@ -277,10 +277,14 @@ hand-author a SemiJoin). Every large-IN fallback `log`s the key count.
 
 ## Phasing
 
-1. **P1** — filter-only → semi-join injection; selectivity = "Lookup-exact, else
-   always semi-join." Solves the motivating question end-to-end.
-2. **P2** — cost-based `semi_join` ↔ `bridge_merge` choice via size_hint +
-   selectivity.
+1. **P1 — SHIPPED** (`semql/autoplan.py`). Filter-only → semi-join injection;
+   always semi-join. Solves the motivating question end-to-end. Surfaced + fixed
+   the federation `LEFT JOIN` "Gap C" so bridge-merge agrees with semi-join.
+2. **P2 — SHIPPED.** Cost-based `semi_join` ↔ `bridge_merge` via the operator +
+   `size_hint` heuristic: non-distributive measure → semi_join; selective filter
+   (eq/in or Lookup-backed) → semi_join; broad filter with `size_hint >
+   semi_join_max` → bridge_merge; else semi_join. `semi_join_max` defaults to
+   10 000, overridable per call. Records a `CrossSourceDecision` per foreign cube.
 3. **P3** — `attach` strategy + engine capability flag (Option G).
 
 ## Tests (Red/Green)
