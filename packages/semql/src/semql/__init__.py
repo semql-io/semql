@@ -77,7 +77,15 @@ from semql.logical import (
     partition_scans,
     to_logical_plan,
 )
-from semql.lookups import enrich_all, enrich_result, sql_enricher
+from semql.lookups import (
+    QueryResolution,
+    ResolutionOutcome,
+    enrich_all,
+    enrich_result,
+    resolve_outcome,
+    resolve_query_filters,
+    sql_enricher,
+)
 from semql.lookups import materialize as materialize_lookup
 from semql.lookups import resolve as resolve_lookup
 from semql.model import (
@@ -369,6 +377,10 @@ __all__ = [
     "enrich_result",
     "sql_enricher",
     "materialize_lookup",
+    "QueryResolution",
+    "ResolutionOutcome",
+    "resolve_outcome",
+    "resolve_query_filters",
     "lint_catalog",
     "parse_instant",
     "LintFinding",

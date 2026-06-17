@@ -28,6 +28,7 @@ from semql.catalog import Catalog
 from semql.model import Lookup, MultiFieldEnricher, ResolutionContext
 from semql.refs import field_of
 from semql.safe import is_safe_sql_identifier
+from semql.spec import Filter, FilterOp, SemanticQuery
 
 # ---------------------------------------------------------------------------
 # Materialization — turn a Lookup into a concrete (values, labels) tuple
@@ -133,6 +134,146 @@ def resolve(
     # candidates for completely unrelated queries.
     candidates = sorted(scored, key=lambda s: s[0], reverse=True)
     return [v for score, v in candidates if score >= 0.5][:max_candidates]
+
+
+# ---------------------------------------------------------------------------
+# Resolution stage — free-text filter phrases -> canonical keys, typed
+# ---------------------------------------------------------------------------
+
+# Operators whose values are membership keys worth canonicalizing. ``contains``
+# / ``gt`` / ``lt`` carry patterns or bounds, not values to resolve; ``is_null``
+# / ``not_null`` carry none.
+_RESOLVABLE_OPS: frozenset[FilterOp] = frozenset({"eq", "neq", "in", "not_in"})
+
+
+@dataclass(frozen=True)
+class ResolutionOutcome:
+    """The result of resolving one free-text value against a dimension's Lookup.
+
+    ``status`` classifies :func:`resolve` output: ``resolved`` (exactly one
+    canonical hit — splice it), ``ambiguous`` (several; a structured refusal
+    carrying the candidates so the caller / LLM re-issues), or ``unresolved``
+    (none). Never an exception — a blocked outcome loses no data."""
+
+    dimension: str
+    query: str
+    status: Literal["resolved", "ambiguous", "unresolved"]
+    values: tuple[str, ...] = ()
+    labels: dict[str, str] | None = None
+
+    @property
+    def resolved(self) -> bool:
+        return self.status == "resolved"
+
+    @property
+    def value(self) -> str:
+        """The single canonical value; only valid when ``resolved``."""
+        if self.status != "resolved":
+            raise ValueError(
+                f"ResolutionOutcome for {self.dimension!r}={self.query!r} is "
+                f"{self.status!r}, not resolved; inspect ``values`` instead."
+            )
+        return self.values[0]
+
+
+def _labels_for(
+    catalog: Catalog, dimension: str, values: list[str], ctx: ResolutionContext | None
+) -> dict[str, str] | None:
+    """Human labels for ``values``, drawn from the lookup's label map (subset to
+    the candidates). ``None`` when the lookup carries no labels."""
+    materialized = materialize(catalog.lookups[dimension], ctx)
+    if materialized is None:
+        return None
+    _, labels = materialized
+    if not labels:
+        return None
+    sub = {v: labels[v] for v in values if v in labels}
+    return sub or None
+
+
+def resolve_outcome(
+    catalog: Catalog,
+    dimension: str,
+    query: str,
+    *,
+    ctx: ResolutionContext | None = None,
+    max_candidates: int = 5,
+) -> ResolutionOutcome:
+    """Resolve a free-text ``query`` against ``dimension`` into a typed outcome.
+
+    Wraps :func:`resolve`: zero hits -> ``unresolved``; exactly one ->
+    ``resolved``; several -> ``ambiguous`` (the ranked candidates). Raises
+    ``KeyError`` when ``dimension`` has no registered ``Lookup`` (same contract
+    as :func:`resolve`)."""
+    candidates = resolve(catalog, dimension, query, ctx=ctx, max_candidates=max_candidates)
+    if not candidates:
+        return ResolutionOutcome(dimension, query, "unresolved")
+    labels = _labels_for(catalog, dimension, candidates, ctx)
+    status: Literal["resolved", "ambiguous"] = "resolved" if len(candidates) == 1 else "ambiguous"
+    return ResolutionOutcome(dimension, query, status, tuple(candidates), labels)
+
+
+@dataclass(frozen=True)
+class QueryResolution:
+    """A query whose lookup-backed filter values have been canonicalized where
+    possible, plus every :class:`ResolutionOutcome` attempted.
+
+    ``query`` has resolved values spliced in; any filter with an ambiguous /
+    unresolved value is left exactly as the caller wrote it (see ``blocked``).
+    Feed ``query`` to :func:`semql.autoplan.autoplan` only when ``ok``."""
+
+    query: SemanticQuery
+    outcomes: tuple[ResolutionOutcome, ...] = ()
+
+    @property
+    def blocked(self) -> tuple[ResolutionOutcome, ...]:
+        return tuple(o for o in self.outcomes if not o.resolved)
+
+    @property
+    def ok(self) -> bool:
+        return not self.blocked
+
+
+def resolve_query_filters(
+    q: SemanticQuery,
+    catalog: Catalog,
+    *,
+    ctx: ResolutionContext | None = None,
+    max_candidates: int = 5,
+) -> QueryResolution:
+    """Canonicalize every free-text membership filter on a Lookup-backed
+    dimension (the sans-io compiler / Auto-Planner then sees canonical values).
+
+    A filter resolves *atomically*: only when every one of its values resolves
+    to a single canonical key is it spliced; if any value is ambiguous or
+    unresolved the filter is left verbatim and the blocking outcomes are
+    reported via ``blocked``. Non-string values, non-membership ops, and
+    dimensions without a registered ``Lookup`` pass through untouched. The
+    boolean ``q.where`` tree is out of scope (kept as-is)."""
+    outcomes: list[ResolutionOutcome] = []
+    new_filters: list[Filter] = []
+    for f in q.filters:
+        if f.dimension not in catalog.lookups or f.op not in _RESOLVABLE_OPS:
+            new_filters.append(f)
+            continue
+        resolved_values: list[str | int | float | bool] = []
+        blocked = False
+        for v in f.values:
+            if not isinstance(v, str):
+                resolved_values.append(v)
+                continue
+            outcome = resolve_outcome(
+                catalog, f.dimension, v, ctx=ctx, max_candidates=max_candidates
+            )
+            outcomes.append(outcome)
+            if outcome.resolved:
+                resolved_values.append(outcome.value)
+            else:
+                blocked = True
+        new_filters.append(f if blocked else f.model_copy(update={"values": resolved_values}))
+    return QueryResolution(
+        query=q.model_copy(update={"filters": new_filters}), outcomes=tuple(outcomes)
+    )
 
 
 def enrich_result(
@@ -328,4 +469,14 @@ def sql_enricher(
     )
 
 
-__all__ = ["enrich_all", "enrich_result", "materialize", "resolve", "sql_enricher"]
+__all__ = [
+    "QueryResolution",
+    "ResolutionOutcome",
+    "enrich_all",
+    "enrich_result",
+    "materialize",
+    "resolve",
+    "resolve_outcome",
+    "resolve_query_filters",
+    "sql_enricher",
+]
