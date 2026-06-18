@@ -79,7 +79,7 @@ Always registered:
 | `query_semantic(spec, context?)` | Compile a SemanticQuery; return `{dialect, sql, params, columns}`. |
 | `validate(spec)` | Collect-all static validation; returns `list[ValidationError]`. Empty when the query would compile cleanly. |
 | `explain(spec, context?)` | Compile and return just the SQL string. |
-| `catalog_prompt(only_exposed=True, include_introspection=False)` | Render the planner prompt fragment for the catalog. |
+| `catalog_prompt(include_introspection=False)` | Render the planner prompt fragment, scoped to the resolved viewer's authorized surface. |
 
 Registered when `executor` is supplied:
 
@@ -118,6 +118,26 @@ Multi-cube queries (joins across cubes) still go through
 `query_semantic` — the per-cube tools are scoped to a single cube by
 construction. When `executor` is configured, the per-cube tools
 return rows too.
+
+## Authorization and metadata disclosure
+
+Per-call execution is authorized and fails closed. Pass a `viewer_provider`
+and every tool — `query_*`, `validate`, `catalog_prompt`, lookup, and entity
+tools — resolves the viewer and refuses cubes, fields, lookups, and saved
+queries it isn't allowed to see. An unauthorized call returns a structured
+error, never data or SQL.
+
+**Accepted limitation — tool *listing* is not viewer-filtered.** Tools are
+registered once when the server is constructed, before any client connects,
+so there is no request identity at registration time. A client that lists
+tools therefore sees the **names, descriptions, and field enums** of every
+role-gated cube, saved query, and entity in the catalog — including ones it
+cannot execute. This exposes catalog *structure* (names and shapes), never
+row data or SQL, and execution remains authorized. Treat tool names and
+descriptions as non-secret: don't encode confidential facts in
+cube / field / saved-query names if untrusted clients can list tools. To gate
+listing itself, run a per-tenant server (one catalog per trust boundary) or
+front it with a transport that filters the advertised tool set per connection.
 
 ## In-process testing
 
