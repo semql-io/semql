@@ -27,7 +27,8 @@ from typing import TYPE_CHECKING, Any
 
 from semql._resolve import ResolutionDiagnostic, walk_query_fields
 from semql.errors import closest_match
-from semql.model import Cube
+from semql.introspect import PolicyFn, viewer_sees
+from semql.model import AuthContext, Cube
 from semql.spec import SemanticQuery
 
 if TYPE_CHECKING:
@@ -99,13 +100,22 @@ def _to_validation_error(d: ResolutionDiagnostic) -> ValidationError:
 def validate(
     query: SemanticQuery,
     catalog: Catalog | dict[str, Cube],
+    *,
+    viewer: AuthContext | None = None,
+    policy: PolicyFn | None = None,
 ) -> list[ValidationError]:
     """Return every problem the static checker can find in ``query``.
 
     Returns ``[]`` for a query that ``compile_query`` would also accept.
     Never raises on input.
+
+    ``viewer`` / ``policy`` filter the catalog used for identifier
+    resolution so error messages don't enumerate cubes the viewer
+    can't access (SEMQL-RESOLVER-DIAGNOSTIC-HIDDEN-CATALOG-ENUMERATION).
     """
     cat = _catalog_dict(catalog)
+    if viewer is not None:
+        cat = {k: v for k, v in cat.items() if viewer_sees(v, viewer, policy)}
     errors: list[ValidationError] = []
 
     if not query.measures and not query.dimensions and query.time_dimension is None:

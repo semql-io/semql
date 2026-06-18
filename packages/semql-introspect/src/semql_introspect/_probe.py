@@ -11,9 +11,27 @@ touching the rest of the package.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any, Protocol
+
+_SAFE_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]*$")
+
+
+def _assert_safe_identifier(value: str, label: str) -> None:
+    """Raise ValueError if ``value`` is not a conservative SQL identifier.
+
+    Prevents SQL injection via information_schema string comparisons
+    (SEMQL-DISC-PROBE-SQLI-001). We validate rather than parameterise
+    because the DB-API parameterisation format varies by backend.
+    """
+    if not _SAFE_IDENT_RE.match(value):
+        raise ValueError(
+            f"Unsafe {label}: {value!r} contains characters that are not "
+            "allowed in an identifier. Only letters, digits, underscores, "
+            "and $ (after the first character) are permitted."
+        )
 
 
 @dataclass(frozen=True)
@@ -86,6 +104,7 @@ class InformationSchemaProbe:
         include_tables: Iterable[str] | None = None,
         exclude_tables: Iterable[str] | None = None,
     ) -> None:
+        _assert_safe_identifier(schema, "schema")
         self._conn = connection
         self._schema = schema
         self._include = set(include_tables) if include_tables else None
@@ -113,6 +132,7 @@ class InformationSchemaProbe:
         return out
 
     def _columns_for(self, table: str) -> tuple[ColumnInfo, ...]:
+        _assert_safe_identifier(table, "table")
         cur = self._conn.cursor()
         try:
             cur.execute(

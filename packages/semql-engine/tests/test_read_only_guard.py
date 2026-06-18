@@ -92,3 +92,30 @@ def test_engine_run_refuses_non_select_before_touching_adapter() -> None:
     with pytest.raises(EngineError):
         engine.run(_plan(_frag("TRUNCATE t")))
     assert calls == []  # adapter never touched
+
+
+def test_writable_cte_fragment_refused() -> None:
+    """SELECT root with writable CTE body must be rejected (SEMQL-READONLY-WRITABLE-CTE)."""
+    with pytest.raises(EngineError, match="read-only"):
+        _assert_fragments_read_only(
+            _plan(_frag("WITH d AS (DELETE FROM users RETURNING id) SELECT * FROM d"))
+        )
+
+
+# ---------------------------------------------------------------------------
+# _quote escapes embedded double-quotes (CAND-semql-engine-alias-ddl-injection)
+# ---------------------------------------------------------------------------
+
+
+def test_quote_escapes_embedded_double_quote() -> None:
+    from semql_engine.engine import _quote
+
+    safe = _quote('col"name')
+    # Must not produce a bare unescaped " that breaks out of the identifier.
+    assert safe == '"col""name"'
+
+
+def test_quote_ordinary_name_unchanged() -> None:
+    from semql_engine.engine import _quote
+
+    assert _quote("revenue") == '"revenue"'

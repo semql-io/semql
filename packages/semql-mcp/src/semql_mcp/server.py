@@ -1084,8 +1084,20 @@ def _make_saved_query_tool(
     def saved_query_fn(  # type: ignore[no-untyped-def]  # noqa: ANN202 — signature attached via __annotations__ below
         context=None,  # noqa: ANN001
     ):
+        viewer = resolve_viewer()
+        if sq.required_roles:
+            viewer_roles = viewer.roles if viewer is not None else []
+            if not any(r in viewer_roles for r in sq.required_roles):
+                return _error_payload(
+                    AuthError(
+                        f"Saved query {saved_name!r} requires role(s) "
+                        f"{sorted(sq.required_roles)!r}.",
+                        reason="forbidden",
+                    ),
+                    debug=debug,
+                )
         try:
-            compiled = catalog.compile(sq.query, context=context, viewer=resolve_viewer())
+            compiled = catalog.compile(sq.query, context=context, viewer=viewer)
         except Exception as exc:
             return _error_payload(exc, debug=debug)
         envelope: dict[str, Any] = {

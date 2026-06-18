@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING, Any
 
 from semql.hooks import CubePromptHook
 from semql.introspect import PolicyFn, iter_cubes, viewer_sees
-from semql.model import AuthContext, Cube, GlossaryEntry, Lookup, ResolutionContext, View
+from semql.model import AuthContext, BaseField, Cube, GlossaryEntry, Lookup, ResolutionContext, View
 
 if TYPE_CHECKING:
     from semql.retrieve import Retriever
@@ -236,6 +236,7 @@ def _render_cube_block(
     *,
     header: str,
     preamble: str,
+    viewer: AuthContext | None = None,
     cube_prompt_hooks: list[CubePromptHook] | None = None,
 ) -> str:
     """Render a list of cubes under a header, with optional preamble.
@@ -247,7 +248,7 @@ def _render_cube_block(
         return ""
     lines: list[str] = [header, preamble, ""]
     for cube in cubes:
-        lines.extend(_render_cube(cube, lookups_by_dim, ctx))
+        lines.extend(_render_cube(cube, lookups_by_dim, ctx, viewer))
         if cube_prompt_hooks:
             for hook in cube_prompt_hooks:
                 extra = hook(cube)
@@ -321,6 +322,7 @@ def render_catalog_block(
         ctx,
         header=header,
         preamble=preamble,
+        viewer=viewer,
         cube_prompt_hooks=cube_prompt_hooks,
     )
     # Domain Context (glossary + cross-cube relations) sits above the
@@ -513,6 +515,8 @@ def render_catalog_segments(
         ctx,
         header=header,
         preamble=preamble,
+        # static segment is viewer-invariant; field filtering for public cubes kept off
+        viewer=None,
         cube_prompt_hooks=cube_prompt_hooks,
     )
     # Domain context (glossary + cross-cube relations) is viewer-
@@ -540,6 +544,7 @@ def render_catalog_segments(
                     f"catalog above: {names}. Reference them the same "
                     "way (`cube.field`)."
                 ),
+                viewer=viewer,
                 cube_prompt_hooks=cube_prompt_hooks,
             )
 
@@ -580,7 +585,23 @@ class ToolDescriptionProjection:
         return out
 
 
-def render_tool_description(cube: Cube) -> str:
+def _field_visible_to(field: BaseField, viewer: AuthContext | None) -> bool:
+    """Return True if ``viewer`` may see this field.
+
+    Mirrors the compiler's ``_check_field_visibility`` logic:
+    - No required_roles → open to all.
+    - viewer=None → open (unauthed path; catalog tooling uses this).
+    - Otherwise the viewer must hold at least one listed role (ANY-match).
+    """
+    if viewer is None:
+        return True
+    required = field.required_roles
+    if not required:
+        return True
+    return any(r in viewer.roles for r in required)
+
+
+def render_tool_description(cube: Cube, *, viewer: AuthContext | None = None) -> str:
     """Render the MCP tool-description string for one cube.
 
     Matches the format ``semql_mcp._make_query_cube_tool`` uses for the
@@ -588,7 +609,10 @@ def render_tool_description(cube: Cube) -> str:
     default), then list measures (with unit annotations), dimensions,
     and time dimensions. Centralising the format here means the prompt
     projection and the MCP tool registration can't drift apart — both
-    call this function."""
+    call this function.
+
+    Pass ``viewer`` to filter out fields the viewer is not authorised to
+    see (SEMQL-PROMPT-FIELD-ROLES-001)."""
 
     def _measure_label(m: object) -> str:
         unit = getattr(m, "unit", None)
@@ -603,9 +627,9 @@ def render_tool_description(cube: Cube) -> str:
     head = cube.description or f"Query the {cube.name} cube."
     if cube.stability == "beta":
         head = f"[BETA] {head}"
-    measure_labels = [_measure_label(m) for m in cube.measures]
-    dim_names = [d.name for d in cube.dimensions]
-    td_names = [td.name for td in cube.time_dimensions]
+    measure_labels = [_measure_label(m) for m in cube.measures if _field_visible_to(m, viewer)]
+    dim_names = [d.name for d in cube.dimensions if _field_visible_to(d, viewer)]
+    td_names = [td.name for td in cube.time_dimensions if _field_visible_to(td, viewer)]
     parts = [
         head,
         "",
@@ -698,7 +722,10 @@ def project_tool_descriptions(
     invariant: dict[str, str] = {}
     viewer_gated: dict[str, str] = {}
     for cube in all_cubes:
-        rendered = render_tool_description(cube)
+        # Pass viewer so fields with required_roles are filtered out of the
+        # tool description for viewers who lack those roles
+        # (SEMQL-PROMPT-FIELD-ROLES-001).
+        rendered = render_tool_description(cube, viewer=viewer)
         if _is_public(cube):
             invariant[cube.name] = rendered
         elif viewer is not None and viewer_sees(cube, viewer, policy):
@@ -792,6 +819,7 @@ def _render_cube(
     cube: Cube,
     lookups: dict[str, Lookup],
     ctx: ResolutionContext | None,
+    viewer: AuthContext | None = None,
 ) -> list[str]:
     # Beta cubes carry an annotation so the planner can deprioritise.
     # Deprecated cubes are filtered out of the prompt entirely by the
@@ -812,10 +840,11 @@ def _render_cube(
         out.append("**Relations:**")
         out.append(cube.relations)
 
-    if cube.measures:
+    visible_measures = [m for m in cube.measures if _field_visible_to(m, viewer)]
+    if visible_measures:
         out.append("")
         out.append("**Measures:**")
-        for m in cube.measures:
+        for m in visible_measures:
             # Surface display_unit alongside storage unit so the planner
             # doesn't invent its own conversion (e.g. ``/3600`` to read
             # seconds-stored watch_time in hours).
@@ -833,10 +862,11 @@ def _render_cube(
                 f"  - `{cube.name}.{m.name}`{unit} `agg={m.agg}`{flags}{filtered}{human}{desc}"
             )
 
-    if cube.dimensions:
+    visible_dims = [d for d in cube.dimensions if _field_visible_to(d, viewer)]
+    if visible_dims:
         out.append("")
         out.append("**Dimensions:**")
-        for d in cube.dimensions:
+        for d in visible_dims:
             desc = f" — {d.description}" if d.description else ""
             human = _human(d.display_name)
             # Surface the cross-cube coercion opt-in so the planner
@@ -850,10 +880,11 @@ def _render_cube(
                 if lookup_line is not None:
                     out.append(lookup_line)
 
-    if cube.time_dimensions:
+    visible_tds = [td for td in cube.time_dimensions if _field_visible_to(td, viewer)]
+    if visible_tds:
         out.append("")
         out.append("**Time dimensions:**")
-        for td in cube.time_dimensions:
+        for td in visible_tds:
             grans = "|".join(td.granularities)
             desc = f" — {td.description}" if td.description else ""
             human = _human(td.display_name)

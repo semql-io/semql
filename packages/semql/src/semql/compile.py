@@ -38,6 +38,7 @@ import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from dataclasses import field as dc_field
+from dataclasses import replace as _dc_replace
 from typing import Any, Literal
 
 import sqlglot
@@ -1118,6 +1119,7 @@ def _check_field_visibility(
     q: SemanticQuery,
     catalog: dict[str, Cube],
     viewer: AuthContext | None,
+    views_map: dict[str, View] | None = None,
 ) -> None:
     """Field hide gate. Refuse queries that touch a field the
     viewer's roles don't intersect with ``field.required_roles``.
@@ -1127,6 +1129,11 @@ def _check_field_visibility(
     Empty ``required_roles`` is open to all viewers who can see the
     cube; ``viewer=None`` (unauthed path) bypasses the gate so
     catalog-level tooling keeps working.
+
+    ``views_map`` must be supplied when views are in use so that
+    view-aliased refs resolve to their underlying field before the
+    role check — without it a ``view.local_name`` ref would silently
+    pass because the view name isn't a cube entry.
     """
     if viewer is None:
         return
@@ -1166,6 +1173,17 @@ def _check_field_visibility(
         cube_name, _, field_name = ref.partition(".")
         if not cube_name or not field_name:
             continue
+        # Resolve view alias to the underlying cube.field before the
+        # role check — a view ref ``view.local`` maps to an underlying
+        # ``cube.field`` that may carry required_roles.
+        if views_map and cube_name in views_map:
+            view = views_map[cube_name]
+            underlying_ref = view.fields.get(field_name)
+            if underlying_ref is None:
+                continue  # missing view field caught by resolver
+            cube_name, _, field_name = underlying_ref.partition(".")
+            if not cube_name or not field_name:
+                continue
         cube = catalog.get(cube_name)
         if cube is None:
             continue
@@ -1455,6 +1473,14 @@ class _CompileEnv:
 
         self.q = q
         self.catalog = catalog
+        # Viewer-filtered view of the catalog: META reflection cubes must only
+        # expose cubes the current viewer can see (SEMQL-META-REFLECTION-AUTH-BYPASS).
+        # For an unauthed viewer (None) this equals the full catalog.
+        self.visible_catalog: dict[str, Cube] = (
+            {k: v for k, v in catalog.items() if viewer_sees(v, viewer, policy)}
+            if viewer is not None
+            else catalog
+        )
         self.group_by_alias = group_by_alias
         self.having_alias = having_alias
         self.dialects = dialects
@@ -1477,7 +1503,9 @@ class _CompileEnv:
         self.ctx = ctx
         self.views_map: dict[str, View] = views or {}
 
-        resolved = _resolve_query_fields(q, catalog, self.views_map)
+        # Use visible_catalog (viewer-filtered) so error messages don't enumerate
+        # cubes the viewer can't access (SEMQL-RESOLVER-DIAGNOSTIC-HIDDEN-CATALOG-ENUMERATION).
+        resolved = _resolve_query_fields(q, self.visible_catalog, self.views_map)
         self.measure_fields = resolved.measure_fields
         self.dim_fields = resolved.dim_fields
         self.time_cube = resolved.time_cube
@@ -1489,7 +1517,7 @@ class _CompileEnv:
 
         _check_lifecycle(self.touched)
         _check_viewer_authorization(self.touched, viewer, policy)
-        _check_field_visibility(q, catalog, viewer)
+        _check_field_visibility(q, catalog, viewer, self.views_map)
         _check_required_filters(self.touched, q)
         _check_alias_uniqueness(self.touched)
 
@@ -2032,7 +2060,7 @@ class _CompileEnv:
                 emit_physical_sources(root, matched) if matched else _empty_source_for(root)
             )
         else:
-            source = self.strategy.emit_source(root, self.catalog, self.resolve_in_ctx)
+            source = self.strategy.emit_source(root, self.visible_catalog, self.resolve_in_ctx)
         sel = sel.from_(self.wrap_for_tenancy(root, source), copy=False)
         for plan_join in plan_joins:
             tgt = plan_join.right
@@ -2044,7 +2072,9 @@ class _CompileEnv:
                     emit_physical_sources(tgt, matched_t) if matched_t else _empty_source_for(tgt)
                 )
             else:
-                target_source = tgt_dialect.emit_source(tgt, self.catalog, self.resolve_in_ctx)
+                target_source = tgt_dialect.emit_source(
+                    tgt, self.visible_catalog, self.resolve_in_ctx
+                )
             sel = sel.join(
                 self.wrap_for_tenancy(tgt, target_source),
                 on=self.parse(j.on),
@@ -2630,7 +2660,7 @@ def _emit_symmetric_query(env: _CompileEnv) -> CompiledQuery:
         fact_aliases[cube.name] = alias
         sub = exp.Select()
         src = env.wrap_for_tenancy(
-            cube, env.strategy.emit_source(cube, env.catalog, env.resolve_in_ctx)
+            cube, env.strategy.emit_source(cube, env.visible_catalog, env.resolve_in_ctx)
         )
         sub = sub.from_(src, copy=False)
         sub = sub.select(exp.alias_(env.parse(fa.key_sql), _SYM_KEY, copy=False), copy=False)
@@ -2671,7 +2701,7 @@ def _emit_symmetric_query(env: _CompileEnv) -> CompiledQuery:
 
     # Join the bridge on bridge_key = COALESCE(all fact keys).
     bridge_src = env.wrap_for_tenancy(
-        sym.bridge, env.strategy.emit_source(sym.bridge, env.catalog, env.resolve_in_ctx)
+        sym.bridge, env.strategy.emit_source(sym.bridge, env.visible_catalog, env.resolve_in_ctx)
     )
     outer = outer.join(
         bridge_src,
@@ -3168,6 +3198,31 @@ def compile_plan(
         limit=plan.limit.limit,
         offset=plan.limit.offset,
     )
+    # Restore security-critical fields on plan scan/join cubes from the
+    # trusted catalog (SEMQL-COMPILEPLAN-SCOPE-BYPASS). An LLM-generated or
+    # externally-constructed plan could tamper with Cube fields like
+    # tenancy=None to bypass scope predicates. We preserve physical table
+    # changes (legitimate rollup/partition rewrites change .table) but
+    # overwrite the fields that gate authorization and row-level security.
+    _SECURITY_FIELDS = ("tenancy", "tenancy_columns", "security_sql", "scope", "required_roles")
+
+    def _restore_security(cube: Cube) -> Cube:
+        trusted = catalog.get(cube.name)
+        if trusted is None:
+            return cube
+        update = {f: getattr(trusted, f) for f in _SECURITY_FIELDS}
+        return cube.model_copy(update=update)
+
+    if plan.scans or plan.joins:
+        canonical_scans = [
+            _dc_replace(scan, cube=_restore_security(scan.cube)) for scan in plan.scans
+        ]
+        canonical_joins = [
+            _dc_replace(j, left=_restore_security(j.left), right=_restore_security(j.right))
+            for j in plan.joins
+        ]
+        plan = _dc_replace(plan, scans=canonical_scans, joins=canonical_joins)
+
     env = _CompileEnv(
         q,
         catalog,

@@ -1,3 +1,6 @@
+# pyright: reportPrivateUsage=false
+# Tests for internal helpers (_dot_quoted) exercise module-private functions
+# by design; pyright's private-usage guard would fire without this suppression.
 """Tests for ``semql_erd.render_dot``.
 
 The DOT path is pure Python — no graphviz binary needed — so these
@@ -101,7 +104,7 @@ def test_render_dot_omits_label_when_no_title() -> None:
 
 def test_node_label_includes_cube_name() -> None:
     out = render_dot(Catalog([_orders(), _customers()]))
-    assert "orders [label=" in out
+    assert '"orders" [label=' in out
 
 
 def test_node_label_includes_display_name_when_present() -> None:
@@ -227,12 +230,10 @@ def test_one_to_one_uses_tee_on_both_sides() -> None:
     assert 'arrowhead="tee"' in edge
 
 
-def test_edge_uses_safe_node_ids() -> None:
-    """Cube names already conform to ``[a-z_][a-z0-9_]*`` by the
-    resolver regex, so they need no escaping. Pin that we don't quote
-    them either."""
+def test_edge_node_ids_are_double_quoted() -> None:
+    """Node IDs in edges must be DOT double-quoted (SEMQL-DISC-ERD-DOT-INJECTION-004)."""
     out = render_dot(Catalog([_orders(), _customers()]))
-    assert "  orders -> customers " in out
+    assert '  "orders" -> "customers" ' in out
 
 
 # ---------------------------------------------------------------------------
@@ -263,7 +264,7 @@ def test_only_exposed_false_shows_hidden_cubes() -> None:
         dimensions=[Dimension(name="x", sql="{h}.x", type="string")],
     )
     out = render_dot(Catalog([_orders(), _customers(), hidden]), only_exposed=False)
-    assert "hidden [label=" in out
+    assert '"hidden" [label=' in out
 
 
 def test_meta_cubes_are_always_excluded() -> None:
@@ -295,8 +296,8 @@ def test_edges_to_filtered_out_cubes_are_dropped() -> None:
     )
     out = render_dot(Catalog([orders_with_hidden_join, _customers(), hidden]))
     # ``customers`` edge present; ``hidden`` edge dropped.
-    assert "orders -> customers" in out
-    assert "orders -> hidden" not in out
+    assert '"orders" -> "customers"' in out
+    assert '"orders" -> "hidden"' not in out
 
 
 # ---------------------------------------------------------------------------
@@ -309,7 +310,7 @@ def test_single_cube_no_edges_renders_clean() -> None:
     # No edges at all.
     assert " -> " not in out
     # But the node is there.
-    assert "customers [label=" in out
+    assert '"customers" [label=' in out
 
 
 def test_catalog_with_only_hidden_cubes_renders_empty_graph() -> None:
@@ -357,3 +358,36 @@ def test_record_label_escapes_special_characters(weird: str) -> None:
     for ch in ("|", "{", "}"):
         if ch in weird:
             assert f"\\{ch}" in out
+
+
+# ---------------------------------------------------------------------------
+# DOT node identifier quoting (SEMQL-DISC-ERD-DOT-INJECTION-004)
+# ---------------------------------------------------------------------------
+
+
+def test_dot_quoted_helper_wraps_in_double_quotes() -> None:
+    from semql_erd.dot import _dot_quoted
+
+    assert _dot_quoted("orders") == '"orders"'
+
+
+def test_dot_quoted_helper_escapes_embedded_double_quote() -> None:
+    from semql_erd.dot import _dot_quoted
+
+    # An embedded " must be backslash-escaped so the identifier doesn't
+    # break out of the DOT double-quoted string.
+    assert _dot_quoted('cube"name') == '"cube\\"name"'
+
+
+def test_node_declaration_uses_quoted_identifier() -> None:
+    out = render_dot(Catalog([_customers()]))
+    # Every node declaration must use the double-quoted form.
+    assert '"customers" [label=' in out
+
+
+def test_edge_target_uses_quoted_identifier() -> None:
+    out = render_dot(Catalog([_orders(), _customers()]))
+    # The edge's target (join.to) must also be quoted.
+    edge_lines = [ln for ln in out.splitlines() if " -> " in ln]
+    assert len(edge_lines) == 1
+    assert edge_lines[0].strip().startswith('"orders" -> "customers"')

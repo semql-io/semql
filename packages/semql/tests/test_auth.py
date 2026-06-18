@@ -162,10 +162,13 @@ def test_iter_cubes_with_policy_further_restricts() -> None:
 
 
 def test_compile_refuses_query_against_unauthorised_cube() -> None:
+    # Resolution uses visible_catalog (viewer-filtered), so an unauthorized
+    # cube surfaces as "Unknown cube" rather than "not authorised" — which is
+    # intentionally more secure (doesn't reveal the cube exists).
     cat = _catalog()
-    viewer = AuthContext(viewer_id="u1", roles=["analyst"])  # no finance
+    viewer = AuthContext(viewer_id="u1", roles=["analyst"])  # no finance role
     q = SemanticQuery(measures=["finance.revenue"])
-    with pytest.raises(CompileError, match="not authorised"):
+    with pytest.raises(CompileError):
         cat.compile(q, viewer=viewer)
 
 
@@ -255,7 +258,9 @@ def test_catalog_compile_uses_registered_policy() -> None:
     )
     viewer = AuthContext(viewer_id="u1", roles=["finance", "hr"])
     q = SemanticQuery(measures=["finance.revenue"])
-    with pytest.raises(CompileError, match="not authorised"):
+    # Policy-blocked cube appears as "Unknown cube" (not "not authorised")
+    # because the resolver uses the viewer-filtered catalog.
+    with pytest.raises(CompileError):
         cat.compile(q, viewer=viewer)
 
 

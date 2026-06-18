@@ -91,7 +91,7 @@ def test_amount_column_becomes_sum_measure(conn: duckdb.DuckDBPyConnection) -> N
     assert "amount" in measure_names
     amount = next(m for m in cubes["orders"].measures if m.name == "amount")
     assert amount.agg == "sum"
-    assert amount.sql == "{o}.amount"
+    assert amount.sql == '{o}."amount"'
 
 
 def test_id_columns_become_count_distinct_measures(conn: duckdb.DuckDBPyConnection) -> None:
@@ -147,7 +147,7 @@ def test_fk_emits_join_and_foreign_key_dimension(
     assert "customers" in join_targets
     join = next(j for j in orders.joins if j.to == "customers")
     assert join.relationship == "many_to_one"
-    assert join.on == "{o}.customer_id = {c}.id"
+    assert join.on == '{o}."customer_id" = {c}."id"'
 
 
 def test_fk_column_does_not_become_count_distinct_measure(
@@ -296,3 +296,37 @@ def test_probe_can_be_passed_directly_to_introspect(
     probe = InformationSchemaProbe(conn, schema="main")
     result = introspect(probe, dialect=Dialect.DUCKDB)
     assert {c.name for c in result.cubes} == {"orders", "customers"}
+
+
+# ---------------------------------------------------------------------------
+# SQL identifier quoting in generated fragments
+# (SEMQL-DISC-INTROSPECT-GENERATED-SQL-002)
+# ---------------------------------------------------------------------------
+
+
+def test_introspect_column_sql_uses_quoted_identifier(
+    conn: duckdb.DuckDBPyConnection,
+) -> None:
+    """Field SQL fragments must quote column names so reserved words and
+    names with spaces survive the round-trip into catalog SQL."""
+    _setup_orders_customers(conn)
+    result = introspect_to_result(conn, dialect=Dialect.DUCKDB, schema="main")
+    orders = next(c for c in result.cubes if c.name == "orders")
+    for field in (*orders.measures, *orders.dimensions, *orders.time_dimensions):
+        # Every SQL fragment must contain a double-quoted column identifier.
+        assert '"' in field.sql, f"sql={field.sql!r} is not quoted"
+
+
+def test_introspect_join_on_clause_uses_quoted_identifiers(
+    conn: duckdb.DuckDBPyConnection,
+) -> None:
+    """FK join predicates must quote both sides of the ON clause."""
+    _setup_orders_customers(conn)
+    result = introspect_to_result(conn, dialect=Dialect.DUCKDB, schema="main")
+    orders = next(c for c in result.cubes if c.name == "orders")
+    fk_joins = [j for j in orders.joins if j.to == "customers"]
+    assert fk_joins, "Expected a FK join from orders to customers"
+    on = fk_joins[0].on
+    # Both sides of = must have quoted column names.
+    assert '"customer_id"' in on
+    assert '"id"' in on

@@ -397,7 +397,14 @@ def _target_predicate(
             params[pname] = value
 
     # Structured discriminator-tenancy scope, injected and bypass-proof.
-    if cube.tenancy == "discriminator" and viewer is not None and viewer.tenant is not None:
+    # Fail closed: if the cube is discriminator-scoped and no tenant is
+    # present, refuse rather than silently emit a tenantless DML.
+    if cube.tenancy == "discriminator":
+        if viewer is None or viewer.tenant is None:
+            raise CompileError(
+                f"Cube {cube.name!r} is discriminator-scoped but no tenant "
+                "value is present — refusing update/delete without tenancy predicate."
+            )
         for i, col in enumerate(cube.tenancy_columns):
             pname = f"scope_{i}"
             conds.append(

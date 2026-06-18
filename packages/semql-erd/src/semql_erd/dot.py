@@ -97,11 +97,18 @@ def _field_label(name: str, unit: str | None, display_unit: str | None) -> str:
     return name
 
 
+def _dot_quoted(name: str) -> str:
+    """Wrap ``name`` in DOT double-quoted identifier syntax.
+
+    DOT allows arbitrary node IDs inside double quotes; the only
+    character that needs escaping is ``"`` itself (SEMQL-DISC-ERD-DOT-INJECTION-004).
+    """
+    return '"' + name.replace('"', '\\"') + '"'
+
+
 def _node_id(cube: Cube) -> str:
-    """A safe DOT node identifier — cube names are already restricted
-    to ``[a-z_][a-z0-9_]*`` by the resolver regex, so they need no
-    further escaping."""
-    return cube.name
+    """A quoted DOT node identifier for ``cube``."""
+    return _dot_quoted(cube.name)
 
 
 def _cubes_in_scope(catalog: Catalog, *, only_exposed: bool) -> list[Cube]:
@@ -157,7 +164,7 @@ def render_dot(
                 continue
             attrs = _relationship_attrs(join.relationship)
             attr_str = ", ".join(f'{k}="{v}"' for k, v in attrs.items())
-            lines.append(f"  {_node_id(cube)} -> {join.to} [{attr_str}];")
+            lines.append(f"  {_node_id(cube)} -> {_dot_quoted(join.to)} [{attr_str}];")
 
     lines.append("}")
     return "\n".join(lines) + "\n"

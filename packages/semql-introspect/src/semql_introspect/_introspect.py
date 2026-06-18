@@ -29,6 +29,16 @@ from semql_introspect._heuristics import classify_column
 from semql_introspect._probe import SchemaProbe
 
 
+def _sql_quote(name: str) -> str:
+    """Wrap ``name`` in SQL double-quoted identifier syntax.
+
+    Column names copied from information_schema into generated SQL fragments
+    must be quoted to survive names with spaces, reserved words, or hostile
+    content (SEMQL-DISC-INTROSPECT-GENERATED-SQL-002).
+    """
+    return '"' + name.replace('"', '""') + '"'
+
+
 @dataclass(frozen=True)
 class HeuristicAnnotation:
     """One ``# TODO: review`` hint surfaced by the introspector."""
@@ -121,7 +131,7 @@ def introspect(probe: SchemaProbe, *, dialect: Dialect) -> IntrospectionResult:
             is_fk = (tbl.name, col.name) in fk_by_source
             is_pk = pk_col == col.name
             cls = classify_column(col, is_fk=is_fk, is_pk=is_pk)
-            sql = f"{{{alias}}}.{col.name}"
+            sql = f"{{{alias}}}.{_sql_quote(col.name)}"
 
             if cls.kind == "time_dimension":
                 time_dims.append(TimeDimension(name=col.name, sql=sql))
@@ -175,7 +185,10 @@ def introspect(probe: SchemaProbe, *, dialect: Dialect) -> IntrospectionResult:
                 Join(
                     to=fk.to_table,
                     relationship="many_to_one",
-                    on=f"{{{alias}}}.{fk.from_column} = {{{target_alias}}}.{fk.to_column}",
+                    on=(
+                        f"{{{alias}}}.{_sql_quote(fk.from_column)}"
+                        f" = {{{target_alias}}}.{_sql_quote(fk.to_column)}"
+                    ),
                 )
             )
 

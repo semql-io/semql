@@ -563,7 +563,7 @@ def _duckdb_type_for(value: Any) -> str:  # noqa: ANN401 — any row value
 
 def _quote(name: str) -> str:
     """DuckDB identifier quoting; matches semql.federate."""
-    return f'"{name}"'
+    return '"' + name.replace('"', '""') + '"'
 
 
 def _reset_frag_tables_on(con: Any, n: int) -> None:  # noqa: ANN401 — duckdb conn

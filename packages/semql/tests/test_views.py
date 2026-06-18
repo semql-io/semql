@@ -20,7 +20,8 @@ Two practical benefits:
 from __future__ import annotations
 
 import pytest
-from semql import Catalog, Cube, Dialect, Dimension, Measure, SemanticQuery, View
+from semql import AuthContext, Catalog, Cube, Dialect, Dimension, Measure, SemanticQuery, View
+from semql.errors import UnknownIdentifierError
 from semql_prompt import planner_prompt
 
 
@@ -165,3 +166,74 @@ def test_prompt_includes_view_section() -> None:
     assert "checkout" in rendered
     # The view's exposed names are what the planner sees.
     assert "`checkout.revenue`" in rendered or "checkout.revenue" in rendered
+
+
+# ---------------------------------------------------------------------------
+# Field-level role enforcement via views (SEMQL-VIEW-FIELD-ROLES-002):
+# a view alias that maps to a required_roles-protected underlying field
+# must be blocked for a viewer who lacks the required role.
+# ---------------------------------------------------------------------------
+
+
+def _orders_with_secret_revenue() -> Cube:
+    return Cube(
+        name="orders",
+        dialect=Dialect.POSTGRES,
+        table="orders",
+        alias="o",
+        measures=[
+            Measure(name="count", sql="*", agg="count"),
+            Measure(
+                name="secret_revenue",
+                sql="{o}.amount",
+                agg="sum",
+                required_roles=["finance"],
+            ),
+        ],
+        dimensions=[Dimension(name="region", sql="{o}.region", type="string")],
+    )
+
+
+def _public_report_view() -> View:
+    """View that exposes the role-protected measure under a bland name."""
+    return View(
+        name="public_report",
+        fields={
+            "revenue": "orders.secret_revenue",
+            "region": "orders.region",
+        },
+    )
+
+
+def test_view_field_role_blocked_for_low_role_viewer() -> None:
+    """A viewer without the 'finance' role must not read secret_revenue
+    even when it's accessed via a view alias (SEMQL-VIEW-FIELD-ROLES-002)."""
+    cat = Catalog([_orders_with_secret_revenue()], views=[_public_report_view()])
+    low_viewer = AuthContext(viewer_id="u1", roles=["viewer"])
+    with pytest.raises(UnknownIdentifierError):
+        cat.compile(
+            SemanticQuery(measures=["public_report.revenue"]),
+            viewer=low_viewer,
+        )
+
+
+def test_view_field_role_allowed_for_finance_viewer() -> None:
+    """A viewer with the 'finance' role can access the field via the view."""
+    cat = Catalog([_orders_with_secret_revenue()], views=[_public_report_view()])
+    finance_viewer = AuthContext(viewer_id="u2", roles=["finance"])
+    out = cat.compile(
+        SemanticQuery(measures=["public_report.revenue"]),
+        viewer=finance_viewer,
+    )
+    assert "SUM(o.amount)" in out.sql
+
+
+def test_direct_field_role_still_blocked() -> None:
+    """Baseline: direct access to the protected field is also blocked."""
+    cat = Catalog([_orders_with_secret_revenue()])
+    low_viewer = AuthContext(viewer_id="u1", roles=["viewer"])
+    with pytest.raises(UnknownIdentifierError):
+        cat.compile(
+            SemanticQuery(measures=["orders.secret_revenue"]),
+            viewer=low_viewer,
+        )

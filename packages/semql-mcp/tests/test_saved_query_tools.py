@@ -14,6 +14,7 @@ from typing import Any
 
 from fastmcp import Client
 from semql import (
+    AuthContext,
     Catalog,
     Cube,
     Dialect,
@@ -243,3 +244,80 @@ def test_saved_query_tool_execute_failure_carries_sql() -> None:
     dbg = _run(call(_server(_catalog_with_saved(), executor=boom, debug=True)))
     assert dbg["error"]["code"] == "RuntimeError"
     assert "connection refused" in dbg["error"]["message"]
+
+
+# ---------------------------------------------------------------------------
+# Role enforcement (CAND-semql-mcp-saved-query-required-roles-bypass):
+# saved-query tools must check sq.required_roles before compiling.
+# ---------------------------------------------------------------------------
+
+
+def _admin_saved_query() -> SavedQuery:
+    return SavedQuery(
+        name="admin_report",
+        description="Admin-only report.",
+        required_roles=["admin"],
+        query=SemanticQuery(
+            measures=["orders.revenue"],
+            dimensions=["orders.region"],
+        ),
+    )
+
+
+def _catalog_with_role_gated_saved() -> Catalog:
+    return Catalog([_orders_cube()], saved_queries=[_admin_saved_query()])
+
+
+def test_saved_query_required_roles_denied_for_non_admin() -> None:
+    """A viewer without required_roles must receive an AuthError, not SQL."""
+    low_viewer = AuthContext(viewer_id="u1", roles=["viewer"])
+    s = MCPServer(
+        _catalog_with_role_gated_saved(),
+        viewer_provider=lambda: low_viewer,
+    )
+
+    async def call() -> dict[str, Any]:
+        async with Client(s.mcp) as c:
+            result = await c.call_tool("saved_admin_report", {})
+            return result.data  # type: ignore[no-any-return]
+
+    out = _run(call())
+    assert "error" in out
+    assert out["error"]["code"] == "AuthError"
+    assert "sql" not in out  # must not have compiled at all
+
+
+def test_saved_query_required_roles_allowed_for_admin() -> None:
+    """A viewer with the required role must receive compiled SQL."""
+    admin_viewer = AuthContext(viewer_id="u2", roles=["admin"])
+    s = MCPServer(
+        _catalog_with_role_gated_saved(),
+        viewer_provider=lambda: admin_viewer,
+    )
+
+    async def call() -> dict[str, Any]:
+        async with Client(s.mcp) as c:
+            result = await c.call_tool("saved_admin_report", {})
+            return result.data  # type: ignore[no-any-return]
+
+    out = _run(call())
+    assert "error" not in out
+    assert "sql" in out
+
+
+def test_saved_query_required_roles_denied_when_no_viewer() -> None:
+    """No viewer (None) with required_roles must be rejected, not pass through."""
+    s = MCPServer(
+        _catalog_with_role_gated_saved(),
+        viewer_provider=lambda: None,
+        require_viewer=False,  # allow None viewer at the server level
+    )
+
+    async def call() -> dict[str, Any]:
+        async with Client(s.mcp) as c:
+            result = await c.call_tool("saved_admin_report", {})
+            return result.data  # type: ignore[no-any-return]
+
+    out = _run(call())
+    assert "error" in out
+    assert out["error"]["code"] == "AuthError"

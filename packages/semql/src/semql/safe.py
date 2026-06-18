@@ -44,7 +44,22 @@ def is_read_only_statement(sql: str, *, dialect: str = "postgres") -> bool:
     # ``Select`` covers plain SELECT; ``Union`` (and friends) are
     # composed of SELECTs. Anything else — Insert, Update, Delete,
     # Create, Drop, Alter, Truncate, Grant, ... — is rejected.
-    return isinstance(root, exp.Select | exp.Union | exp.Subquery)
+    if not isinstance(root, exp.Select | exp.Union | exp.Subquery):
+        return False
+    # Traverse all descendants: reject any DML/DDL node even when it
+    # appears inside a CTE body (e.g. writable CTEs like
+    # ``WITH d AS (DELETE FROM t RETURNING id) SELECT * FROM d``).
+    _DML_DDL = (
+        exp.Insert,
+        exp.Update,
+        exp.Delete,
+        exp.Create,
+        exp.Drop,
+        exp.Alter,
+        exp.TruncateTable,
+        exp.Grant,
+    )
+    return not any(isinstance(node, _DML_DDL) for node in root.walk())
 
 
 __all__ = ["is_read_only_statement"]

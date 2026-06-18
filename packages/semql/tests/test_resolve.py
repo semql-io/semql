@@ -228,3 +228,40 @@ def test_resolve_returns_unknown_field_when_cube_has_no_fields() -> None:
     assert err.cube == "bare"
     # ``Known fields:`` is still present even with an empty cube.
     assert "Known fields:" in str(err)
+
+
+# ---------------------------------------------------------------------------
+# Catalog enumeration — filtered catalog hides unauthorized cube names
+# (SEMQL-RESOLVER-DIAGNOSTIC-HIDDEN-CATALOG-ENUMERATION)
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_with_filtered_catalog_hides_unauthorized_cube_name(
+    small_catalog: dict[str, Cube],
+) -> None:
+    """Passing only the visible subset of the catalog keeps unauthorized
+    cube names out of the 'Known cubes:' list in error messages."""
+    visible: dict[str, Cube] = {"orders": small_catalog["orders"]}
+    with pytest.raises(UnknownIdentifierError) as exc_info:
+        resolve_field("customers.name", visible)
+    msg = str(exc_info.value)
+    # The "Known cubes:" section must not reveal unauthorized cube names.
+    # (The error may still echo the UNKNOWN name itself — that's the query
+    # input, not a catalog leak.)
+    assert "Known cubes:" in msg
+    known_section = msg.split("Known cubes:")[1]
+    assert "customers" not in known_section
+    assert "orders" in known_section
+
+
+def test_resolve_with_filtered_catalog_does_not_expose_unknown_cube_in_hint(
+    small_catalog: dict[str, Cube],
+) -> None:
+    """close-match hint must also stay within the visible catalog."""
+    visible: dict[str, Cube] = {"orders": small_catalog["orders"]}
+    with pytest.raises(UnknownIdentifierError) as exc_info:
+        # "custmers" is close to "customers" but customers is not visible.
+        resolve_field("custmers.name", visible)
+    err = exc_info.value
+    # Hint may be None or "orders" — must not be "customers".
+    assert err.hint != "customers"

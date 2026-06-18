@@ -340,3 +340,41 @@ def test_raw_security_sql_scope_refused() -> None:
     cat = _catalog(_entity(), security_sql="{o}.region = 'x'")
     with pytest.raises(CompileError, match=r"(?i)raw-SQL scope|security_sql"):
         cat.mutate(SemanticMutation(entity="order", operation=Op.DELETE, pk={"id": 1}))
+
+
+# ---------------------------------------------------------------------------
+# Discriminator fail-closed (SEMQL-MUTATION-DISCRIMINATOR-FAILOPEN):
+# update/delete on a discriminator-scoped cube without a tenant must
+# raise rather than emit a tenantless WHERE clause.
+# ---------------------------------------------------------------------------
+
+
+def test_discriminator_update_without_viewer_raises() -> None:
+    """No viewer → CompileError, not a silently tenantless UPDATE."""
+    cat = _catalog(_pinned_entity(), tenancy="discriminator", tenancy_columns=["org_id"])
+    with pytest.raises(CompileError, match=r"(?i)discriminator|tenant"):
+        cat.mutate(
+            SemanticMutation(
+                entity="order", operation=Op.UPDATE, values={"region": "us"}, pk={"id": 1}
+            )
+        )
+
+
+def test_discriminator_update_without_tenant_raises() -> None:
+    """Viewer present but tenant is None → CompileError."""
+    cat = _catalog(_pinned_entity(), tenancy="discriminator", tenancy_columns=["org_id"])
+    viewer = AuthContext(viewer_id="u1")  # no tenant
+    with pytest.raises(CompileError, match=r"(?i)discriminator|tenant"):
+        cat.mutate(
+            SemanticMutation(
+                entity="order", operation=Op.UPDATE, values={"region": "us"}, pk={"id": 1}
+            ),
+            viewer=viewer,
+        )
+
+
+def test_discriminator_delete_without_viewer_raises() -> None:
+    """Same fail-closed behaviour for DELETE."""
+    cat = _catalog(_pinned_entity(), tenancy="discriminator", tenancy_columns=["org_id"])
+    with pytest.raises(CompileError, match=r"(?i)discriminator|tenant"):
+        cat.mutate(SemanticMutation(entity="order", operation=Op.DELETE, pk={"id": 1}))

@@ -68,6 +68,23 @@ class _Connection(Protocol):
 
 
 _PLACEHOLDER_RE = re.compile(r"\{([a-z_][a-z0-9_]*)\}")
+_SAFE_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_$.]*$")
+
+
+def _validate_context_values(context: dict[str, str]) -> None:
+    """Reject context values that are not safe SQL identifiers.
+
+    Context values are substituted into live SQL probes (SEMQL-DISC-VALIDATE-CONTEXT-SQLI-003).
+    We use identifier validation rather than quoting because the probe
+    SQL constructs table/schema references, not string literals.
+    """
+    for key, value in context.items():
+        if not _SAFE_IDENT_RE.match(value):
+            raise ValueError(
+                f"Unsafe context value for {key!r}: {value!r} contains "
+                "characters not allowed in a SQL identifier. Only letters, "
+                "digits, underscores, dots, and $ are permitted."
+            )
 
 
 def _resolve_placeholders(sql: str, lookup: dict[str, str]) -> str:
@@ -284,6 +301,8 @@ def validate_against_db(
     physical database.
     """
     ctx = context or {}
+    # Validate context values before substituting into live SQL probes.
+    _validate_context_values(ctx)
     errors: list[DbValidationError] = []
     # ``iter_cubes`` skips META reflection cubes by default — they
     # live in-memory and aren't real database tables.

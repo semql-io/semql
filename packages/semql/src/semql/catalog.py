@@ -1246,7 +1246,7 @@ class Catalog:
             self.compile(query, context=context, viewer=viewer)
             return []
         except SemQLError as exc:
-            errors = validate(query, self)
+            errors = validate(query, self, viewer=viewer, policy=self._policy)
             if errors:
                 return errors
             # The compile error didn't surface through validate (e.g.

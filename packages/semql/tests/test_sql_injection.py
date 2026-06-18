@@ -213,3 +213,23 @@ def test_tautology_payload_is_compared_not_evaluated() -> None:
     # The equality predicate binds the whole string; there is no bare 1=1.
     assert "1=1" not in out.sql.replace(" ", "")
     assert "' OR 1=1 --" in out.params.values()
+
+
+# ---------------------------------------------------------------------------
+# Writable-CTE bypass (SEMQL-READONLY-WRITABLE-CTE): SELECT root is not
+# sufficient — DML inside a CTE body must also be rejected.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "WITH d AS (DELETE FROM users RETURNING id) SELECT * FROM d",
+        "WITH d AS (INSERT INTO log VALUES (1) RETURNING id) SELECT * FROM d",
+        "WITH d AS (UPDATE users SET x=1 RETURNING id) SELECT * FROM d",
+    ],
+    ids=["writable-cte-delete", "writable-cte-insert", "writable-cte-update"],
+)
+def test_writable_cte_rejected_by_read_only_guard(sql: str) -> None:
+    """is_read_only_statement must reject SELECT roots whose CTEs contain DML."""
+    assert not is_read_only_statement(sql, dialect="postgres")
