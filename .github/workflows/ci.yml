@@ -56,6 +56,11 @@ jobs:
           packages/semql-validate-db/src
           scripts
 
+      - name: module boundaries
+        run: |
+          uv run tach check
+          uv run python scripts/check_core_boundary.py
+
       - name: pytest
         run: uv run pytest packages
 

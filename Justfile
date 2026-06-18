@@ -10,10 +10,16 @@ typecheck:
     uv run mypy packages/
     uv run pyright packages/
 
+# Module-boundary enforcement: tach (layers within core) +
+# the cross-package guard (core imports no sibling packages).
+boundaries:
+    uv run tach check
+    uv run python scripts/check_core_boundary.py
+
 test *args:
     uv run pytest {{args}}
 
-check: fmt lint typecheck test
+check: fmt lint typecheck boundaries test
 
 # Mutation testing on semql core. Results saved to .mutmut-cache.
 # Show a summary with `just mutmut-results` after a run completes.

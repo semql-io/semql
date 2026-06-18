@@ -20,3 +20,15 @@ repos:
         language: system
         types: [python]
         pass_filenames: false
+      - id: tach
+        name: tach (module boundaries)
+        entry: uv run tach check
+        language: system
+        types: [python]
+        pass_filenames: false
+      - id: core-boundary
+        name: core imports no sibling packages
+        entry: uv run python scripts/check_core_boundary.py
+        language: system
+        types: [python]
+        pass_filenames: false

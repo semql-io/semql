@@ -1,0 +1,172 @@
+# Module-boundary enforcement for the core `semql` package.
+#
+# Two layers: `foundation` (data types + pure utilities) and `app`
+# (resolution, compilation, orchestration, the public surface). tach lets a
+# higher layer import a lower one, never the reverse — so an `app` module may
+# import the value types, but a `foundation` module may NOT reach up into the
+# compiler. This keeps the value types cheap to import and free of the
+# machinery that operates on them. `tach check` fails on an upward import.
+#
+# Cross-*package* boundaries (core must not import sibling packages like
+# semql-engine / semql-mcp) are enforced separately by
+# scripts/check_core_boundary.py: tach treats the sibling distributions as
+# external, so it cannot see those edges.
+
+source_roots = ["packages/semql/src"]
+root_module = "ignore"
+layers = ["app", "foundation"]
+
+exclude = [
+    "**/tests/**",
+    "**/__pycache__/**",
+    ".venv/**",
+]
+
+# The `semql` package root (__init__ / __main__: the public surface).
+[[modules]]
+path = "semql"
+layer = "app"
+
+[[modules]]
+path = "semql._grounding"
+layer = "foundation"
+
+[[modules]]
+path = "semql._resolve"
+layer = "app"
+
+[[modules]]
+path = "semql._schema"
+layer = "app"
+
+[[modules]]
+path = "semql.backend"
+layer = "app"
+
+[[modules]]
+path = "semql.catalog"
+layer = "app"
+
+[[modules]]
+path = "semql.cnf"
+layer = "app"
+
+[[modules]]
+path = "semql.codegen"
+layer = "app"
+
+[[modules]]
+path = "semql.compile"
+layer = "app"
+
+[[modules]]
+path = "semql.cost"
+layer = "app"
+
+[[modules]]
+path = "semql.dialect"
+layer = "foundation"
+
+[[modules]]
+path = "semql.diff"
+layer = "app"
+
+[[modules]]
+path = "semql.docs"
+layer = "app"
+
+[[modules]]
+path = "semql.errors"
+layer = "foundation"
+
+[[modules]]
+path = "semql.federate"
+layer = "app"
+
+[[modules]]
+path = "semql.hooks"
+layer = "app"
+
+[[modules]]
+path = "semql.instant"
+layer = "foundation"
+
+[[modules]]
+path = "semql.introspect"
+layer = "app"
+
+[[modules]]
+path = "semql.lint"
+layer = "app"
+
+[[modules]]
+path = "semql.logical"
+layer = "app"
+
+[[modules]]
+path = "semql.lookups"
+layer = "app"
+
+[[modules]]
+path = "semql.model"
+layer = "foundation"
+
+[[modules]]
+path = "semql.mutate"
+layer = "app"
+
+[[modules]]
+path = "semql.parse"
+layer = "app"
+
+[[modules]]
+path = "semql.partition"
+layer = "app"
+
+[[modules]]
+path = "semql.plan"
+layer = "app"
+
+[[modules]]
+path = "semql.refs"
+layer = "foundation"
+
+[[modules]]
+path = "semql.retrieve"
+layer = "app"
+
+[[modules]]
+path = "semql.rewrite"
+layer = "app"
+
+[[modules]]
+path = "semql.rollup"
+layer = "app"
+
+[[modules]]
+path = "semql.rows"
+layer = "app"
+
+[[modules]]
+path = "semql.safe"
+layer = "foundation"
+
+[[modules]]
+path = "semql.semijoin"
+layer = "app"
+
+[[modules]]
+path = "semql.spec"
+layer = "app"
+
+[[modules]]
+path = "semql.units"
+layer = "foundation"
+
+[[modules]]
+path = "semql.validate"
+layer = "app"
+
+[[modules]]
+path = "semql.visualize"
+layer = "app"
