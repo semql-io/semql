@@ -28,7 +28,7 @@ from semql.errors import (
     closest_match,
 )
 from semql.model import Cube, Dimension, Measure, Segment, TimeDimension, View
-from semql.refs import parse_qualified_ref
+from semql.refs import is_qualified, parse_qualified_ref
 from semql.spec import BoolExpr, Filter, SemanticQuery
 
 if TYPE_CHECKING:
@@ -182,8 +182,9 @@ def _make_view_resolver(
     def _resolve(
         qualified: str,
     ) -> tuple[Cube, Measure | Dimension | TimeDimension | Segment]:
-        if "." in qualified:
-            prefix, local = qualified.split(".", 1)
+        if is_qualified(qualified):
+            ref = parse_qualified_ref(qualified)
+            prefix, local = ref.cube, ref.field
             if prefix in views_map:
                 view = views_map[prefix]
                 if local not in view.fields:
@@ -401,7 +402,7 @@ def walk_query_fields(
 
     segment_resolutions: list[tuple[Cube, Segment]] = []
     for seg_ref in q.segments:
-        if "." not in seg_ref:
+        if not is_qualified(seg_ref):
             diagnostics.append(
                 ResolutionDiagnostic(
                     code="segment_unqualified",
@@ -410,7 +411,8 @@ def walk_query_fields(
                 )
             )
             continue
-        cube_name, seg_name = seg_ref.rsplit(".", 1)
+        seg = parse_qualified_ref(seg_ref)
+        cube_name, seg_name = seg.cube, seg.field
         if cube_name not in catalog:
             diagnostics.append(
                 ResolutionDiagnostic(
