@@ -45,6 +45,7 @@ _INTEGRATION_FILES = frozenset(
     {
         "test_symmetric_aggregation.py",
         "test_federate_where_segments.py",
+        "test_metamorphic.py",
     }
 )
 _SECURITY_FILES = frozenset(
