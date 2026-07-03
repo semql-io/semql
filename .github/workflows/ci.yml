@@ -1,9 +1,21 @@
 name: CI
 
-# Disabled — manual-only until the repo's secrets / fixtures / cache
-# story is settled. Switch back to push + pull_request triggers once
-# CI is ready to gate merges.
+# Three tiers by trigger (W5/§10.7):
+#   * pull_request  -> fast lane, budget ~5 min: static checks, the
+#     unit/security test lane (no integration/e2e/bench), per-package
+#     coverage ratchet, and the public-API-breakage diff.
+#   * push to main  -> merge gate, budget ~15 min: everything in the
+#     fast lane plus the full test suite (integration + security) and
+#     the per-package build smoke.
+#   * schedule      -> nightly: the 5000-example Hypothesis profile and
+#     the (currently informational) mutation run.
+# workflow_dispatch stays for manual re-runs of the merge-gate shape.
 on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "0 3 * * *" # 03:00 UTC nightly
   workflow_dispatch:
 
 concurrency:
@@ -15,9 +27,11 @@ env:
   PYTHON_VERSION: "3.12"
 
 jobs:
-  check:
-    name: lint + types + tests
+  # --- Tier 0: static checks (every trigger) -------------------------------
+  static:
+    name: lint + types + boundaries
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
 
@@ -62,12 +76,82 @@ jobs:
           uv run python scripts/check_core_boundary.py
           uv run python scripts/check_frozen_models.py
 
-      - name: pytest
-        run: uv run pytest packages
+  # --- Tier 1: fast test lane (PRs) ----------------------------------------
+  # Unit + security only — the integration/e2e/bench tiers are excluded so
+  # a PR stays inside the ~5 min budget.
+  fast-tests:
+    name: fast tests (unit + security)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
 
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Sync dependencies
+        run: uv sync --all-extras --frozen
+
+      - name: pytest (fast lane)
+        run: >
+          uv run pytest packages -p no:tach --no-cov
+          -m "not integration and not e2e and not bench"
+
+  # --- Coverage ratchet (PRs + merge) --------------------------------------
+  # Per-package floor: a raise-only ratchet. Floors sit a few points below
+  # the measured self-coverage so ordinary variance never trips them; bump
+  # a floor up whenever a package's real coverage climbs, never down.
+  coverage:
+    name: coverage ${{ matrix.package }} (>=${{ matrix.floor }}%)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        # Floors are ~2-3 pts below the measured branch coverage (in
+        # comments) so variance never trips them; ratchet up, never down.
+        include:
+          - { package: semql, import: semql, floor: 88 } # 91%
+          - { package: semql-auth, import: semql_auth, floor: 82 } # 84%
+          - { package: semql-engine, import: semql_engine, floor: 83 } # 85%
+          - { package: semql-erd, import: semql_erd, floor: 64 } # 67%
+          - { package: semql-introspect, import: semql_introspect, floor: 83 } # 85%
+          - { package: semql-mcp, import: semql_mcp, floor: 88 } # 90%
+          - { package: semql-prompt, import: semql_prompt, floor: 82 } # 84%
+          - { package: semql-validate-db, import: semql_validate_db, floor: 89 } # 91%
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Sync dependencies
+        run: uv sync --all-extras --frozen
+
+      # -o addopts="" drops the repo-wide "--cov=semql" default so each
+      # package measures only its own source against its own floor.
+      - name: pytest + coverage floor
+        run: >
+          uv run pytest packages/${{ matrix.package }} -p no:tach
+          -o addopts=""
+          --cov=${{ matrix.import }} --cov-branch
+          --cov-report=term-missing
+          --cov-fail-under=${{ matrix.floor }}
+
+  # --- API breakage (PRs) --------------------------------------------------
   api-breakage:
     name: API breakage diff
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     if: github.event_name == 'pull_request'
     steps:
       - uses: actions/checkout@v4
@@ -87,9 +171,34 @@ jobs:
       - name: Compare public API surface
         run: uv run scripts/check_api_break.py --base ${{ github.event.pull_request.base.sha }}
 
+  # --- Tier 2: full test suite (merge to main + nightly) -------------------
+  full-tests:
+    name: full tests (all tiers)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    if: github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Sync dependencies
+        run: uv sync --all-extras --frozen
+
+      - name: pytest (full)
+        run: uv run pytest packages -p no:tach --no-cov
+
+  # --- Build smoke (merge to main) -----------------------------------------
   build:
     name: uv build smoke (${{ matrix.package }})
     runs-on: ubuntu-latest
+    timeout-minutes: 5
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     strategy:
       matrix:
         package:
@@ -113,3 +222,38 @@ jobs:
 
       - name: Build
         run: uv build --package ${{ matrix.package }}
+
+  # --- Tier 3: nightly deep runs (schedule) --------------------------------
+  nightly:
+    name: nightly (deep Hypothesis + mutation)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Sync dependencies
+        run: uv sync --all-extras --frozen
+
+      - name: pytest (nightly Hypothesis profile, 5000 examples)
+        env:
+          HYPOTHESIS_PROFILE: nightly
+        run: uv run pytest packages -p no:tach --no-cov
+
+      # Mutation score on the four core modules (compile/logical/cnf/
+      # _resolve — scoped in [tool.mutmut]). Informational and
+      # non-gating until the mutmut-vs-editable-layout blocker noted in
+      # pyproject is resolved; then drop continue-on-error and gate the
+      # merge tier on the changed-lines mutation score.
+      - name: mutmut baseline (informational)
+        continue-on-error: true
+        run: |
+          uv run mutmut run || true
+          uv run mutmut results || true
