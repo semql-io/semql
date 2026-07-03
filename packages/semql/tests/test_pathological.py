@@ -9,6 +9,8 @@ a reader should be able to find.
 
 from __future__ import annotations
 
+import time
+
 import pytest
 from semql import (
     MAX_UNGROUPED_ROWS,
@@ -28,6 +30,7 @@ from semql import (
     UnknownIdentifierError,
     is_read_only_statement,
 )
+from semql.cnf import to_cnf
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -262,3 +265,58 @@ def test_left_joined_cube_dimension_in_dimensions_refused() -> None:
                 left_joins=["line_items"],
             )
         )
+
+
+# ---------------------------------------------------------------------------
+# Blowup / recursion tripwires (W5/§7). These are structural guards, not
+# latency benchmarks: the wall-clock bound is deliberately loose (an
+# exponential regression takes minutes or OOMs, not milliseconds), so it
+# never flakes but still trips on genuine blowup. The hard assertion is on
+# the *shape* — bounded clause count, no ``RecursionError``.
+# ---------------------------------------------------------------------------
+
+
+def _or_leaf(i: int) -> Filter:
+    return Filter(dimension="orders.status", op="eq", values=[f"v{i}"])
+
+
+def _cnf_clause_count(node: BoolExpr | Filter) -> int:
+    """CNF is a top-level AND of OR-clauses. A bare Filter or a single
+    OR node is one clause; an AND has one clause per child."""
+    if isinstance(node, Filter):
+        return 1
+    return len(node.children) if node.op == "and" else 1
+
+
+def test_cnf_nested_or_stays_flat_and_bounded() -> None:
+    """A 30-leaf right-nested OR must collapse to a single flat clause,
+    not distribute into an exponential AND-of-ORs. If flattening ever
+    regresses this either explodes the clause count or times out."""
+    node: BoolExpr | Filter = _or_leaf(29)
+    for i in range(28, -1, -1):
+        node = BoolExpr(op="or", children=[_or_leaf(i), node])
+
+    start = time.perf_counter()
+    out = to_cnf(node)
+    elapsed = time.perf_counter() - start
+
+    # Pure OR never distributes: 30 leaves -> exactly one OR-clause.
+    assert _cnf_clause_count(out) == 1
+    assert isinstance(out, BoolExpr) and out.op == "or"
+    assert len(out.children) == 30
+    assert elapsed < 1.0
+
+
+def test_deep_filter_nesting_survives_recursion() -> None:
+    """A filter tree far deeper than any human-written query must compile
+    without tripping Python's recursion limit. 250 levels is well past
+    real usage yet clear of the ~900-frame ceiling, so a regression that
+    adds a recursive frame per level surfaces here before production."""
+    depth = 250
+    where = BoolExpr(op="and", children=[_or_leaf(0), _or_leaf(1)])
+    for i in range(2, depth):
+        where = BoolExpr(op="and", children=[_or_leaf(i), where])
+
+    out = _single().compile(SemanticQuery(measures=["orders.count"], where=where))
+    assert is_read_only_statement(out.sql)
+    assert len(out.params) == depth

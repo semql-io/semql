@@ -21,6 +21,8 @@ prompt that dropped relations. The order is documented in
 
 from __future__ import annotations
 
+import time
+
 import pytest
 from semql import (
     AuthContext,
@@ -32,6 +34,7 @@ from semql import (
 from semql_prompt import (
     CatalogPrompt,
     PromptBudget,
+    estimate_tokens,
     render_catalog_block,
     render_catalog_segments,
 )
@@ -199,3 +202,43 @@ def test_policy_and_viewer_compose_with_budget() -> None:
     # Sanity: the gated full prompt is no longer than the
     # unfiltered one.
     assert len(gated) <= len(full)
+
+
+# ---------------------------------------------------------------------------
+# Scale tripwire (W5/§7): a 1000-cube catalog must render and trim to fit a
+# tight budget in bounded time. Structural guard — the loose wall-clock
+# bound only trips on a quadratic/exponential regression, not on ordinary
+# machine variance.
+# ---------------------------------------------------------------------------
+
+
+def test_prompt_budget_trims_thousand_cube_catalog_to_fit() -> None:
+    catalog = {
+        f"cube{i}": Cube(
+            name=f"cube{i}",
+            dialect=Dialect.POSTGRES,
+            table=f"t{i}",
+            alias=f"a{i}",
+            primary_key="id",
+            description=f"Cube number {i} — a synthetic fact table for scale testing",
+            measures=[Measure(name="count", sql="*", agg="count", description="row count")],
+            dimensions=[
+                Dimension(name="id", sql=f"{{a{i}}}.id", type="number"),
+                Dimension(name="key", sql=f"{{a{i}}}.key", type="string", description="a key"),
+            ],
+        )
+        for i in range(1000)
+    }
+
+    start = time.perf_counter()
+    prompt = render_catalog_block(catalog)
+    result = PromptBudget(max_tokens=2_000).apply(prompt)
+    elapsed = time.perf_counter() - start
+
+    # The un-budgeted prompt genuinely overflows (proves the trim did work).
+    assert estimate_tokens(prompt) > 2_000
+    # ...and the trimmed prompt fits, having dropped whole cubes to get there.
+    assert result.estimated_tokens <= 2_000
+    assert result.was_truncated
+    assert any(d.startswith("cube:") for d in result.dropped)
+    assert elapsed < 5.0
