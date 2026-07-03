@@ -69,5 +69,22 @@ fail_under = 0
 
 [tool.mutmut]
 source_paths = ["packages/semql/src/semql/"]
+# Baseline scope (W5/§10.7): the four correctness-critical core modules.
+# ``only_mutate`` fnmatches the copied-tree path, so glob the basenames.
+only_mutate = [
+    "*/semql/compile.py",
+    "*/semql/logical.py",
+    "*/semql/cnf.py",
+    "*/semql/_resolve.py",
+]
 pytest_add_cli_args_test_selection = ["packages/semql/tests/"]
-pytest_add_cli_args = ["-x", "-q", "--no-cov"]
+pytest_add_cli_args = ["-x", "-q", "--no-cov", "-p", "no:tach"]
+# KNOWN BLOCKER (W5/§10.7): ``mutmut run`` mutates the four files above
+# correctly (verified: "4 files mutated") but cannot yet *score* them.
+# mutmut 3.x sandboxes by copying source into ``mutants/`` and shadowing
+# ``./``, ``./src``, ``./source`` on sys.path. This is a uv-workspace
+# ``packages/*/src/`` layout installed editable, so ``semql.pth`` keeps
+# the *real* ``packages/semql/src`` ahead of the mutant copy — the
+# mutations are never imported. Baselining needs a mutmut runner that
+# repoints the editable install (or a single-src layout); tracked as a
+# follow-up rather than reshaping the repo for one tool.

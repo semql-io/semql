@@ -13,6 +13,7 @@ docs/api/
 .hypothesis/
 .coverage
 .mutmut-cache
+mutants/
 
 # Token / secret material — both the plaintext source files and the
 # sops-encrypted intermediates stay out of git. Use `sops secrets.enc.yaml`
