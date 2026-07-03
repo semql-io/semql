@@ -44,8 +44,19 @@ venvPath = "."
 venv = ".venv"
 
 [tool.pytest.ini_options]
-addopts = "-q --cov=semql --cov-report=term-missing"
+addopts = "-q --strict-markers --cov=semql --cov-branch --cov-report=term-missing"
 testpaths = ["packages"]
+# Test tiers (W5/§10.5). Unmarked tests are treated as ``unit`` — the
+# fast PR tier runs ``-m 'not integration and not e2e and not bench'``.
+# ``--strict-markers`` (above) turns a typo'd marker into an error, not
+# a silent no-op selection.
+markers = [
+    "unit: fast, in-process, no external services (the implicit default)",
+    "integration: exercises a real in-process engine/DuckDB oracle",
+    "e2e: full stack across process/network boundaries (needs Docker/CI)",
+    "bench: performance/latency budget guard (not a correctness assertion)",
+    "security: authz/tenancy/injection containment property or case",
+]
 
 [tool.coverage.run]
 source = ["semql"]
