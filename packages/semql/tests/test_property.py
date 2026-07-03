@@ -23,6 +23,7 @@ import sqlglot
 from hypothesis import HealthCheck, example, given, settings
 from hypothesis import strategies as st
 from semql import (
+    AuthContext,
     BoolExpr,
     Catalog,
     Cube,
@@ -30,6 +31,7 @@ from semql import (
     Dimension,
     Filter,
     Measure,
+    ScopePredicate,
     SemanticQuery,
     TimeDimension,
     TimeWindow,
@@ -131,6 +133,21 @@ def test_p1_totality_compile_never_crashes(
 # ---------------------------------------------------------------------------
 
 
+def _emitted_param_names(sql: str, dialect: str) -> set[str]:
+    """The set of bind-parameter names the emitted SQL actually
+    references. Backends render a bound value four ways — ``%(p0)s``
+    (postgres pyformat), ``$p0`` (duckdb), ``:p0`` (snowflake) and
+    ``{p0:Type}`` (clickhouse) all reparse to ``exp.Placeholder``,
+    while BigQuery's ``@p0`` reparses to ``exp.Parameter`` — so collect
+    both node kinds."""
+    parsed = sqlglot.parse_one(sql, dialect=dialect)
+    names: set[str] = set()
+    for node in parsed.walk():
+        if isinstance(node, exp.Placeholder | exp.Parameter) and node.name:
+            names.add(node.name)
+    return names
+
+
 @given(trip=swarm())
 @_SWARM
 def test_p2_values_are_bound_never_spliced(
@@ -147,6 +164,11 @@ def test_p2_values_are_bound_never_spliced(
     assert SENTINEL not in out.sql
     # Param keys are unique (no clobbering).
     assert len(out.params) == len(set(out.params))
+    # Placeholders ↔ param-keys are bijective: the SQL references exactly
+    # the keys ``out.params`` carries — no orphan placeholder (a ``pK`` in
+    # the SQL with no bound value) and no orphan param (a bound value the
+    # SQL never references). Both would be a binding bug.
+    assert _emitted_param_names(out.sql, out.dialect.value) == set(out.params)
 
 
 # ---------------------------------------------------------------------------
@@ -210,6 +232,83 @@ def test_p3_every_dialect_emits_parseable_sql(dialect: Dialect) -> None:
     parsed = sqlglot.parse_one(out.sql, dialect=out.dialect.value)
     assert not isinstance(parsed, exp.Command)
     assert not list(parsed.find_all(exp.Command)), f"unparsed fragment in:\n{out.sql}"
+
+
+# ---------------------------------------------------------------------------
+# Auth-containment (P21) — the row-level scope subquery survives into the
+# emitted SQL, nested, and its ctx value is bound not spliced.
+# ---------------------------------------------------------------------------
+
+
+def _reportees_scope(_cube: Cube, viewer: AuthContext) -> ScopePredicate | None:
+    """Row scope: tickets whose assignee reports to the viewer. Admins are
+    unscoped (the fn returns None → no predicate injected)."""
+    if "admin" in viewer.roles:
+        return None
+    return ScopePredicate(
+        sql="{t}.assignee_id IN (SELECT id FROM employees WHERE manager_id = {ctx.viewer_id})",
+        ctx_keys=["ctx.viewer_id"],
+    )
+
+
+def _scoped_catalog() -> Catalog:
+    tickets = Cube(
+        name="tickets",
+        dialect=Dialect.POSTGRES,
+        table="tickets",
+        alias="t",
+        scope="reportees",
+        measures=[Measure(name="count", sql="*", agg="count")],
+        dimensions=[Dimension(name="assignee", sql="{t}.assignee", type="string")],
+    )
+    return Catalog([tickets], scope_fns={"reportees": _reportees_scope})
+
+
+@st.composite
+def _scoped_case(draw: st.DrawFn) -> tuple[list[str], str, SemanticQuery]:
+    # Distinctive viewer ids so "not spliced" can't false-positive on an
+    # incidental identifier substring.
+    viewer_id = draw(st.sampled_from(["viewer_ALPHA", "viewer_BETA", "viewer_GAMMA"]))
+    roles = draw(
+        st.lists(
+            st.sampled_from(["admin", "manager", "analyst", "support"]),
+            min_size=1,
+            max_size=2,
+            unique=True,
+        )
+    )
+    dims = draw(st.lists(st.just("tickets.assignee"), max_size=1, unique=True))
+    return roles, viewer_id, SemanticQuery(measures=["tickets.count"], dimensions=dims)
+
+
+@given(case=_scoped_case())
+@_SWARM
+def test_p21_row_scope_subquery_is_contained_and_bound(
+    case: tuple[list[str], str, SemanticQuery],
+) -> None:
+    roles, viewer_id, query = case
+    cat = _scoped_catalog()
+    viewer = AuthContext(viewer_id=viewer_id, roles=roles)
+    out = cat.compile(query, viewer=viewer)
+    parsed = sqlglot.parse_one(out.sql, dialect=out.dialect.value)
+    scope_tables = {t.name for t in parsed.find_all(exp.Table)}
+
+    if "admin" in roles:
+        # Admin is unscoped: the scope subquery must be absent entirely.
+        assert "employees" not in scope_tables
+        assert viewer_id not in out.sql
+        return
+
+    # Scope fired. The emitted SQL contains the scope subquery (P21).
+    assert "employees" in scope_tables, out.sql
+    emp = next(t for t in parsed.find_all(exp.Table) if t.name == "employees")
+    # Containment: it lives inside a nested subquery, never at the top
+    # level — an outer OR cannot reach around an AND-injected predicate
+    # sunk into the cube's isolation subquery.
+    assert emp.find_ancestor(exp.Subquery) is not None, out.sql
+    # The ctx value is bound, never spliced into SQL text.
+    assert viewer_id not in out.sql
+    assert viewer_id in out.params.values()
 
 
 # ---------------------------------------------------------------------------
