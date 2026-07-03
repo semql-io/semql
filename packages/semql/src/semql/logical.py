@@ -261,6 +261,22 @@ class SymmetricAgg:
 
 
 @dataclass(frozen=True)
+class JoinDiagnostic:
+    """A soft observation about how a query's join graph resolved.
+
+    Emitted per non-root target cube the planner routed to. ``target`` is
+    that cube's name; ``is_ambiguous`` / ``has_one_to_many`` mirror the
+    :class:`JoinPath` flags for the chosen route. Carried on the plan and
+    turned into human-readable :attr:`CompiledQuery.warnings` by the
+    compiler (W3/ktx-C4) — the plan itself stays neutral about presentation.
+    """
+
+    target: str
+    is_ambiguous: bool
+    has_one_to_many: bool
+
+
+@dataclass(frozen=True)
 class LogicalPlan:
     scans: list[Scan]
     joins: list[Join]
@@ -290,6 +306,12 @@ class LogicalPlan:
     # every other plan — kept out of ``__repr__`` to preserve the
     # plan-snapshot contract, exactly like ``having`` / ``segments``.
     symmetric: SymmetricAgg | None = None
+    # Soft join-graph observations (ambiguous / fan-out routes), one per
+    # non-root target the planner resolved. Derived planner state like
+    # ``symmetric`` — kept out of ``__repr__`` so the plan-snapshot
+    # contract is unchanged. The compiler turns these into
+    # ``CompiledQuery.warnings`` (W3/ktx-C4).
+    join_diagnostics: tuple[JoinDiagnostic, ...] = ()
 
     def __repr__(self) -> str:
         lines = [
@@ -346,6 +368,13 @@ def to_logical_plan(
     left_join_cubes = set(query.left_joins)
     cubes_in_from, join_edges = build_join_graph(
         resolved.touched, catalog, left_join_cubes=left_join_cubes
+    )
+    # Soft join-graph diagnostics: re-walk each resolved route from the same
+    # root/forbid-transit the builder used and record ambiguous or fan-out
+    # paths. Cheap (join graphs are tiny) and keeps ``build_join_graph``'s
+    # return shape untouched.
+    join_diagnostics = _collect_join_diagnostics(
+        cubes_in_from, resolved.touched, catalog, left_join_cubes
     )
 
     # 2. Scans & Joins.
@@ -502,6 +531,7 @@ def to_logical_plan(
         segments=tuple(query.segments),
         aliases=tuple(query.aliases.items()),
         symmetric=symmetric,
+        join_diagnostics=join_diagnostics,
     )
 
 
@@ -644,6 +674,40 @@ def output_alias(cube_name: str, field_name: str, collisions: set[str]) -> str:
 # ---------------------------------------------------------------------------
 # Graph helpers (unchanged)
 # ---------------------------------------------------------------------------
+
+
+def _collect_join_diagnostics(
+    cubes_in_from: list[Cube],
+    touched: list[Cube],
+    catalog: dict[str, Cube],
+    left_join_cubes: set[str],
+) -> tuple[JoinDiagnostic, ...]:
+    """Re-resolve each touched target from the FROM root and record the
+    ambiguous / fan-out routes, mirroring :func:`build_join_graph`'s own
+    root choice (``cubes_in_from[0]``) and transit rules so the diagnostics
+    describe the *same* routes the planner emitted. A single-cube query (no
+    joins) yields nothing."""
+    if len(cubes_in_from) < 2:
+        return ()
+    root = cubes_in_from[0]
+    forbid = frozenset(left_join_cubes)
+    diags: list[JoinDiagnostic] = []
+    for c in touched:
+        if c.name == root.name:
+            continue
+        try:
+            jp = find_join_path_detailed(root.name, c.name, catalog, forbid_transit=forbid)
+        except JoinPathError:
+            continue  # a target reachable only via re-rooting — build_join_graph owns that error
+        if jp.is_ambiguous or jp.has_one_to_many:
+            diags.append(
+                JoinDiagnostic(
+                    target=c.name,
+                    is_ambiguous=jp.is_ambiguous,
+                    has_one_to_many=jp.has_one_to_many,
+                )
+            )
+    return tuple(diags)
 
 
 def build_join_graph(
@@ -1108,6 +1172,7 @@ __all__ = [
     "ColumnRef",
     "CompareSplit",
     "Join",
+    "JoinDiagnostic",
     "JoinPath",
     "Limit",
     "LogicalPlan",

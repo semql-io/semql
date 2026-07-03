@@ -225,6 +225,12 @@ class CompiledQuery:
     # every source (a zero-row subquery was emitted instead). See
     # :mod:`semql.partition` for the routing rules.
     physical_sources_hit: tuple[str, ...] = ()
+    # Soft, non-fatal compile-path advisories (W3/ktx-C4). Errors stay
+    # exceptions; this channel carries observations the caller may surface
+    # but need not act on — an ambiguous join path the compiler resolved by
+    # tie-break, or a fan-out join a future SUM would over-count across.
+    # Empty for the overwhelming majority of queries.
+    warnings: tuple[str, ...] = ()
 
     def model_dump(self) -> dict[str, Any]:
         """JSON-safe dict view of this CompiledQuery (round-trip helper).
@@ -244,6 +250,7 @@ class CompiledQuery:
             "derived_sources": list(self.derived_sources),
             "applied_rollup": self.applied_rollup,
             "physical_sources_hit": list(self.physical_sources_hit),
+            "warnings": list(self.warnings),
         }
 
     @classmethod
@@ -268,6 +275,7 @@ class CompiledQuery:
             derived_sources=list(data.get("derived_sources", [])),
             applied_rollup=data.get("applied_rollup"),
             physical_sources_hit=tuple(data.get("physical_sources_hit", ())),
+            warnings=tuple(data.get("warnings", ())),
         )
 
 
@@ -2355,12 +2363,44 @@ class _CompileEnv:
         return sel
 
     def emit(self) -> CompiledQuery:
-        """Dispatch to the symmetric, compare, or simple emission helper."""
+        """Dispatch to the symmetric, compare, or simple emission helper,
+        then attach any soft compile-path warnings (W3/ktx-C4)."""
         if self.plan.symmetric is not None:
-            return _emit_symmetric_query(self)
-        if self.q.compare is not None:
-            return _emit_compare_query(self)
-        return _emit_simple_query(self)
+            compiled = _emit_symmetric_query(self)
+        elif self.q.compare is not None:
+            compiled = _emit_compare_query(self)
+        else:
+            compiled = _emit_simple_query(self)
+        warnings = self._compile_warnings()
+        return _dc_replace(compiled, warnings=warnings) if warnings else compiled
+
+    def _compile_warnings(self) -> tuple[str, ...]:
+        """Human-readable advisories built from the plan's join diagnostics.
+
+        Two callers today: an ambiguous join route (the catalog offers two
+        equal-cost paths and the compiler tie-broke), and a fan-out join
+        that survived :func:`_check_fan_out` (no additive measure is
+        endangered *now*, but the join multiplies rows). Symmetric-aggregation
+        plans emit fan-safe SQL by design, so their fan-out is suppressed."""
+        warnings: list[str] = []
+        symmetric = self.plan.symmetric is not None
+        root = self.plan.root.name
+        for diag in self.plan.join_diagnostics:
+            if diag.is_ambiguous:
+                warnings.append(
+                    f"Ambiguous join path to {diag.target!r}: two or more equal-cost "
+                    f"join routes connect it to {root!r}, and the compiler picked one "
+                    f"by a deterministic tie-break. Declare an explicit join or drop "
+                    f"the redundant edge so the route is a modelled decision."
+                )
+            if diag.has_one_to_many and not symmetric:
+                warnings.append(
+                    f"Join to {diag.target!r} fans out {root!r}'s rows (a one-to-many "
+                    f"traversal). No additive measure is endangered in this query, but "
+                    f"a SUM/COUNT added later would over-count across it — pre-aggregate "
+                    f"{diag.target!r} to the join grain first."
+                )
+        return tuple(warnings)
 
 
 # Synthetic compare-mode output refs: ``compare.<measure>.<facet>``
