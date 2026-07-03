@@ -747,6 +747,32 @@ def _edge_weight(relationship: str, *, forward: bool) -> int:
     return _FAN_OUT_EDGE_WEIGHT if fans_out else _SAFE_EDGE_WEIGHT
 
 
+@dataclass(frozen=True)
+class JoinPath:
+    """A resolved join route between two cubes, with cost-model metadata.
+
+    ``edges`` is the chosen shortest route as ``((next_cube, join), ...)``
+    from root to target — the same shape :func:`find_join_path` returns,
+    empty when root == target.
+
+    ``is_ambiguous`` is True when two or more *distinct* minimum-cost paths
+    connect the cubes. The planner still returns one route (its
+    deterministic tie-break), but an ambiguous flag means the catalog is
+    under-specified: two equally-cheap join routes carry the same measure
+    to the same dimension, and which one the compiler picked is an
+    implementation detail rather than a modelled decision. Callers surface
+    this as a soft warning (W3/C4).
+
+    ``has_one_to_many`` is True when any edge on the chosen route traverses
+    toward the "many" side (fans out per :func:`_edge_weight`) — the signal
+    that a SUM/COUNT carried across it may over-count.
+    """
+
+    edges: tuple[tuple[str, ModelJoin], ...]
+    is_ambiguous: bool
+    has_one_to_many: bool
+
+
 def find_join_path(
     root: str,
     target: str,
@@ -756,6 +782,27 @@ def find_join_path(
     forbid_transit: frozenset[str] = frozenset(),
 ) -> list[tuple[str, ModelJoin]]:
     """Weighted shortest join path from ``root`` to ``target`` (Dijkstra).
+
+    Thin unwrapper over :func:`find_join_path_detailed`: returns just the
+    chosen route as ``[(next_cube, join), ...]``. Prefer the detailed form
+    when you also need the ambiguity / fan-out flags. Raises
+    :class:`JoinPathError` if no path exists."""
+    return list(
+        find_join_path_detailed(
+            root, target, catalog, bidirectional=bidirectional, forbid_transit=forbid_transit
+        ).edges
+    )
+
+
+def find_join_path_detailed(
+    root: str,
+    target: str,
+    catalog: dict[str, Cube],
+    *,
+    bidirectional: bool = True,
+    forbid_transit: frozenset[str] = frozenset(),
+) -> JoinPath:
+    """Weighted shortest join path (Dijkstra) with ambiguity + fan-out flags.
 
     The join graph is undirected for *reachability* — a catalog join is
     declared on one cube but resolves a query from either side, so a
@@ -772,10 +819,16 @@ def find_join_path(
     disappear so the caller refuses rather than emit it. The ``root`` is a
     starting point, never a transit, so it is always free to expand.
 
-    Returns the path as ``[(next_cube, join), ...]`` from ``root`` to
-    ``target``; raises :class:`JoinPathError` if no path exists."""
+    Returns a :class:`JoinPath`; raises :class:`JoinPathError` if no path
+    exists. Alongside the shortest route it reports:
+
+    - ``is_ambiguous`` — whether two or more distinct minimum-cost routes
+      exist (counted with a standard shortest-path count over the Dijkstra
+      settle order; every edge weight is ≥ 1 so a node settles only after
+      all its equal-or-shorter predecessors, making the count exact);
+    - ``has_one_to_many`` — whether any chosen edge fans out."""
     if root == target:
-        return []
+        return JoinPath(edges=(), is_ambiguous=False, has_one_to_many=False)
     # Build the weighted adjacency once: forward edges from every declared
     # join, plus reverse edges when traversal is allowed both ways.
     adj: dict[str, list[tuple[str, ModelJoin, int]]] = {}
@@ -786,16 +839,20 @@ def find_join_path(
                 adj.setdefault(j.to, []).append(
                     (name, j, _edge_weight(j.relationship, forward=False))
                 )
-    # Dijkstra. The monotonic ``order`` counter is the tie-breaker so the
-    # heap never compares the ``path`` payload (ModelJoin isn't orderable)
-    # and the result is deterministic for equal-cost frontiers.
+    # Dijkstra with predecessor tracking + shortest-path counting. The
+    # monotonic ``order`` counter is the heap tie-breaker so it never
+    # compares the ``str`` payload against equal-distance frontiers in a
+    # nondeterministic way; ``prev`` is set only on a *strictly* improving
+    # relaxation, so the chosen representative route is stable. ``count``
+    # tallies distinct minimum-cost routes: reset on improvement, summed on
+    # an equal-cost tie.
     best: dict[str, int] = {root: 0}
+    count: dict[str, int] = {root: 1}
+    prev: dict[str, tuple[str, ModelJoin, int]] = {}
     order = 0
-    pq: list[tuple[int, int, str, list[tuple[str, ModelJoin]]]] = [(0, order, root, [])]
+    pq: list[tuple[int, int, str]] = [(0, order, root)]
     while pq:
-        dist, _, current, path = heapq.heappop(pq)
-        if current == target:
-            return path
+        dist, _, current = heapq.heappop(pq)
         if dist > best.get(current, dist):
             continue
         # A LEFT-joined cube may be an endpoint but not a through-node: don't
@@ -804,15 +861,36 @@ def find_join_path(
             continue
         for neighbour, join, weight in adj.get(current, ()):
             new_dist = dist + weight
-            if new_dist < best.get(neighbour, new_dist + 1):
+            prior = best.get(neighbour)
+            if prior is None or new_dist < prior:
                 best[neighbour] = new_dist
+                count[neighbour] = count[current]
+                prev[neighbour] = (current, join, weight)
                 order += 1
-                heapq.heappush(pq, (new_dist, order, neighbour, path + [(neighbour, join)]))
-    raise JoinPathError(
-        f"No join path from cube {root!r} to {target!r}. "
-        "Declare a Join in the catalog or restructure the query.",
-        root_cube=root,
-        target_cube=target,
+                heapq.heappush(pq, (new_dist, order, neighbour))
+            elif new_dist == prior:
+                count[neighbour] += count[current]
+    if target not in best:
+        raise JoinPathError(
+            f"No join path from cube {root!r} to {target!r}. "
+            "Declare a Join in the catalog or restructure the query.",
+            root_cube=root,
+            target_cube=target,
+        )
+    # Reconstruct the chosen route back-to-front via ``prev``.
+    edges_rev: list[tuple[str, ModelJoin]] = []
+    has_one_to_many = False
+    node = target
+    while node != root:
+        pred, join, weight = prev[node]
+        edges_rev.append((node, join))
+        if weight == _FAN_OUT_EDGE_WEIGHT:
+            has_one_to_many = True
+        node = pred
+    return JoinPath(
+        edges=tuple(reversed(edges_rev)),
+        is_ambiguous=count.get(target, 0) >= 2,
+        has_one_to_many=has_one_to_many,
     )
 
 
@@ -1030,6 +1108,7 @@ __all__ = [
     "ColumnRef",
     "CompareSplit",
     "Join",
+    "JoinPath",
     "Limit",
     "LogicalPlan",
     "OrderBy",
@@ -1040,6 +1119,8 @@ __all__ = [
     "TimeBreakdown",
     "apply_partition_to_plan",
     "apply_rollup_to_plan",
+    "find_join_path",
+    "find_join_path_detailed",
     "partition_scans",
     "to_logical_plan",
 ]

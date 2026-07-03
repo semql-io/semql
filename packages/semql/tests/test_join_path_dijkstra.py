@@ -22,7 +22,7 @@ from __future__ import annotations
 import pytest
 from semql import Catalog, Cube, Dialect, Dimension, Join, Measure, SemanticQuery
 from semql.errors import JoinPathError
-from semql.logical import _edge_weight, find_join_path
+from semql.logical import JoinPath, _edge_weight, find_join_path, find_join_path_detailed
 
 
 def _cube(name: str, alias: str, *, joins: list[Join] | None = None) -> Cube:
@@ -149,3 +149,71 @@ def test_disconnected_cubes_raise_join_path_error() -> None:
     cat = Catalog([a, b]).as_dict()
     with pytest.raises(JoinPathError, match=r"(?i)no join path"):
         find_join_path("a", "b", cat)
+
+
+# ---------------------------------------------------------------------------
+# JoinPath value type + ambiguity flag (ktx M2 surface / W3)
+# ---------------------------------------------------------------------------
+
+
+def test_detailed_edges_match_bare_path() -> None:
+    """``find_join_path_detailed(...).edges`` is the same route the bare
+    ``find_join_path`` returns — the bare form just unwraps the value."""
+    a = _cube("a", "a", joins=[Join(to="b", relationship="many_to_one", on="x")])
+    b = _cube("b", "b")
+    cat = Catalog([a, b]).as_dict()
+    detailed = find_join_path_detailed("a", "b", cat)
+    assert isinstance(detailed, JoinPath)
+    assert list(detailed.edges) == find_join_path("a", "b", cat)
+
+
+def test_self_path_is_empty_and_unambiguous() -> None:
+    a = _cube("a", "a")
+    cat = Catalog([a]).as_dict()
+    jp = find_join_path_detailed("a", "a", cat)
+    assert jp.edges == ()
+    assert jp.is_ambiguous is False
+    assert jp.has_one_to_many is False
+
+
+def test_ambiguous_when_two_equal_cost_paths_exist() -> None:
+    """``a`` reaches ``d`` two equal-cost ways: a→b→d and a→c→d, every edge
+    ``many_to_one`` (cost 1). The planner still returns one route by its
+    deterministic tie-break, but flags the catalog as under-specified."""
+    a = _cube(
+        "a",
+        "a",
+        joins=[
+            Join(to="b", relationship="many_to_one", on="x"),
+            Join(to="c", relationship="many_to_one", on="x"),
+        ],
+    )
+    b = _cube("b", "b", joins=[Join(to="d", relationship="many_to_one", on="x")])
+    c = _cube("c", "c", joins=[Join(to="d", relationship="many_to_one", on="x")])
+    d = _cube("d", "d")
+    cat = Catalog([a, b, c, d]).as_dict()
+    jp = find_join_path_detailed("a", "d", cat)
+    assert jp.is_ambiguous is True
+    assert len(jp.edges) == 2  # still a single chosen 2-hop route
+    assert jp.has_one_to_many is False
+
+
+def test_unique_path_is_not_ambiguous() -> None:
+    a = _cube("a", "a", joins=[Join(to="b", relationship="many_to_one", on="x")])
+    b = _cube("b", "b", joins=[Join(to="d", relationship="many_to_one", on="x")])
+    d = _cube("d", "d")
+    cat = Catalog([a, b, d]).as_dict()
+    jp = find_join_path_detailed("a", "d", cat)
+    assert jp.is_ambiguous is False
+    assert jp.has_one_to_many is False
+
+
+def test_has_one_to_many_when_chosen_route_fans_out() -> None:
+    """The only route from ``a`` to ``d`` is a one_to_many edge — the chosen
+    path fans out, so ``has_one_to_many`` is set even though it is unique."""
+    a = _cube("a", "a", joins=[Join(to="d", relationship="one_to_many", on="x")])
+    d = _cube("d", "d")
+    cat = Catalog([a, d]).as_dict()
+    jp = find_join_path_detailed("a", "d", cat)
+    assert jp.has_one_to_many is True
+    assert jp.is_ambiguous is False
