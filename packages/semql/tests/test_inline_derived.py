@@ -6,9 +6,12 @@ Three ops over existing catalog measures, composed at query time:
 - ``sum``: ``a_agg(a) + b_agg(b) + ... AS name``
 - ``diff``: ``a_agg(a) - b_agg(b) AS name``
 
-Phase A: every operand must resolve to a measure on the same cube;
-cross-cube refs raise. The derived measure is addressable in
-``order`` and ``having`` by its ``name``.
+Operands may span cubes when the join graph connects them
+unambiguously and fan-safely (C17): a cross-cube ratio compiles over a
+``one_to_one`` join, but is refused when the operand cube is
+unreachable, reached two equal-cost ways (ambiguous), or joined so
+that an additive operand fans out. The derived measure is addressable
+in ``order`` and ``having`` by its ``name``.
 """
 
 from __future__ import annotations
@@ -22,6 +25,7 @@ from semql import (
     Dimension,
     Filter,
     InlineDerived,
+    Join,
     Measure,
     SemanticQuery,
 )
@@ -205,8 +209,10 @@ def test_inline_diff_subtracts_second_from_first() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_inline_cross_cube_operands_rejected() -> None:
-    """Phase A: every operand must be on the same cube."""
+def test_inline_cross_cube_unreachable_rejected() -> None:
+    """Cross-cube operands whose cubes share no join path are refused —
+    ``orders`` and ``customers`` are disconnected in ``_cat()``, so the
+    operand cube can't be pulled into the FROM clause."""
     q = SemanticQuery(
         measures=["orders.revenue"],
         dimensions=["orders.region"],
@@ -218,8 +224,154 @@ def test_inline_cross_cube_operands_rejected() -> None:
             ),
         ],
     )
-    with pytest.raises(CompileError, match=r"(?i)same cube"):
+    with pytest.raises(CompileError, match=r"(?i)no join path|unreachable"):
         _cat().compile(q)
+
+
+# ---------------------------------------------------------------------------
+# Cross-cube operands (C17) — reachable + unambiguous + fan-safe
+# ---------------------------------------------------------------------------
+
+
+def _orders_extras_cat() -> Catalog:
+    """Orders ⋈ order_extras over a ``one_to_one`` join — neither side
+    duplicates, so a cross-cube composition is fan-safe."""
+    orders = Cube(
+        name="orders",
+        dialect=Dialect.POSTGRES,
+        table="orders",
+        alias="o",
+        measures=[Measure(name="revenue", sql="{o}.amount", agg="sum")],
+        dimensions=[Dimension(name="region", sql="{o}.region", type="string")],
+        joins=[
+            Join(
+                to="order_extras",
+                relationship="one_to_one",
+                on="{o}.id = {e}.order_id",
+            )
+        ],
+    )
+    extras = Cube(
+        name="order_extras",
+        dialect=Dialect.POSTGRES,
+        table="order_extras",
+        alias="e",
+        measures=[Measure(name="bonus", sql="{e}.bonus", agg="sum")],
+        dimensions=[Dimension(name="order_id", sql="{e}.order_id", type="number")],
+    )
+    return Catalog([orders, extras])
+
+
+def test_inline_cross_cube_ratio_over_one_to_one_compiles() -> None:
+    """A ratio whose denominator lives on a ``one_to_one``-joined cube
+    compiles: the operand cube is pulled into the FROM clause even
+    though it is referenced only through the derived measure."""
+    q = SemanticQuery(
+        measures=["orders.revenue"],
+        dimensions=["orders.region"],
+        derived_measures=[
+            InlineDerived(
+                name="rev_per_bonus",
+                op="ratio",
+                operands=["orders.revenue", "order_extras.bonus"],
+            ),
+        ],
+    )
+    out = _orders_extras_cat().compile(q)
+    assert "rev_per_bonus" in out.columns
+    assert "NULLIF" in out.sql.upper()
+    # The operand-only cube is joined in even though it is not projected.
+    assert "order_extras" in out.sql
+    assert "bonus" not in out.columns  # operand, not an output column
+
+
+def test_inline_cross_cube_fanning_operand_rejected() -> None:
+    """An additive operand that fans out across the join is refused, even
+    when the fanning measure appears *only* as a derived operand (never
+    in the query's own ``measures``)."""
+    orders = Cube(
+        name="orders",
+        dialect=Dialect.POSTGRES,
+        table="orders",
+        alias="o",
+        measures=[Measure(name="revenue", sql="{o}.amount", agg="sum")],
+        dimensions=[Dimension(name="region", sql="{o}.region", type="string")],
+        joins=[
+            Join(
+                to="items",
+                relationship="one_to_many",
+                on="{o}.id = {i}.order_id",
+            )
+        ],
+    )
+    items = Cube(
+        name="items",
+        dialect=Dialect.POSTGRES,
+        table="items",
+        alias="i",
+        measures=[Measure(name="qty", sql="{i}.quantity", agg="sum")],
+        dimensions=[Dimension(name="sku", sql="{i}.sku", type="string")],
+    )
+    cat = Catalog([orders, items])
+    q = SemanticQuery(
+        dimensions=["orders.region"],
+        derived_measures=[
+            InlineDerived(
+                name="rev_per_qty",
+                op="ratio",
+                operands=["orders.revenue", "items.qty"],
+            ),
+        ],
+    )
+    with pytest.raises(CompileError, match=r"(?i)fans out"):
+        cat.compile(q)
+
+
+def test_inline_cross_cube_ambiguous_path_rejected() -> None:
+    """When the operand cube is reachable two equal-cost ways the
+    derivation's value depends on which route the planner picks, so it is
+    refused rather than silently resolved."""
+
+    def _oo(name: str, alias: str, *, to: str | None = None) -> Cube:
+        joins = [Join(to=to, relationship="one_to_one", on=f"{{{alias}}}.k = x")] if to else []
+        return Cube(
+            name=name,
+            dialect=Dialect.POSTGRES,
+            table=name,
+            alias=alias,
+            measures=[Measure(name="val", sql=f"{{{alias}}}.v", agg="sum")],
+            dimensions=[Dimension(name="region", sql=f"{{{alias}}}.region", type="string")],
+            joins=joins,
+        )
+
+    orders = Cube(
+        name="orders",
+        dialect=Dialect.POSTGRES,
+        table="orders",
+        alias="o",
+        measures=[Measure(name="revenue", sql="{o}.amount", agg="sum")],
+        dimensions=[Dimension(name="region", sql="{o}.region", type="string")],
+        joins=[
+            Join(to="b", relationship="one_to_one", on="{o}.k = x"),
+            Join(to="c", relationship="one_to_one", on="{o}.k = x"),
+        ],
+    )
+    b = _oo("b", "b", to="d")
+    c = _oo("c", "c", to="d")
+    d = _oo("d", "d")
+    cat = Catalog([orders, b, c, d])
+    q = SemanticQuery(
+        dimensions=["orders.region"],
+        derived_measures=[
+            InlineDerived(
+                name="rev_per_d",
+                op="ratio",
+                operands=["orders.revenue", "d.val"],
+            ),
+        ],
+    )
+    with pytest.raises(CompileError, match=r"(?i)ambiguous"):
+        cat.compile(q)
 
 
 def test_inline_operand_must_be_measure() -> None:

@@ -142,6 +142,11 @@ class _ResolvedFields:
     where_leaf_resolutions: dict[str, tuple[Cube, Dimension | Measure | TimeDimension | Segment]]
     segment_resolutions: list[tuple[Cube, Segment]]
     touched: list[Cube]
+    # (cube, measure) for every InlineDerived operand that resolves to a
+    # measure. Kept apart from ``measure_fields`` so operands are *not*
+    # emitted as output columns, yet still feed the fan-out guard — a
+    # cross-cube operand that fans out must be refused like any measure.
+    derived_operand_fields: list[tuple[Cube, Measure]]
 
 
 def walk_where_leaves(expr: BoolExpr | Filter) -> list[Filter]:
@@ -443,6 +448,40 @@ def walk_query_fields(
         if cube_obj not in touched:
             touched.append(cube_obj)
 
+    # Inline derived measures (C17). Resolve each operand and pull its
+    # cube into ``touched`` so the join graph joins it — an operand cube
+    # referenced *only* through a derivation must still reach the FROM
+    # clause. Operands that don't resolve are left for the compile
+    # emitter to report precisely; here we just collect what resolves.
+    # Declared ``dependencies`` (bridge cubes) are pulled in too.
+    derived_operand_fields: list[tuple[Cube, Measure]] = []
+    for ir in q.derived_measures:
+        for operand_ref in ir.operands:
+            try:
+                c, fld = resolve_with_views(operand_ref)
+            except Exception:
+                continue  # emitter raises the precise CompileError.
+            if isinstance(fld, Measure):
+                derived_operand_fields.append((c, fld))
+                if c not in touched:
+                    touched.append(c)
+        for dep in ir.dependencies:
+            dep_cube = catalog.get(dep)
+            if dep_cube is None:
+                diagnostics.append(
+                    ResolutionDiagnostic(
+                        code="derived_unknown_dependency",
+                        message=(
+                            f"InlineDerived({ir.name!r}): dependency {dep!r} "
+                            f"is not a cube in the catalog."
+                        ),
+                        cube=dep,
+                    )
+                )
+                continue
+            if dep_cube not in touched:
+                touched.append(dep_cube)
+
     resolved = _ResolvedFields(
         measure_fields=measure_fields,
         dim_fields=dim_fields,
@@ -452,6 +491,7 @@ def walk_query_fields(
         where_leaf_resolutions=where_leaf_resolutions,
         segment_resolutions=segment_resolutions,
         touched=touched,
+        derived_operand_fields=derived_operand_fields,
     )
     return resolved, diagnostics
 

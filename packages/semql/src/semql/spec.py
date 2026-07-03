@@ -251,9 +251,14 @@ class InlineDerived(BaseModel):
     - ``"diff"``: exactly two operands; emits
       ``<a_agg>(a) - <b_agg>(b) AS name``.
 
-    Phase A restriction: every operand must resolve to a measure on
-    the same cube. Cross-cube refs raise at compile time with a hint
-    to pre-declare the derivation in the catalog.
+    Operands may span cubes when the join graph connects them (C17):
+    the compiler pulls each operand's cube into the FROM clause and
+    validates the route is unambiguous and fan-safe. It refuses a
+    derivation whose operand cube is unreachable, reachable two
+    equal-cost ways (ambiguous — the value would depend on the route),
+    or joined so that an additive operand fans out. Stable cross-cube
+    metrics still belong in the catalog; this is the ad-hoc escape
+    hatch.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -265,7 +270,17 @@ class InlineDerived(BaseModel):
     )
     operands: list[str] = Field(
         description=(
-            "Qualified measure refs ('cube.measure'); Phase A requires all on the same cube."
+            "Qualified measure refs ('cube.measure'); may span cubes the "
+            "join graph connects unambiguously and fan-safely."
+        ),
+    )
+    dependencies: tuple[str, ...] = Field(
+        default=(),
+        description=(
+            "Extra cube names to pull into the join graph for this "
+            "derivation — e.g. a bridge cube linking the operand cubes "
+            "that is not itself an operand. Operand cubes are joined "
+            "automatically; this covers intermediaries they need."
         ),
     )
 

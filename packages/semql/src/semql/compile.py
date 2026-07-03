@@ -87,6 +87,7 @@ from semql.logical import (
     FAN_OUT_SENSITIVE_AGGS,
     LogicalPlan,
     apply_rollup_to_plan,
+    find_join_path_detailed,
     output_alias,
     output_column_collisions,
 )
@@ -615,6 +616,48 @@ _PERCENTILE_AGGS: dict[str, float] = {
 }
 
 
+def _check_cross_cube_operand_reachable(
+    ir: InlineDerived,
+    anchor_cube: Cube,
+    operand_cube: Cube,
+    operand_ref: str,
+    env: _CompileEnv,
+) -> None:
+    """Refuse a cross-cube operand reached over an ambiguous join path.
+
+    The join graph is already built by the time this runs, so an
+    *unreachable* operand cube has raised ``JoinPathError`` upstream
+    (the cube couldn't be pulled into the FROM clause). What survives
+    to here is reachable — but if it is reachable two equal-cost ways
+    the planner silently tie-breaks, and the derivation's value would
+    depend on that arbitrary choice. Refuse rather than resolve it
+    quietly. Re-walk from the anchor with the same left-join transit
+    prohibition the graph builder used."""
+    try:
+        jp = find_join_path_detailed(
+            anchor_cube.name,
+            operand_cube.name,
+            env.catalog,
+            forbid_transit=frozenset(env.left_join_cubes),
+        )
+    except JoinPathError as exc:  # pragma: no cover — build_join_graph raises first
+        raise CompileError(
+            f"InlineDerived({ir.name!r}): operand {operand_ref!r} is on "
+            f"cube {operand_cube.name!r}, unreachable from {anchor_cube.name!r}. "
+            f"Declare a join between them, or add a bridge cube via "
+            f"``dependencies``."
+        ) from exc
+    if jp.is_ambiguous:
+        raise CompileError(
+            f"InlineDerived({ir.name!r}): operand {operand_ref!r} on cube "
+            f"{operand_cube.name!r} has an ambiguous join path from "
+            f"{anchor_cube.name!r} — it is reachable two or more equal-cost "
+            f"ways, so the derivation's value would depend on which route is "
+            f"chosen. The catalog is under-specified: make one path cheaper "
+            f"(a direct join) or pre-declare the derivation in the catalog."
+        )
+
+
 def _build_inline_derived_expr(
     ir: InlineDerived,
     env: _CompileEnv,
@@ -631,9 +674,14 @@ def _build_inline_derived_expr(
     - ``sum``: ``a_agg + b_agg + ...``.
     - ``diff``: ``a_agg - b_agg``.
 
-    Phase A restriction: every operand must resolve to a measure on
-    the same cube. The first operand's cube is the anchor; subsequent
-    operands referencing a different cube raise.
+    Operands may span cubes (C17). The first operand's cube is the
+    anchor; every other operand cube must reach the anchor over an
+    *unambiguous* join path (a route reachable two equal-cost ways is
+    refused — the value would depend on which the planner picked).
+    Reachability itself is enforced upstream when the join graph is
+    built; fan-out safety by :func:`_check_fan_out`, which sees the
+    operand measures. This function guards only the ambiguity a silent
+    tie-break would otherwise hide.
     """
     if ir.name in already_declared:
         raise CompileError(
@@ -660,13 +708,7 @@ def _build_inline_derived_expr(
         if anchor_cube is None:
             anchor_cube = cube
         elif cube is not anchor_cube:
-            raise CompileError(
-                f"InlineDerived({ir.name!r}): operand {operand_ref!r} is "
-                f"on cube {cube.name!r}, but earlier operands are on "
-                f"{anchor_cube.name!r}. Phase A requires every operand "
-                "to live on the same cube — pre-declare cross-cube "
-                "derivations in the catalog."
-            )
+            _check_cross_cube_operand_reachable(ir, anchor_cube, cube, operand_ref, env)
         resolved_operands.append((cube, fld))
 
     nodes = [env.build_measure_expr(cube, m) for cube, m in resolved_operands]
@@ -1530,6 +1572,10 @@ class _CompileEnv:
         self.where_leaf_resolutions = resolved.where_leaf_resolutions
         self.segment_resolutions = resolved.segment_resolutions
         self.touched = resolved.touched
+        # InlineDerived operand (cube, measure) pairs — not projected, but
+        # they participate in the fan-out guard so a cross-cube operand
+        # that the join would inflate is refused (C17).
+        self.derived_operand_fields = resolved.derived_operand_fields
 
         _check_lifecycle(self.touched)
         _check_viewer_authorization(self.touched, viewer, policy)
@@ -1657,7 +1703,7 @@ class _CompileEnv:
         # touched-cube prelude above. A chasm trap the planner flagged for
         # symmetric aggregation is emitted fan-safely, so it is not refused.
         _check_fan_out(
-            self.measure_fields,
+            [*self.measure_fields, *self.derived_operand_fields],
             self.join_edges,
             symmetric_handled=self.plan.symmetric is not None,
         )
