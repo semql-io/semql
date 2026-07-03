@@ -18,6 +18,7 @@ from __future__ import annotations
 import contextlib
 from typing import cast
 
+import pytest
 import sqlglot
 from hypothesis import HealthCheck, example, given, settings
 from hypothesis import strategies as st
@@ -31,6 +32,7 @@ from semql import (
     Measure,
     SemanticQuery,
     TimeDimension,
+    TimeWindow,
     compile_query,
     is_read_only_statement,
     to_logical_plan,
@@ -42,7 +44,7 @@ from semql.dialect import dialect_for as sqlglot_dialect_for
 from semql.errors import SemQLError
 from sqlglot import exp
 
-from .strategies import SENTINEL, broken_pair, swarm
+from .strategies import DIALECT_BACKENDS, SENTINEL, broken_pair, swarm
 
 # Swarm catalogs/queries are richer than the default health-check budget
 # expects; suppress the timing alarm but never ``filter_too_much`` (§3.5).
@@ -164,6 +166,48 @@ def test_p3_emitted_sql_parses_under_its_dialect(
         return
     parsed = sqlglot.parse_one(out.sql, dialect=out.dialect.value)
     # ``exp.Command`` is sqlglot's "couldn't really parse this" fallback.
+    assert not isinstance(parsed, exp.Command)
+    assert not list(parsed.find_all(exp.Command)), f"unparsed fragment in:\n{out.sql}"
+
+
+def _dialect_probe_catalog(dialect: Dialect) -> Catalog:
+    """A one-cube catalog whose only variable is the backend — used to
+    pin P3 to *every* dialect deterministically (the swarm hits each
+    dialect only by chance)."""
+    orders = Cube(
+        name="orders",
+        dialect=dialect,
+        table="orders",
+        alias="o",
+        base_predicate="{o}.deleted_at IS NULL",
+        measures=[Measure(name="revenue", sql="{o}.amount", agg="sum")],
+        dimensions=[Dimension(name="region", sql="{o}.region", type="string")],
+        time_dimensions=[TimeDimension(name="created_at", sql="{o}.created_at")],
+    )
+    return Catalog([orders])
+
+
+@pytest.mark.parametrize("dialect", DIALECT_BACKENDS, ids=lambda d: d.value)
+def test_p3_every_dialect_emits_parseable_sql(dialect: Dialect) -> None:
+    """Systematic companion to the swarm P3: the same query — which
+    forces the dialect-sensitive surface (date-truncation, LIMIT,
+    bound filter, GROUP BY, ORDER BY) — parses under each backend with
+    no ``exp.Command`` fallback."""
+    cat = _dialect_probe_catalog(dialect)
+    q = SemanticQuery(
+        measures=["orders.revenue"],
+        dimensions=["orders.region"],
+        time_dimension=TimeWindow(
+            dimension="orders.created_at",
+            granularity="month",
+            range=("2020-01-01", "2025-01-01"),
+        ),
+        filters=[Filter(dimension="orders.region", op="eq", values=["EU"])],
+        order=[("orders.revenue", "desc")],
+        limit=100,
+    )
+    out = compile_query(q, cat.as_dict())
+    parsed = sqlglot.parse_one(out.sql, dialect=out.dialect.value)
     assert not isinstance(parsed, exp.Command)
     assert not list(parsed.find_all(exp.Command)), f"unparsed fragment in:\n{out.sql}"
 

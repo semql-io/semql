@@ -66,7 +66,7 @@ identifier: st.SearchStrategy[str] = st.sampled_from(_POOL)
 
 # Backends with a real sqlglot dialect (excludes META). ``Dialect.value`` is
 # the sqlglot dialect name, so the dialect-validity property can reuse it.
-_DIALECT_BACKENDS = [
+DIALECT_BACKENDS = [
     Dialect.POSTGRES,
     Dialect.CLICKHOUSE,
     Dialect.DUCKDB,
@@ -262,7 +262,7 @@ def random_catalog(draw: st.DrawFn, features: frozenset[str] = FEATURES) -> Cata
     """A tree-shaped catalog (one backend). Edges are FK-on-child
     (``{child}.p<i> = {parent}.id``); relationships bias to ``many_to_one``
     so most queries don't trip the fan-out guard."""
-    dialect = draw(st.sampled_from(_DIALECT_BACKENDS))
+    dialect = draw(st.sampled_from(DIALECT_BACKENDS))
     n_cubes = draw(st.integers(1, 4)) if "joins" in features else 1
     names = draw(st.lists(identifier, min_size=n_cubes, max_size=n_cubes, unique=True))
     cubes: list[Cube] = []
