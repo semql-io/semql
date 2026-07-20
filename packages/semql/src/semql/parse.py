@@ -246,9 +246,11 @@ def _count_measure_ref(catalog: dict[str, Cube] | None, ctx: ResolveCtx) -> str 
     by name like ``SUM(amount)``. Find the cube measure declared as a row
     count (``agg="count"``, ``sql="*"``) among the query's cubes:
 
-    - exactly one participating cube declares one → use it;
-    - more than one (a JOIN where both sides count) → ambiguous, return
-      ``None`` so the caller surfaces it rather than guessing a grain;
+    - exactly one participating cube declares exactly one → use it;
+    - more than one across the participating cubes (a JOIN where both
+      sides count, *or* a single cube declaring two row-count measures)
+      → ambiguous, return ``None`` so the caller surfaces it rather than
+      guessing which measure it means;
     - none found / uncatalogued → fall back to ``<cube>.count`` for the
       single-cube case (the validation pass flags it if absent)."""
     if catalog is not None:
@@ -257,10 +259,11 @@ def _count_measure_ref(catalog: dict[str, Cube] | None, ctx: ResolveCtx) -> str 
             cube = catalog.get(name)
             if cube is None:
                 continue
-            for m in cube.measures:
-                if m.agg == "count" and m.sql.strip() == "*":
-                    owners.append(f"{name}.{m.name}")
-                    break
+            matches = [m.name for m in cube.measures if m.agg == "count" and m.sql.strip() == "*"]
+            if len(matches) > 1:
+                return None  # ambiguous within this cube alone
+            if matches:
+                owners.append(f"{name}.{matches[0]}")
         if len(owners) == 1:
             return owners[0]
         if len(owners) > 1:
@@ -587,7 +590,8 @@ def parse_sql_statement(
                 # Resolve to a qualified ``cube.field`` ref — the form the
                 # compiler requires (bare refs raise a resolution error).
                 ref = ctx.resolve(inner) if inner is not None else None
-                if ref is None and isinstance(agg, exp.Count):
+                is_count_star = ref is None and isinstance(agg, exp.Count)
+                if is_count_star:
                     # COUNT(*) → the row-count measure of the participating cube.
                     ref = _count_measure_ref(catalog, ctx)
                 if ref:
@@ -597,6 +601,15 @@ def parse_sql_statement(
                         measures.append(ref)
                     if single and output_alias and output_alias != field_name:
                         aliases[output_alias] = ref
+                elif is_count_star and catalog is not None:
+                    # Ambiguous: either two+ cubes each declare a row-count
+                    # measure, or one cube declares more than one — surface
+                    # it rather than silently dropping the measure.
+                    errors.append(
+                        f"Ambiguous COUNT(*) in {expr.sql()!r}: more than one "
+                        "row-count measure among the participating cubes; "
+                        "reference the measure by name instead."
+                    )
         else:
             # Plain column — dimension.
             ref = ctx.resolve(expr)

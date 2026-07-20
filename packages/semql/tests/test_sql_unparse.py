@@ -123,6 +123,33 @@ def test_generated_sql_uses_true_aggregate_with_catalog() -> None:
     assert "COUNT(*)" in sql
 
 
+def test_two_row_count_measures_on_one_cube_round_trips_without_bare_count_star() -> None:
+    """A cube declaring two row-count measures (``agg='count', sql='*'``)
+    makes bare ``COUNT(*)`` ambiguous — referencing either one must emit an
+    explicit, unambiguous form that round-trips to the *same* measure, not
+    whichever one the parser would otherwise guess first."""
+    from semql.model import Cube, Dialect, Measure
+
+    catalog = {
+        "orders": Cube(
+            name="orders",
+            dialect=Dialect.POSTGRES,
+            table="{schema}.orders",
+            alias="o",
+            measures=[
+                Measure(name="count", sql="*", agg="count", unit="count"),
+                Measure(name="num_rows", sql="*", agg="count", unit="count"),
+            ],
+        )
+    }
+    q = SemanticQuery(measures=["orders.num_rows"])
+    sql = query_to_sql(q, catalog)
+    assert sql.strip() != "SELECT COUNT(*) FROM orders"
+    decision = parse_sql_statement(sql, catalog, strict=True)
+    assert decision.parse_errors == (), decision.parse_errors
+    assert decision.query == q
+
+
 # ---------------------------------------------------------------------------
 # Unsupported features are flagged, never silently dropped
 # ---------------------------------------------------------------------------

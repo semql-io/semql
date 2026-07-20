@@ -171,8 +171,13 @@ class _Serializer:
         return seen
 
     def _row_count_cube(self, ref: str) -> str | None:
-        """The cube of ``ref`` if ``ref`` is a catalog row-count measure
-        (``agg='count'``, ``sql='*'``), else ``None``."""
+        """The cube of ``ref`` if ``ref`` is *the* catalog row-count measure
+        (``agg='count'``, ``sql='*'``) on its cube, else ``None``.
+
+        A cube declaring more than one row-count measure makes bare
+        ``COUNT(*)`` ambiguous — the parser can't tell which one it means
+        (it always resolves to the first declared), so ``ref`` must be the
+        cube's *sole* row-count measure to qualify."""
         if self.catalog is None:
             return None
         cube_name = cube_of(ref)
@@ -180,9 +185,11 @@ class _Serializer:
         if cube is None:
             return None
         field = ref.split(".", 1)[1]
-        for m in cube.measures:
-            if m.name == field and m.agg == "count" and m.sql.strip() == "*":
-                return cube_name
+        count_measures = [
+            m.name for m in cube.measures if m.agg == "count" and m.sql.strip() == "*"
+        ]
+        if field in count_measures and len(count_measures) == 1:
+            return cube_name
         return None
 
     def _cubes_with_row_count(self) -> set[str]:

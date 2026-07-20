@@ -191,6 +191,35 @@ def test_count_star_with_alias_captured(catalog: dict) -> None:
     assert q.aliases == {"n": "orders.count"}
 
 
+def test_count_star_ambiguous_with_two_row_count_measures_on_one_cube() -> None:
+    """A cube declaring two row-count measures (``agg='count', sql='*'``)
+    makes bare ``COUNT(*)`` ambiguous — it must not silently resolve to
+    whichever measure happens to be declared first."""
+    from semql.model import Cube, Dialect, Measure
+
+    two_count_catalog = {
+        "orders": Cube(
+            name="orders",
+            dialect=Dialect.POSTGRES,
+            table="{schema}.orders",
+            alias="o",
+            measures=[
+                Measure(name="count", sql="*", agg="count", unit="count"),
+                Measure(name="num_rows", sql="*", agg="count", unit="count"),
+            ],
+        )
+    }
+    out = parse_sql_statement(
+        "SELECT COUNT(*) FROM orders",
+        catalog=two_count_catalog,
+        strict=False,
+    )
+    q = out.query
+    assert "orders.count" not in q.measures
+    assert "orders.num_rows" not in q.measures
+    assert out.parse_errors != ()
+
+
 def test_having_over_aggregate_becomes_measure_filter(catalog: dict) -> None:
     """``HAVING SUM(revenue) > 1000`` unwraps the aggregate to a filter
     on the measure — it must not be silently dropped."""
