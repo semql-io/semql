@@ -147,7 +147,15 @@ bump part="patch":
         raise SystemExit("no package pyproject.toml files found under packages/*/")
 
     version_re = re.compile(r'(?m)^version = "(\d+)\.(\d+)\.(\d+)"$')
-    semql_dep_re = re.compile(r'semql>=\d+\.\d+\.\d+,<\d+\.\d+')
+    # Match EVERY internal sibling range, not just bare ``semql>=``. The
+    # package names are the ``packages/*/`` dir names; longest-first so the
+    # alternation prefers ``semql-prompt`` over the ``semql`` prefix. An
+    # earlier ``semql>=`` literal skipped ``semql-prompt>=…`` (after
+    # ``semql`` comes ``-``, not ``>``), so that pin drifted out of lockstep.
+    internal_names = sorted((p.parent.name for p in package_files), key=len, reverse=True)
+    semql_dep_re = re.compile(
+        r"(" + "|".join(re.escape(n) for n in internal_names) + r")>=\d+\.\d+\.\d+,<\d+\.\d+"
+    )
 
     first_text = package_files[0].read_text()
     match = version_re.search(first_text)
@@ -167,19 +175,20 @@ bump part="patch":
 
     new_version = f"{major}.{minor}.{patch}"
     upper_bound = f"{major}.{minor + 1}"
-    new_dep = f"semql>={new_version},<{upper_bound}"
+    # ``\1`` keeps whichever sibling name matched (semql, semql-prompt, …).
+    new_dep = rf"\g<1>>={new_version},<{upper_bound}"
 
     for path in package_files:
         text = path.read_text()
         if not version_re.search(text):
             raise SystemExit(f"missing [project].version in {path}")
         text, version_count = version_re.subn(f'version = "{new_version}"', text, count=1)
-        text = semql_dep_re.sub(new_dep, text)
+        text, dep_count = semql_dep_re.subn(new_dep, text)
         path.write_text(text)
-        print(f"updated {path} ({version_count} version field)")
+        print(f"updated {path} ({version_count} version field, {dep_count} dep ranges)")
 
     print(f"bumped all packages to {new_version}")
-    print(f"updated semql dependency spec to {new_dep}")
+    print(f"pinned all internal sibling ranges to >={new_version},<{upper_bound}")
 
 # ---------------------------------------------------------------------------
 # Staged release — semql first, wait for the index, then dependents.
