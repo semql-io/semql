@@ -312,6 +312,42 @@ def test_between_becomes_time_window() -> None:
 
 
 # ---------------------------------------------------------------------------
+# DATE_TRUNC in SELECT → time_dimension.granularity
+# ---------------------------------------------------------------------------
+
+
+def test_date_trunc_in_select_sets_granularity() -> None:
+    """``DATE_TRUNC('<grain>', dim)`` in SELECT + a matching ``BETWEEN`` on
+    the same dimension sets ``time_dimension.granularity`` (and does not add
+    the time dimension to ``dimensions``)."""
+    out = parse_sql_statement(
+        "SELECT DATE_TRUNC('month', created_at), SUM(amount) FROM orders "
+        "WHERE created_at BETWEEN '2026-01-01' AND '2026-03-31' "
+        "GROUP BY DATE_TRUNC('month', created_at)",
+        catalog=None,
+    )
+    q = out.query
+    assert q.time_dimension is not None
+    assert q.time_dimension.dimension == "orders.created_at"
+    assert q.time_dimension.granularity == "month"
+    assert q.time_dimension.range == ("2026-01-01", "2026-03-31")
+    # The bucketed time dimension is not a plain grouping dimension.
+    assert "orders.created_at" not in q.dimensions
+
+
+def test_date_trunc_without_matching_between_is_error() -> None:
+    """A ``DATE_TRUNC`` bucket with no ``BETWEEN`` window on the same
+    dimension is flagged rather than silently dropped."""
+    from semql.parse import ParseError
+
+    with pytest.raises(ParseError, match=r"(?i)date_trunc|between|window"):
+        parse_sql_statement(
+            "SELECT DATE_TRUNC('month', created_at), SUM(amount) FROM orders",
+            catalog=None,
+        )
+
+
+# ---------------------------------------------------------------------------
 # Strict / lenient modes
 # ---------------------------------------------------------------------------
 
