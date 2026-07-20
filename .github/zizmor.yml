@@ -1,0 +1,11 @@
+# zizmor configuration.
+#
+# We pin actions to tags (e.g. @v4), not commit SHAs. Dependabot's weekly
+# github-actions update keeps those tags current. Relax the default
+# blanket hash-pin requirement to a ref-pin (tag/branch/sha all accepted;
+# only a floating/absent ref is rejected).
+rules:
+  unpinned-uses:
+    config:
+      policies:
+        "*": ref-pin

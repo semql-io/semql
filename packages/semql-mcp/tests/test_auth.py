@@ -76,7 +76,13 @@ def test_query_tool_refuses_when_provider_viewer_lacks_role() -> None:
     )
     out = _call_query_semantic(server)
     assert "error" in out
-    assert "not authorised" in out["error"]["message"]
+    # A viewer lacking the required role can't see the gated cube at all:
+    # it is filtered from their catalog, so resolution reports "Unknown cube"
+    # rather than confirming the cube exists ("not authorised"). This
+    # hide-existence behaviour is intentional and matches the core compiler
+    # (see semql/tests/test_auth.py). The denied query yields no SQL.
+    assert "Unknown cube" in out["error"]["message"]
+    assert "sql" not in out
 
 
 def test_query_tool_allows_when_provider_viewer_has_role() -> None:

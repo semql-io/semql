@@ -1,6 +1,6 @@
 # semql-auth
 
-Credential→identity adapters for [semql](https://github.com/npalladium/semql).
+Credential→identity adapters for [semql](https://github.com/semql-io/semql).
 
 `semql` threads an `AuthContext` (identity + roles) through
 `Catalog.compile(viewer=...)` to enforce `required_roles` cube/field

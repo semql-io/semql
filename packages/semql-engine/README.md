@@ -1,6 +1,6 @@
 # semql-engine
 
-In-process executor for [`semql`](https://github.com/npalladium/semql)
+In-process executor for [`semql`](https://github.com/semql-io/semql)
 `FederatedPlan` results. Runs each per-backend fragment via a
 caller-supplied `Adapter`, materialises the rows into in-memory DuckDB,
 then runs the plan's merge SQL against the assembled tables.

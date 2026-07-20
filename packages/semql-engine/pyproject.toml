@@ -1,6 +1,6 @@
 [project]
 name = "semql-engine"
-version = "0.5.0"
+version = "0.6.0"
 description = "In-process executor for semql FederatedPlans — runs per-backend fragments via caller-supplied adapters and merges results in DuckDB."
 readme = "README.md"
 license = "BSD-3-Clause"
@@ -11,7 +11,7 @@ authors = [
 requires-python = ">=3.12"
 dependencies = [
     "duckdb>=1.5.3",
-    "semql>=0.5.0,<0.6",
+    "semql>=0.6.0,<0.7",
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -26,9 +26,9 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/npalladium/semql"
-Repository = "https://github.com/npalladium/semql"
-Issues = "https://github.com/npalladium/semql/issues"
+Homepage = "https://github.com/semql-io/semql"
+Repository = "https://github.com/semql-io/semql"
+Issues = "https://github.com/semql-io/semql/issues"
 
 [build-system]
 requires = ["uv_build>=0.11.19,<0.12.0"]

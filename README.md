@@ -253,13 +253,13 @@ to install them into your agent's expected directory:
 
 ```sh
 # install both skills into Claude Code
-npx skills add npalladium/semql -a claude-code
+npx skills add semql-io/semql -a claude-code
 
 # install into multiple agents at once
-npx skills add npalladium/semql -a claude-code -a codex -a cursor
+npx skills add semql-io/semql -a claude-code -a codex -a cursor
 
 # install a single skill, globally
-npx skills add npalladium/semql -g -a claude-code --skill semql-cube
+npx skills add semql-io/semql -g -a claude-code --skill semql-cube
 ```
 
 The skill bodies are deliberately tool-agnostic: they say *what* to

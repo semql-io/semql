@@ -38,6 +38,12 @@ rejection of a schema we expect to pass, or a constraint behaving differently
 than documented), so it doubles as a regression check for ``flatten_root_ref``.
 """
 
+# boto3 is injected at runtime via the ``uv run --with boto3`` shebang, not a
+# project dependency, and ships no type stubs. Suppress the resulting strict
+# unknowns for this standalone probe rather than vendoring stubs for an
+# optional AWS SDK.
+# pyright: reportMissingImports=false, reportUnknownMemberType=false, reportUnknownVariableType=false
+
 from __future__ import annotations
 
 import argparse
