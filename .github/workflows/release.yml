@@ -14,7 +14,7 @@ permissions:
   contents: read
 
 env:
-  UV_VERSION: "0.5.x"
+  UV_VERSION: "0.11.x" # must satisfy the uv_build backend (>=0.11.19)
 
 jobs:
   build:
