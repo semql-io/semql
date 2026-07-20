@@ -347,6 +347,36 @@ def test_date_trunc_without_matching_between_is_error() -> None:
         )
 
 
+def test_two_date_trunc_buckets_same_dimension_conflicting_grains_is_error() -> None:
+    """Two ``DATE_TRUNC`` projections on the same dimension with conflicting
+    grains must not silently keep the last one — both are discarded in favor
+    of a diagnostic."""
+    from semql.parse import ParseError
+
+    with pytest.raises(ParseError, match=r"(?i)multiple.*date_trunc"):
+        parse_sql_statement(
+            "SELECT DATE_TRUNC('month', created_at), DATE_TRUNC('week', created_at), "
+            "SUM(amount) FROM orders "
+            "WHERE created_at BETWEEN '2026-01-01' AND '2026-03-31'",
+            catalog=None,
+        )
+
+
+def test_two_date_trunc_buckets_one_matching_one_not_is_error() -> None:
+    """A valid bucket followed by a mismatched one must not be discarded in
+    favor of a misleading error about the wrong bucket — both are rejected
+    with a diagnostic naming the real problem (multiple buckets)."""
+    from semql.parse import ParseError
+
+    with pytest.raises(ParseError, match=r"(?i)multiple.*date_trunc"):
+        parse_sql_statement(
+            "SELECT DATE_TRUNC('month', created_at), DATE_TRUNC('day', started_at), "
+            "SUM(amount) FROM orders "
+            "WHERE created_at BETWEEN '2026-01-01' AND '2026-03-31'",
+            catalog=None,
+        )
+
+
 # ---------------------------------------------------------------------------
 # Strict / lenient modes
 # ---------------------------------------------------------------------------

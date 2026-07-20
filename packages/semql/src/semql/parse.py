@@ -531,9 +531,11 @@ def parse_sql_statement(
     time_dim: TimeWindow | None = None
     compare: CompareWindow | None = None
     # A ``DATE_TRUNC('<grain>', dim)`` projection carries the time bucket;
-    # the grain is stashed here and attached to the ``BETWEEN``-derived
-    # ``TimeWindow`` once the WHERE clause is parsed.
-    select_grain: tuple[str, str] | None = None
+    # every bucket found is stashed here and attached to the ``BETWEEN``-
+    # derived ``TimeWindow`` once the WHERE clause is parsed. Kept as a list
+    # (not overwritten in place) so a second bucket can't silently discard
+    # an already-valid one.
+    select_grains: list[tuple[str, str]] = []
 
     # --- SELECT list ---
     select_expressions = ast.expressions or []
@@ -563,7 +565,7 @@ def parse_sql_statement(
                 )
             else:
                 resolved_refs[local_name(dim_ref)] = dim_ref
-                select_grain = (dim_ref, grain)
+                select_grains.append((dim_ref, grain))
             continue
         if expr.find(exp.Select) is not None:
             # A subquery projection (scalar subquery) is unsupported — its
@@ -618,9 +620,17 @@ def parse_sql_statement(
 
     # A ``DATE_TRUNC`` bucket in SELECT sets the granularity on the time
     # window the ``BETWEEN`` produced. The two must name the same dimension;
-    # a bucket with no matching window is flagged, not silently dropped.
-    if select_grain is not None:
-        grain_dim, grain = select_grain
+    # a bucket with no matching window is flagged, not silently dropped. More
+    # than one bucket in a single SELECT is rejected outright — only one
+    # ``TimeWindow.granularity`` slot exists, so silently keeping the last
+    # one would discard an earlier, possibly-valid bucket without a trace.
+    if len(select_grains) > 1:
+        errors.append(
+            "Multiple DATE_TRUNC bucket projections in SELECT "
+            f"({select_grains!r}); only one time-bucket projection is supported."
+        )
+    elif len(select_grains) == 1:
+        grain_dim, grain = select_grains[0]
         if time_dim is not None and time_dim.dimension == grain_dim:
             time_dim = time_dim.model_copy(update={"granularity": grain})
         elif time_dim is None:
