@@ -11,8 +11,9 @@ name: CI
 #     the (currently informational) mutation run.
 # workflow_dispatch stays for manual re-runs of the merge-gate shape.
 on:
-  pull_request:
   push:
+    branches: [main]
+  pull_request:
     branches: [main]
   schedule:
     - cron: "0 3 * * *" # 03:00 UTC nightly
@@ -233,12 +234,12 @@ jobs:
       - name: pytest (full)
         run: uv run pytest packages -p no:tach --no-cov
 
-  # --- Build smoke (merge to main) -----------------------------------------
+  # --- Build smoke (PRs + merge to main) -----------------------------------
   build:
     name: uv build smoke (${{ matrix.package }})
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'push' || github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
     strategy:
       matrix:
         package:
