@@ -200,6 +200,7 @@ from semql.units import (
     UnitError,
     UnknownUnit,
 )
+from semql.unparse import UnparseError, query_to_sql
 from semql.validate import ValidationError, ValidationWarning, validate
 from semql.visualize import (
     DecisionReason,
@@ -288,6 +289,8 @@ __all__ = [
     "ParserDecision",
     "ParseError",
     "parse_sql_statement",
+    "UnparseError",
+    "query_to_sql",
     "MMRWrapper",
     "MergeSpec",
     "META_CUBES",

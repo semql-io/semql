@@ -64,13 +64,13 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import Any, Literal, cast
+from typing import Any, Literal, cast, get_args
 
 import sqlglot
 from sqlglot import exp
 
 from semql.errors import SemQLError
-from semql.model import Cube
+from semql.model import Cube, GranularityLiteral
 from semql.refs import local_name
 from semql.spec import (
     BoolExpr,
@@ -84,6 +84,10 @@ from semql.spec import (
 _AGG_FUNCS = frozenset(
     {"SUM", "COUNT", "AVG", "MIN", "MAX", "COUNT_DISTINCT", "MEDIAN", "PERCENTILE"}
 )
+
+# Valid time-bucket grains for a ``DATE_TRUNC('<grain>', dim)`` projection —
+# the same literal set the ``TimeWindow.granularity`` field accepts.
+_GRAINS = frozenset(get_args(GranularityLiteral))
 
 # Logical negation of a filter op, for unwrapping a wrapping ``NOT``.
 # ``contains`` (LIKE) has no negated counterpart in the FilterOp set, so
@@ -242,9 +246,11 @@ def _count_measure_ref(catalog: dict[str, Cube] | None, ctx: ResolveCtx) -> str 
     by name like ``SUM(amount)``. Find the cube measure declared as a row
     count (``agg="count"``, ``sql="*"``) among the query's cubes:
 
-    - exactly one participating cube declares one → use it;
-    - more than one (a JOIN where both sides count) → ambiguous, return
-      ``None`` so the caller surfaces it rather than guessing a grain;
+    - exactly one participating cube declares exactly one → use it;
+    - more than one across the participating cubes (a JOIN where both
+      sides count, *or* a single cube declaring two row-count measures)
+      → ambiguous, return ``None`` so the caller surfaces it rather than
+      guessing which measure it means;
     - none found / uncatalogued → fall back to ``<cube>.count`` for the
       single-cube case (the validation pass flags it if absent)."""
     if catalog is not None:
@@ -253,10 +259,11 @@ def _count_measure_ref(catalog: dict[str, Cube] | None, ctx: ResolveCtx) -> str 
             cube = catalog.get(name)
             if cube is None:
                 continue
-            for m in cube.measures:
-                if m.agg == "count" and m.sql.strip() == "*":
-                    owners.append(f"{name}.{m.name}")
-                    break
+            matches = [m.name for m in cube.measures if m.agg == "count" and m.sql.strip() == "*"]
+            if len(matches) > 1:
+                return None  # ambiguous within this cube alone
+            if matches:
+                owners.append(f"{name}.{matches[0]}")
         if len(owners) == 1:
             return owners[0]
         if len(owners) > 1:
@@ -264,6 +271,23 @@ def _count_measure_ref(catalog: dict[str, Cube] | None, ctx: ResolveCtx) -> str 
     if ctx.default_cube is not None:
         return f"{ctx.default_cube}.count"
     return None
+
+
+def _parse_date_trunc(node: exp.DateTrunc, ctx: ResolveCtx) -> tuple[str | None, str | None]:
+    """Unpack a ``DATE_TRUNC('<grain>', dim)`` projection.
+
+    Returns ``(grain, dim_ref)`` — the lower-cased grain literal and the
+    resolved ``cube.field`` ref of the truncated column. Either element is
+    ``None`` when it can't be determined (unknown grain, unresolvable
+    column); the caller surfaces the diagnostic."""
+    unit = node.unit
+    grain: str | None = None
+    if isinstance(unit, (exp.Literal, exp.Var)):
+        grain = str(unit.this).lower()
+    if grain is not None and grain not in _GRAINS:
+        grain = None
+    dim_ref = ctx.resolve(node.this) if node.this is not None else None
+    return grain, dim_ref
 
 
 def _inside_subquery(node: exp.Expression, root: exp.Expression) -> bool:
@@ -509,6 +533,12 @@ def parse_sql_statement(
     offset: int | None = None
     time_dim: TimeWindow | None = None
     compare: CompareWindow | None = None
+    # A ``DATE_TRUNC('<grain>', dim)`` projection carries the time bucket;
+    # every bucket found is stashed here and attached to the ``BETWEEN``-
+    # derived ``TimeWindow`` once the WHERE clause is parsed. Kept as a list
+    # (not overwritten in place) so a second bucket can't silently discard
+    # an already-valid one.
+    select_grains: list[tuple[str, str]] = []
 
     # --- SELECT list ---
     select_expressions = ast.expressions or []
@@ -523,6 +553,22 @@ def parse_sql_statement(
         if isinstance(expr, exp.Star):
             # SELECT * — every dimension implicitly. We don't emit
             # anything; the compile pipeline will infer.
+            continue
+        if isinstance(expr, exp.DateTrunc):
+            # ``DATE_TRUNC('<grain>', dim)`` is the time-bucket projection.
+            # It is not a plain dimension — the grain rides on the query's
+            # ``time_dimension``, attached below once the BETWEEN is parsed.
+            grain, dim_ref = _parse_date_trunc(expr, ctx)
+            if dim_ref is None:
+                errors.append(f"Could not resolve the DATE_TRUNC column in {expr.sql()!r}.")
+            elif grain is None:
+                errors.append(
+                    f"Unsupported DATE_TRUNC grain in {expr.sql()!r}; "
+                    f"expected one of {sorted(_GRAINS)}."
+                )
+            else:
+                resolved_refs[local_name(dim_ref)] = dim_ref
+                select_grains.append((dim_ref, grain))
             continue
         if expr.find(exp.Select) is not None:
             # A subquery projection (scalar subquery) is unsupported — its
@@ -544,7 +590,8 @@ def parse_sql_statement(
                 # Resolve to a qualified ``cube.field`` ref — the form the
                 # compiler requires (bare refs raise a resolution error).
                 ref = ctx.resolve(inner) if inner is not None else None
-                if ref is None and isinstance(agg, exp.Count):
+                is_count_star = ref is None and isinstance(agg, exp.Count)
+                if is_count_star:
                     # COUNT(*) → the row-count measure of the participating cube.
                     ref = _count_measure_ref(catalog, ctx)
                 if ref:
@@ -554,6 +601,15 @@ def parse_sql_statement(
                         measures.append(ref)
                     if single and output_alias and output_alias != field_name:
                         aliases[output_alias] = ref
+                elif is_count_star and catalog is not None:
+                    # Ambiguous: either two+ cubes each declare a row-count
+                    # measure, or one cube declares more than one — surface
+                    # it rather than silently dropping the measure.
+                    errors.append(
+                        f"Ambiguous COUNT(*) in {expr.sql()!r}: more than one "
+                        "row-count measure among the participating cubes; "
+                        "reference the measure by name instead."
+                    )
         else:
             # Plain column — dimension.
             ref = ctx.resolve(expr)
@@ -574,6 +630,32 @@ def parse_sql_statement(
     where_tree = ast.args.get("where")
     if where_tree is not None:
         time_dim, filters, where = _parse_where(where_tree, ctx, resolved_refs)
+
+    # A ``DATE_TRUNC`` bucket in SELECT sets the granularity on the time
+    # window the ``BETWEEN`` produced. The two must name the same dimension;
+    # a bucket with no matching window is flagged, not silently dropped. More
+    # than one bucket in a single SELECT is rejected outright — only one
+    # ``TimeWindow.granularity`` slot exists, so silently keeping the last
+    # one would discard an earlier, possibly-valid bucket without a trace.
+    if len(select_grains) > 1:
+        errors.append(
+            "Multiple DATE_TRUNC bucket projections in SELECT "
+            f"({select_grains!r}); only one time-bucket projection is supported."
+        )
+    elif len(select_grains) == 1:
+        grain_dim, grain = select_grains[0]
+        if time_dim is not None and time_dim.dimension == grain_dim:
+            time_dim = time_dim.model_copy(update={"granularity": grain})
+        elif time_dim is None:
+            errors.append(
+                f"DATE_TRUNC({grain!r}, {grain_dim!r}) in SELECT needs a matching "
+                f"BETWEEN window on {grain_dim!r} to set the time granularity."
+            )
+        else:
+            errors.append(
+                f"DATE_TRUNC dimension {grain_dim!r} does not match the "
+                f"BETWEEN window dimension {time_dim.dimension!r}."
+            )
 
     having_node = ast.args.get("having")
     if having_node is not None:

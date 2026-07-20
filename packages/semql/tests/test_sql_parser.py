@@ -191,6 +191,35 @@ def test_count_star_with_alias_captured(catalog: dict) -> None:
     assert q.aliases == {"n": "orders.count"}
 
 
+def test_count_star_ambiguous_with_two_row_count_measures_on_one_cube() -> None:
+    """A cube declaring two row-count measures (``agg='count', sql='*'``)
+    makes bare ``COUNT(*)`` ambiguous — it must not silently resolve to
+    whichever measure happens to be declared first."""
+    from semql.model import Cube, Dialect, Measure
+
+    two_count_catalog = {
+        "orders": Cube(
+            name="orders",
+            dialect=Dialect.POSTGRES,
+            table="{schema}.orders",
+            alias="o",
+            measures=[
+                Measure(name="count", sql="*", agg="count", unit="count"),
+                Measure(name="num_rows", sql="*", agg="count", unit="count"),
+            ],
+        )
+    }
+    out = parse_sql_statement(
+        "SELECT COUNT(*) FROM orders",
+        catalog=two_count_catalog,
+        strict=False,
+    )
+    q = out.query
+    assert "orders.count" not in q.measures
+    assert "orders.num_rows" not in q.measures
+    assert out.parse_errors != ()
+
+
 def test_having_over_aggregate_becomes_measure_filter(catalog: dict) -> None:
     """``HAVING SUM(revenue) > 1000`` unwraps the aggregate to a filter
     on the measure — it must not be silently dropped."""
@@ -309,6 +338,72 @@ def test_between_becomes_time_window() -> None:
     assert q.time_dimension is not None
     assert q.time_dimension.dimension == "orders.created_at"
     assert q.time_dimension.range == ("2026-01-01", "2026-03-31")
+
+
+# ---------------------------------------------------------------------------
+# DATE_TRUNC in SELECT → time_dimension.granularity
+# ---------------------------------------------------------------------------
+
+
+def test_date_trunc_in_select_sets_granularity() -> None:
+    """``DATE_TRUNC('<grain>', dim)`` in SELECT + a matching ``BETWEEN`` on
+    the same dimension sets ``time_dimension.granularity`` (and does not add
+    the time dimension to ``dimensions``)."""
+    out = parse_sql_statement(
+        "SELECT DATE_TRUNC('month', created_at), SUM(amount) FROM orders "
+        "WHERE created_at BETWEEN '2026-01-01' AND '2026-03-31' "
+        "GROUP BY DATE_TRUNC('month', created_at)",
+        catalog=None,
+    )
+    q = out.query
+    assert q.time_dimension is not None
+    assert q.time_dimension.dimension == "orders.created_at"
+    assert q.time_dimension.granularity == "month"
+    assert q.time_dimension.range == ("2026-01-01", "2026-03-31")
+    # The bucketed time dimension is not a plain grouping dimension.
+    assert "orders.created_at" not in q.dimensions
+
+
+def test_date_trunc_without_matching_between_is_error() -> None:
+    """A ``DATE_TRUNC`` bucket with no ``BETWEEN`` window on the same
+    dimension is flagged rather than silently dropped."""
+    from semql.parse import ParseError
+
+    with pytest.raises(ParseError, match=r"(?i)date_trunc|between|window"):
+        parse_sql_statement(
+            "SELECT DATE_TRUNC('month', created_at), SUM(amount) FROM orders",
+            catalog=None,
+        )
+
+
+def test_two_date_trunc_buckets_same_dimension_conflicting_grains_is_error() -> None:
+    """Two ``DATE_TRUNC`` projections on the same dimension with conflicting
+    grains must not silently keep the last one — both are discarded in favor
+    of a diagnostic."""
+    from semql.parse import ParseError
+
+    with pytest.raises(ParseError, match=r"(?i)multiple.*date_trunc"):
+        parse_sql_statement(
+            "SELECT DATE_TRUNC('month', created_at), DATE_TRUNC('week', created_at), "
+            "SUM(amount) FROM orders "
+            "WHERE created_at BETWEEN '2026-01-01' AND '2026-03-31'",
+            catalog=None,
+        )
+
+
+def test_two_date_trunc_buckets_one_matching_one_not_is_error() -> None:
+    """A valid bucket followed by a mismatched one must not be discarded in
+    favor of a misleading error about the wrong bucket — both are rejected
+    with a diagnostic naming the real problem (multiple buckets)."""
+    from semql.parse import ParseError
+
+    with pytest.raises(ParseError, match=r"(?i)multiple.*date_trunc"):
+        parse_sql_statement(
+            "SELECT DATE_TRUNC('month', created_at), DATE_TRUNC('day', started_at), "
+            "SUM(amount) FROM orders "
+            "WHERE created_at BETWEEN '2026-01-01' AND '2026-03-31'",
+            catalog=None,
+        )
 
 
 # ---------------------------------------------------------------------------
