@@ -488,6 +488,47 @@ class SemanticQuery(BaseModel):
 
         return flatten_root_ref(cls.model_json_schema())
 
+    @classmethod
+    def llm_json_schema(cls) -> dict[str, Any]:
+        """Stricter, structured-output-safe JSON schema — no ``prefixItems``, no recursive ``$ref``.
+
+        ``tool_json_schema()`` is object-rooted but still contains
+        ``prefixItems`` (from ``TimeWindow.range`` / ``CompareWindow.range`` /
+        ``order``'s tuples) and a recursive ``$ref`` cycle (``BoolExpr``
+        self-referencing, and ``SemanticQuery`` <-> ``SemiJoin`` through
+        ``semi_joins[].source``). Some tool-use decoders reject both outright
+        — Bedrock Nova has been observed to 424 on either. This returns the
+        schema with both removed via :func:`semql._schema.to_llm_safe_schema`:
+        tuple fields become plain arrays, and the ``where`` / ``semi_joins``
+        properties are dropped (they are the only paths into the recursive
+        defs). Prefer ``tool_json_schema()`` when the target decoder tolerates
+        ``prefixItems`` and recursive refs and you need ``where`` / semi-joins
+        expressible in the schema; use this one when it doesn't.
+
+        Round-trip a payload shaped to this schema back into a
+        ``SemanticQuery`` with :meth:`from_llm_payload`.
+        """
+        from semql._schema import to_llm_safe_schema
+
+        return to_llm_safe_schema(cls.tool_json_schema())
+
+    @classmethod
+    def from_llm_payload(cls, payload: dict[str, Any]) -> SemanticQuery:
+        """Build a ``SemanticQuery`` from a dict shaped per :meth:`llm_json_schema`.
+
+        ``llm_json_schema()`` widens ``range`` and ``order`` from tuple
+        schemas to plain arrays (``[start, end]``, ``[[field, "asc"|"desc"], ...]``);
+        Pydantic coerces those lists back into the declared tuple fields on
+        construction, so this is a thin, explicitly-named wrapper over
+        ``SemanticQuery(**payload)`` — kept as the documented pair to
+        ``llm_json_schema()`` rather than making callers rely on that
+        coercion being obvious. ``where`` / ``semi_joins`` are not
+        expressible via that schema; pass them in ``payload`` explicitly
+        (already-shaped, e.g. from code) if needed — they pass through
+        untouched.
+        """
+        return cls(**payload)
+
     def rewrite(self, op: RewriteOp) -> SemanticQuery:
         """Apply a :class:`semql.rewrite.RewriteOp` and return a new query.
 
