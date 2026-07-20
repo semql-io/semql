@@ -1,11 +1,14 @@
 # Weekly dependency updates. Actions and Python deps are each grouped into
-# a single PR per ecosystem to keep review noise low.
+# a single PR per ecosystem to keep review noise low. A 7-day cooldown holds
+# off on brand-new releases (letting yanks/hotfixes settle before we adopt).
 version: 2
 updates:
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
       interval: "weekly"
+    cooldown:
+      default-days: 7
     groups:
       actions:
         patterns: ["*"]
@@ -14,6 +17,8 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    cooldown:
+      default-days: 7
     groups:
       python:
         patterns: ["*"]
