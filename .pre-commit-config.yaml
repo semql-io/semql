@@ -6,6 +6,17 @@ repos:
         args: [--fix]
       - id: ruff-format
 
+  # GitHub Actions workflow linting + security audit.
+  - repo: https://github.com/rhysd/actionlint
+    rev: v1.7.12
+    hooks:
+      - id: actionlint
+
+  - repo: https://github.com/zizmorcore/zizmor-pre-commit
+    rev: v1.27.0
+    hooks:
+      - id: zizmor
+
   - repo: local
     hooks:
       - id: mypy

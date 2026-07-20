@@ -22,11 +22,42 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# Least privilege: every job here only reads the checkout. Any job that
+# needs more (e.g. uploading SARIF) must opt in with its own block.
+permissions:
+  contents: read
+
 env:
   UV_VERSION: "0.5.x"
   PYTHON_VERSION: "3.12"
 
 jobs:
+  # --- Workflow lint (every trigger) ---------------------------------------
+  # actionlint (YAML/shell correctness) + zizmor (Actions security audit).
+  # Both run through pre-commit so the pinned versions in
+  # .pre-commit-config.yaml stay the single source of truth.
+  workflow-lint:
+    name: workflow lint (actionlint + zizmor)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: actionlint
+        run: uvx pre-commit run actionlint --all-files --color always
+
+      - name: zizmor
+        run: uvx pre-commit run zizmor --all-files --color always
+
   # --- Tier 0: static checks (every trigger) -------------------------------
   static:
     name: lint + types + boundaries
@@ -34,6 +65,8 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Install uv
         uses: astral-sh/setup-uv@v4
@@ -86,6 +119,8 @@ jobs:
     if: github.event_name == 'pull_request'
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Install uv
         uses: astral-sh/setup-uv@v4
@@ -126,6 +161,8 @@ jobs:
           - { package: semql-validate-db, import: semql_validate_db, floor: 89 } # 91%
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Install uv
         uses: astral-sh/setup-uv@v4
@@ -156,6 +193,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          persist-credentials: false
           fetch-depth: 0
 
       - name: Install uv
@@ -179,6 +217,8 @@ jobs:
     if: github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Install uv
         uses: astral-sh/setup-uv@v4
@@ -212,6 +252,8 @@ jobs:
           - semql-validate-db
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Install uv
         uses: astral-sh/setup-uv@v4
@@ -231,6 +273,8 @@ jobs:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Install uv
         uses: astral-sh/setup-uv@v4
