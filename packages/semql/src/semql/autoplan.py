@@ -45,13 +45,13 @@ The rewritten query carries ``semi_joins`` and must be compiled with
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Literal, get_args
 
 from semql.federate import (
     _Bridge,  # pyright: ignore[reportPrivateUsage]
     _find_bridges,  # pyright: ignore[reportPrivateUsage]
 )
-from semql.model import Cube, Lookup
+from semql.model import Cube, GranularityLiteral, Lookup
 from semql.spec import Filter, FilterOp, SemanticQuery, SemiJoin
 
 Strategy = Literal["semi_join", "bridge_merge", "attach"]
@@ -177,14 +177,99 @@ def _decide_strategy(
     )
 
 
+_ALL_GRANULARITIES: tuple[str, ...] = get_args(GranularityLiteral)
+
+
+def collapse_unrequested_grain(q: SemanticQuery) -> SemanticQuery:
+    """Strip ``time_dimension.granularity`` from a top-N query that never
+    orders by the time bucket — the "top-N per period" foot-gun.
+
+    A planner (human or LLM) asking "single most-active entity over the
+    window" often sets a granularity out of habit::
+
+        measures=[...], dimensions=[entity], order=[(measure, 'desc')],
+        limit=1, time_dimension=TimeWindow(..., granularity='day')
+
+    The granularity adds the time bucket to the GROUP BY, silently fanning
+    the result out to top-N *per bucket*. Structural signal for "the grain
+    was not requested": granularity is set AND ``order`` is non-empty AND
+    ``limit`` is set AND no order key references the time bucket.
+
+    An order key "references the time bucket" when it matches the time
+    dimension's qualified ref (``events.start_time``), its bare field name
+    (``start_time``), the compiler's bucket output-column convention
+    (``start_time_<granularity>`` for *any* granularity, bare or qualified),
+    or an ``aliases`` key whose value is the qualified time-dimension ref.
+    Matching is deliberately over-broad: a false "referenced" merely keeps
+    the query as authored.
+
+    Never strips (the grain is either explicitly wanted or meaningless to
+    collapse):
+
+    - ``fill_nulls_with`` is set — it *requires* granularity (stripping
+      would build an invalid ``TimeWindow``), and per-bucket gap-filling is
+      the strongest possible signal the grain is intended;
+    - ``ungrouped=True`` or no measures / derived measures — no aggregation,
+      so granularity does not shape a GROUP BY to collapse;
+    - ``compare`` is set — compare mode joins current/prior rows on the time
+      bucket, so the grain participates in row identity there.
+
+    Pure and non-destructive: returns ``q`` itself (the same object) when
+    the signal doesn't hold, else a ``model_copy`` with only
+    ``time_dimension.granularity`` set to ``None`` — ``range``,
+    ``dimension``, and every other field are preserved.
+    """
+    td = q.time_dimension
+    if td is None or td.granularity is None:
+        return q
+    if not q.order or q.limit is None:
+        return q
+    if td.fill_nulls_with is not None:
+        return q
+    if q.ungrouped or not (q.measures or q.derived_measures):
+        return q
+    if q.compare is not None:
+        return q
+
+    fld = td.dimension.split(".", 1)[1] if "." in td.dimension else td.dimension
+    cube = _cube_of(td.dimension)
+    bucket_refs: set[str] = {td.dimension, fld}
+    for g in _ALL_GRANULARITIES:
+        bucket_refs.add(f"{fld}_{g}")
+        bucket_refs.add(f"{cube}.{fld}_{g}")
+    bucket_refs.update(k for k, v in q.aliases.items() if v == td.dimension)
+    if any(ref in bucket_refs for ref, _direction in q.order):
+        return q
+
+    return q.model_copy(
+        update={"time_dimension": td.model_copy(update={"granularity": None})},
+    )
+
+
+# ``autoplan``'s opt-in keyword shares the function's name (the flag *is*
+# the function, as a bool); this alias keeps the function reachable inside
+# ``autoplan``'s body where the parameter shadows it.
+_collapse_unrequested_grain = collapse_unrequested_grain
+
+
 def autoplan(
     q: SemanticQuery,
     catalog: dict[str, Cube],
     *,
     semi_join_max: int = SEMI_JOIN_MAX,
     lookups: dict[str, Lookup] | None = None,
+    collapse_unrequested_grain: bool = False,
 ) -> AutoPlan:
-    """Plan cross-source filter pushdown for ``q``. See module docstring."""
+    """Plan cross-source filter pushdown for ``q``. See module docstring.
+
+    ``collapse_unrequested_grain=True`` first applies
+    :func:`collapse_unrequested_grain` to ``q`` (silently — the returned
+    :class:`AutoPlan` carries no decision for it; ``CrossSourceDecision``
+    is specifically about foreign-cube routing). Callers that need to know
+    whether the grain was stripped should call the standalone function.
+    """
+    if collapse_unrequested_grain:
+        q = _collapse_unrequested_grain(q)
     lookups = lookups or {}
     # Defer anything beyond a flat measure+filter query to federation untouched.
     if q.semi_joins or q.where is not None or q.compare is not None:
@@ -272,4 +357,11 @@ def autoplan(
     return AutoPlan(query=rewritten, decisions=tuple(decisions))
 
 
-__all__ = ["SEMI_JOIN_MAX", "AutoPlan", "CrossSourceDecision", "Strategy", "autoplan"]
+__all__ = [
+    "SEMI_JOIN_MAX",
+    "AutoPlan",
+    "CrossSourceDecision",
+    "Strategy",
+    "autoplan",
+    "collapse_unrequested_grain",
+]
