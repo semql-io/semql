@@ -160,3 +160,44 @@ def test_cross_backend_symmetric_does_not_inflate(
     result = _engine(pg_con, bq_con).run(plan)
     ana = next(r for r in result.rows if r[0] == "Ana")
     assert ana == ("Ana", 300.0, 8.0)  # not 300*1 / 8*2 cross-product
+
+
+def test_cross_backend_symmetric_applies_having(
+    pg_con: duckdb.DuckDBPyConnection, bq_con: duckdb.DuckDBPyConnection
+) -> None:
+    """HAVING on the symmetric path lands on the MergeSpec (not silently
+    dropped) and filters the merged, re-aggregated rows."""
+    from semql.spec import Filter
+
+    catalog = {c.name: c for c in (_activity_cube(), _worklog_cube(), _employees_cube())}
+    plan = compile_federated_query(
+        SemanticQuery(
+            measures=["activity.active_secs", "worklog.hours"],
+            dimensions=["employees.name"],
+            having=[Filter(dimension="activity.active_secs", op="gte", values=[100])],
+        ),
+        catalog,
+    )
+    (having,) = plan.merge_spec.having
+    assert having.dimension == "activity.active_secs"
+
+    result = _engine(pg_con, bq_con).run(plan)
+    # Ana=300 passes; Bob=50 fails; Cay has no activity (NULL fails too).
+    assert {r[0]: (r[1], r[2]) for r in result.rows} == {"Ana": (300.0, 8.0)}
+
+
+def test_cross_backend_symmetric_having_rejects_unknown_measure() -> None:
+    from semql.errors import FederationError
+    from semql.spec import Filter
+
+    catalog = {c.name: c for c in (_activity_cube(), _worklog_cube(), _employees_cube())}
+    with pytest.raises(FederationError) as exc:
+        compile_federated_query(
+            SemanticQuery(
+                measures=["activity.active_secs", "worklog.hours"],
+                dimensions=["employees.name"],
+                having=[Filter(dimension="employees.headcount", op="gte", values=[1])],
+            ),
+            catalog,
+        )
+    assert exc.value.reason == "having_unknown_measure"

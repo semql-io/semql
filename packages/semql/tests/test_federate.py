@@ -500,9 +500,10 @@ def test_raw_rows_handles_count_star() -> None:
     assert measure.source is not None and measure.source.column_name == ""
 
 
-def test_raw_rows_lifts_having_refusal() -> None:
-    """Distributive mode refuses HAVING; raw-row mode applies it at
-    merge against the recomposed measure aliases."""
+def test_raw_rows_having_lands_on_merge_spec() -> None:
+    """Raw-row mode applies HAVING at merge against the recomposed
+    measure aliases (count_distinct isn't distributive, so this shape
+    is only expressible in raw-row mode)."""
     catalog = _federated_catalog()
     q = SemanticQuery(
         measures=["orders.distinct_customers"],
@@ -528,16 +529,47 @@ def test_raw_rows_having_rejects_unknown_measure() -> None:
     assert exc.value.reason == "having_unknown_measure"
 
 
-def test_distributive_mode_still_refuses_having() -> None:
+def test_distributive_mode_applies_having_at_merge() -> None:
+    """Distributive fragments pre-aggregate without HAVING; the predicate
+    lands on the MergeSpec and is applied post-re-aggregation."""
     catalog = _federated_catalog()
     q = SemanticQuery(
         measures=["orders.revenue"],
         dimensions=["customers.region"],
         having=[Filter(dimension="orders.revenue", op="gt", values=[100])],
     )
+    plan = compile_federated_query(q, catalog)
+    (having,) = plan.merge_spec.having
+    assert having.dimension == "orders.revenue"
+    # Fragments never see the HAVING — it's a merge-only concern.
+    assert all("HAVING" not in frag.sql.upper() for frag in plan.fragments)
+
+
+def test_distributive_having_rejects_unknown_measure() -> None:
+    catalog = _federated_catalog()
+    q = SemanticQuery(
+        measures=["orders.revenue"],
+        dimensions=["customers.region"],
+        having=[Filter(dimension="orders.count", op="gt", values=[1])],
+    )
     with pytest.raises(FederationError) as exc:
         compile_federated_query(q, catalog)
-    assert exc.value.reason == "having_in_distributive_federated"
+    assert exc.value.reason == "having_unknown_measure"
+
+
+def test_single_backend_having_pushed_into_fragment() -> None:
+    """Degenerate single-backend plan: compile_query applies HAVING in
+    the fragment itself; the passthrough merge carries no having."""
+    catalog = _catalog(_orders())
+    q = SemanticQuery(
+        measures=["orders.revenue"],
+        dimensions=["orders.status"],
+        having=[Filter(dimension="orders.revenue", op="gt", values=[100])],
+    )
+    plan = compile_federated_query(q, catalog)
+    assert len(plan.fragments) == 1
+    assert "HAVING" in plan.fragments[0].sql.upper()
+    assert plan.merge_spec.having == []
 
 
 def test_raw_rows_supports_ratio_measure() -> None:
