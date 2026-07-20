@@ -143,8 +143,13 @@ VizDecision.hints: RenderHints
 - All new `VizDecision` fields have defaults → existing constructors keep
   working. Beta surface (viz is explicitly BETA), so additive changes are fine.
 - New exports: `Confidence`, `ScoredChart`, `RenderHints`, `VizFeatures` from
-  `semql` and `semql.visualize` `__all__`; update `test_api_surface` /
-  `test_package_surface`.
+  `semql` and `semql.visualize` `__all__`. `test_api_surface` /
+  `test_package_surface` assert surface properties generically (uniqueness,
+  no `None` entries) rather than enumerating names, so they pass unchanged.
+- Widening `DecisionReasonKind` / `VizChartType` trips the API-breakage
+  gate's generic value-diff (`scripts/check_api_break.py`), which can't tell
+  a covariant Literal widening from an actual break; the script now
+  tokenizes both sides and only flags a genuine removal/rename.
 - `semql_mcp.viz._viz_to_payload` gains the new fields (VizColumn extras ride
   through `asdict`; the manually-built payload dict needs the new keys added).
 
