@@ -1,6 +1,6 @@
 # semql-prompt
 
-LLM-facing prompt rendering for a [semql](https://github.com/npalladium/semql)
+LLM-facing prompt rendering for a [semql](https://github.com/semql-io/semql)
 `Catalog`.
 
 `semql`'s compiler is pure — it turns a `SemanticQuery` into SQL and never

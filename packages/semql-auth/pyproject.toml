@@ -1,6 +1,6 @@
 [project]
 name = "semql-auth"
-version = "0.5.0"
+version = "0.6.0"
 description = "Credential→identity adapters for semql: bearer-token verifiers (HMAC, JWKS, introspection) and mappers (dict, mTLS x509) that produce a semql AuthContext."
 readme = "README.md"
 license = "BSD-3-Clause"
@@ -10,7 +10,7 @@ authors = [
 ]
 requires-python = ">=3.12"
 dependencies = [
-    "semql>=0.5.0,<0.6",
+    "semql>=0.6.0,<0.7",
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -36,9 +36,9 @@ introspect = ["httpx>=0.27"]
 x509 = ["cryptography>=42"]
 
 [project.urls]
-Homepage = "https://github.com/npalladium/semql"
-Repository = "https://github.com/npalladium/semql"
-Issues = "https://github.com/npalladium/semql/issues"
+Homepage = "https://github.com/semql-io/semql"
+Repository = "https://github.com/semql-io/semql"
+Issues = "https://github.com/semql-io/semql/issues"
 
 [build-system]
 requires = ["uv_build>=0.11.19,<0.12.0"]
