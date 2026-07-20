@@ -559,6 +559,106 @@ def test_engine_runs_raw_rows_plan_with_having(
     assert rows == {"EU": 2}
 
 
+def test_engine_runs_distributive_plan_with_having(
+    pg_con: duckdb.DuckDBPyConnection,
+    bq_con: duckdb.DuckDBPyConnection,
+) -> None:
+    """Distributive HAVING applies at the merge, after re-aggregation.
+    Golden-compare: the HAVING plan's rows equal the no-HAVING plan's
+    rows filtered in Python."""
+    from semql.spec import Filter
+
+    catalog = _catalog(_orders_cube(), _customers_cube())
+    base = SemanticQuery(measures=["orders.revenue"], dimensions=["customers.region"])
+    threshold = 100.0
+    with_having = base.model_copy(
+        update={"having": [Filter(dimension="orders.revenue", op="gte", values=[threshold])]}
+    )
+
+    engine = Engine()
+    engine.register(Dialect.POSTGRES, _DialectTranslatingAdapter(pg_con))
+    engine.register(Dialect.BIGQUERY, _DialectTranslatingAdapter(bq_con))
+
+    baseline = engine.run(compile_federated_query(base, catalog))
+    golden = {r[0]: r[1] for r in baseline.rows if r[1] >= threshold}
+    # Sanity: the threshold actually splits the groups (EU=600, US=75).
+    assert golden == {"EU": 600.0}
+
+    result = engine.run(compile_federated_query(with_having, catalog))
+    assert {r[0]: r[1] for r in result.rows} == golden
+
+
+def test_engine_runs_distributive_having_per_time_bucket(
+    bq_con: duckdb.DuckDBPyConnection,
+) -> None:
+    """With a time dimension, HAVING filters per (dimension, bucket) row —
+    a group that clears the threshold on one day can miss it on another."""
+    from semql import TimeDimension
+    from semql.spec import Filter, TimeWindow
+
+    orders = Cube(
+        name="orders",
+        dialect=Dialect.POSTGRES,
+        table="orders",
+        alias="o",
+        primary_key="id",
+        measures=[Measure(name="revenue", sql="{o}.amount", agg="sum", unit="currency")],
+        dimensions=[
+            Dimension(name="id", sql="{o}.id", type="number"),
+            Dimension(
+                name="customer_id",
+                sql="{o}.customer_id",
+                type="number",
+                foreign_key="customers",
+            ),
+        ],
+        time_dimensions=[TimeDimension(name="created_at", sql="{o}.created_at")],
+        joins=[
+            Join(to="customers", relationship="many_to_one", on="{o}.customer_id = {c}.id"),
+        ],
+    )
+    pg = duckdb.connect(":memory:")
+    pg.execute(
+        "CREATE TABLE orders (id INTEGER, customer_id INTEGER, created_at TIMESTAMP, amount DOUBLE)"
+    )
+    pg.execute(
+        "INSERT INTO orders VALUES "
+        "(1, 10, '2024-01-01 08:00', 100.0), "  # EU day 1
+        "(2, 10, '2024-01-01 09:00', 200.0), "  # EU day 1 → 300 total
+        "(3, 10, '2024-01-02 08:00', 50.0), "  # EU day 2 → below threshold
+        "(4, 11, '2024-01-01 08:00', 150.0)"  # US day 1 → exactly at threshold
+    )
+    catalog = _catalog(orders, _customers_cube())
+    plan = compile_federated_query(
+        SemanticQuery(
+            measures=["orders.revenue"],
+            dimensions=["customers.region"],
+            time_dimension=TimeWindow(
+                dimension="orders.created_at",
+                granularity="day",
+                range=("2024-01-01", "2024-02-01"),
+            ),
+            having=[Filter(dimension="orders.revenue", op="gte", values=[150])],
+        ),
+        catalog,
+    )
+
+    engine = Engine()
+    engine.register(Dialect.POSTGRES, _DialectTranslatingAdapter(pg))
+    engine.register(Dialect.BIGQUERY, _DialectTranslatingAdapter(bq_con))
+    result = engine.run(plan)
+
+    idx_region = result.columns.index("region")
+    idx_time = result.columns.index("created_at_day")
+    idx_rev = result.columns.index("revenue")
+    rows = {(r[idx_region], str(r[idx_time])[:10]): r[idx_rev] for r in result.rows}
+    # EU day 2 (50.0) is filtered out even though EU day 1 passes.
+    assert rows == {
+        ("EU", "2024-01-01"): 300.0,
+        ("US", "2024-01-01"): 150.0,
+    }
+
+
 def test_merge_plan_has_required_attributes() -> None:
     catalog = _catalog(_orders_cube())
     q = SemanticQuery(measures=["orders.revenue"], dimensions=["orders.status"])
