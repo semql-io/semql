@@ -202,12 +202,16 @@ from semql.units import (
 )
 from semql.validate import ValidationError, ValidationWarning, validate
 from semql.visualize import (
+    Confidence,
     DecisionReason,
     DecisionReasonKind,
+    RenderHints,
+    ScoredChart,
     ShapeStats,
     VizChartType,
     VizColumn,
     VizDecision,
+    VizFeatures,
     decide_visualization,
 )
 
@@ -358,6 +362,10 @@ __all__ = [
     "VizChartType",
     "VizColumn",
     "VizDecision",
+    "VizFeatures",
+    "Confidence",
+    "ScoredChart",
+    "RenderHints",
     "DecisionReason",
     "DecisionReasonKind",
     "ShapeStats",

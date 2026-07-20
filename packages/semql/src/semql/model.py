@@ -462,6 +462,11 @@ class Dimension(BaseField):
     # when the two keys share at least one acceptable type
     # (own ``type`` ∪ ``coerce_to``). ``None`` = no coercion.
     coerce_to: DimTypeLiteral | None = None
+    # Categorical but naturally ordered (weekday, month-name, rating
+    # bucket). Propagates to ``ColumnMeta.ordinal`` / ``VizColumn.ordinal``
+    # so the visualizer's render hints sort the axis in the dimension's
+    # natural order rather than by measure value.
+    ordinal: bool = False
 
     @model_validator(mode="after")
     def _check_coerce_to(self) -> Dimension:

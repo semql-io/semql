@@ -168,6 +168,17 @@ class ColumnMeta:
     # expression. Downstream renderers (chart, table) use this to
     # suppress cell rendering or show a lock icon.
     masked: bool = False
+    # Measures only: ``agg in {"sum", "count"} and not non_additive``.
+    # ``None`` for non-measure columns (dimensions, time) — additivity
+    # is a measure-only concept. The visualizer's ``_stackable`` check
+    # reads this to decide whether several measures can share a stacked
+    # area/bar; see ``docs/specs/viz-decision-2026-07.md`` §5.
+    additive: bool | None = None
+    # Propagated from ``Dimension.ordinal`` (weekday, month-name, rating
+    # bucket — categorical but naturally ordered). Drives the
+    # visualizer's sort hint: an ordinal axis sorts in its natural
+    # order rather than by measure value.
+    ordinal: bool = False
 
     def model_dump(self) -> dict[str, Any]:
         """JSON-safe dict view of this ColumnMeta (round-trip helper)."""
@@ -180,6 +191,8 @@ class ColumnMeta:
             "format": self.format,
             "storage_type": self.storage_type,
             "masked": self.masked,
+            "additive": self.additive,
+            "ordinal": self.ordinal,
         }
 
     @classmethod
@@ -194,6 +207,8 @@ class ColumnMeta:
             format=data.get("format"),
             storage_type=data.get("storage_type"),
             masked=data.get("masked", False),
+            additive=data.get("additive"),
+            ordinal=data.get("ordinal", False),
         )
 
 
@@ -466,6 +481,7 @@ def _build_column_meta(
             display_unit=dim.display_unit,
             format=dim.format,
             storage_type=dim.type,
+            ordinal=dim.ordinal,
         )
 
     if time_dim is not None and time_col_name is not None:
@@ -482,6 +498,7 @@ def _build_column_meta(
     for (_cube, m), col_name in zip(measure_fields, measure_col_names, strict=True):
         m_label = m.display_name or _humanize(col_name)
         m_storage = _infer_measure_storage_type(m.agg)
+        m_additive = m.agg in ("sum", "count") and not m.non_additive
         by_name[col_name] = ColumnMeta(
             name=col_name,
             kind="measure",
@@ -490,6 +507,7 @@ def _build_column_meta(
             display_unit=m.display_unit,
             format=m.format,
             storage_type=m_storage,
+            additive=m_additive,
         )
         if is_compare:
             # Compare mode emits four derivatives per measure. The first

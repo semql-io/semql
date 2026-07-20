@@ -35,14 +35,26 @@ HEATMAP_MAX_CELLS = 400
 # A per-day time series longer than this many points is the GitHub-style
 # calendar-heatmap case; shorter daily series stay a line.
 CALENDAR_MIN_DAYS = 60
+# ``ShapeStats.null_rate`` at or above this threshold earns a
+# ``VizFeatures.caveats`` entry. Does NOT change the chart pick — it's
+# a "trust but verify" flag for the consumer, not a shape decision.
+NULL_RATE_CAVEAT_THRESHOLD = 0.2
+# ``ShapeStats.measure_max / measure_min`` at or above this ratio (with
+# both positive) is a strong positive skew — the log-scale render hint.
+LOG_SCALE_RATIO = 1000
 
 # Chart types the picker can emit, plus the viz-only ``"text_only"``
 # fallback. ``"compare_line_chart"`` is the explicit shape for a
 # ``SemanticQuery.compare`` result — current/prior/delta/pct_change
 # columns side-by-side, not the stacked-area that the time-series
 # branch would otherwise pick for multi-measure-with-time.
+# ``"bubble_chart"`` is likewise viz-only (NOT part of the model's
+# ``ChartTypeLiteral``): 3 measures + 1 dimension → x/y/size axes.
 _CompareChart = Literal["compare_line_chart"]
-VizChartType = ChartTypeLiteral | _CompareChart | Literal["text_only"]
+_BubbleChart = Literal["bubble_chart"]
+VizChartType = ChartTypeLiteral | _CompareChart | _BubbleChart | Literal["text_only"]
+
+Confidence = Literal["high", "medium", "low"]
 
 # Numeric storage types — a single one of these on a dimension axis marks a
 # distribution (histogram) rather than a categorical breakdown (bar).
@@ -68,8 +80,9 @@ class ShapeStats:
       and refuse charts that imply variation.
     - ``n_distinct_categories`` — a pie / bar of a single distinct category
       is degenerate; fall back to a table.
-    - ``null_rate`` — high null rates warrant a caveat surfaced in
-      :class:`DecisionReason` (``kind=MaskedFallback``).
+    - ``null_rate`` — at or above ``NULL_RATE_CAVEAT_THRESHOLD`` this
+      warrants a caveat surfaced in ``VizDecision.features.caveats``. Does
+      NOT change the chart pick.
     - ``is_sparse`` — for the calendar-heatmap case: a daily series that
       is mostly empty should not be a calendar heatmap.
 
@@ -123,6 +136,13 @@ class VizColumn:
     unit: str | None = None
     display_unit: str | None = None
     storage_type: StorageType | None = None
+    # Measures only: additive iff ``agg in {"sum", "count"} and not
+    # non_additive``, computed by the compiler (``ColumnMeta.additive``).
+    # ``None`` for non-measure columns, or when built without going
+    # through the compiler.
+    additive: bool | None = None
+    # Propagated from ``Dimension.ordinal`` / ``ColumnMeta.ordinal``.
+    ordinal: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -137,14 +157,29 @@ DecisionReasonKind = Literal[
     "single_value",
     "compare_current_prior",
     "time_series_line",
+    # A time series broken down by a categorical dimension → one line per
+    # category (the breakdown rides on ``VizDecision.series``). Distinct
+    # from ``time_series_line`` (single series) so an audit surface can see
+    # the breakdown was recognised rather than dropped.
+    "time_series_multi_series",
     "time_series_area",
+    # Several measures over time whose units diverge or which are
+    # non-additive (a percentage/ratio): stacking would sum incomparable
+    # quantities, so we overlay lines instead of stacking an area.
+    "time_series_overlaid_line",
     "time_series_calendar_heatmap",
     "scatter_xy",
+    # 3 measures + 1 dimension: x=m0, y=m1, size=m2, dim labels the points.
+    "bubble_xyz",
     "histogram_distribution",
     "pie_small",
     "bar_medium",
     "stacked_bar",
     "xy_heatmap",
+    # A series with zero variation (``ShapeStats.measure_min ==
+    # measure_max``) shouldn't imply variation — refuse the chart and
+    # fall back to a plain text answer.
+    "flat_series",
     # Fallbacks — the cardinality branch was overridden by either a
     # caller-supplied ``ShapeStats`` or by client capability.
     "data_table_fallback",
@@ -184,6 +219,166 @@ class DecisionReason:
 
 
 # ---------------------------------------------------------------------------
+# Confidence — coarse enum: how likely a human/LLM with the question
+# would pick something different (escalation value), NOT "are we right".
+# ---------------------------------------------------------------------------
+
+_HIGH_CONFIDENCE_KINDS: frozenset[DecisionReasonKind] = frozenset(
+    {
+        "cube_override",
+        "ungrouped_row",
+        "single_value",
+        "compare_current_prior",
+        "time_series_line",
+        "time_series_multi_series",
+        "scatter_xy",
+        "histogram_distribution",
+        "bubble_xyz",
+        "flat_series",
+        "shape_stats_fallback",
+        "client_capability_fallback",
+    }
+)
+_MEDIUM_CONFIDENCE_KINDS: frozenset[DecisionReasonKind] = frozenset(
+    {
+        "pie_small",
+        "bar_medium",
+        "stacked_bar",
+        "time_series_area",
+        "time_series_overlaid_line",
+        "time_series_calendar_heatmap",
+        "text_only_fallback",
+    }
+)
+# The rest — ``xy_heatmap``, ``data_table_fallback``, ``no_chart_match`` —
+# are "low": we fell back or the pick is dense/marginal.
+
+
+def _confidence_for(kind: DecisionReasonKind) -> Confidence:
+    if kind in _HIGH_CONFIDENCE_KINDS:
+        return "high"
+    if kind in _MEDIUM_CONFIDENCE_KINDS:
+        return "medium"
+    return "low"
+
+
+# ---------------------------------------------------------------------------
+# Candidates — a constrained menu a consumer's LLM can pick from without
+# being able to select an off-list or client-unsupported chart.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ScoredChart:
+    chart_type: VizChartType
+    confidence: Confidence
+    reason: DecisionReason
+
+
+# Each chart type's natural degrade path, tried in order after the chosen
+# chart and its recorded ``alternatives``. ``data_table`` / ``text_only``
+# are appended unconditionally as the universal last resorts, so they
+# don't need to be repeated here.
+_RUNNER_UPS: dict[VizChartType, list[VizChartType]] = {
+    "pie_chart": ["bar_chart"],
+    "bar_chart": [],
+    "line_chart": ["area_chart"],
+    "area_chart": ["line_chart"],
+    "stacked_bar_chart": ["bar_chart"],
+    "scatter_chart": [],
+    "bubble_chart": ["scatter_chart"],
+    "histogram": ["bar_chart"],
+    "calendar_heatmap": ["line_chart"],
+    "xy_heatmap": ["stacked_bar_chart"],
+    "compare_line_chart": ["line_chart"],
+    "data_table": [],
+    "text_only": [],
+}
+
+
+def _build_candidates(
+    chart_type: VizChartType,
+    reason: DecisionReason,
+    confidence: Confidence,
+    supported: frozenset[VizChartType] | None,
+) -> list[ScoredChart]:
+    """Build the ranked, deduped, capability-filtered candidate menu.
+
+    Order: ``[chosen] + reason.alternatives + _RUNNER_UPS[chosen] +
+    ["data_table", "text_only"]``, de-duped preserving first occurrence,
+    then filtered by ``supported`` (``None``/empty imposes no filter).
+    The chosen entry keeps its real confidence + reason; every runner-up
+    is ``low`` confidence with a generic reason.
+    """
+    raw: list[VizChartType] = [
+        chart_type,
+        *reason.alternatives,
+        *_RUNNER_UPS.get(chart_type, []),
+        "data_table",
+        "text_only",
+    ]
+    seen: set[VizChartType] = set()
+    ordered: list[VizChartType] = []
+    for c in raw:
+        if c not in seen:
+            seen.add(c)
+            ordered.append(c)
+    if supported:
+        ordered = [c for c in ordered if c in supported]
+
+    out: list[ScoredChart] = []
+    for c in ordered:
+        if c == chart_type:
+            out.append(ScoredChart(chart_type=c, confidence=confidence, reason=reason))
+        else:
+            out.append(
+                ScoredChart(
+                    chart_type=c,
+                    confidence="low",
+                    reason=DecisionReason(
+                        kind="no_chart_match",
+                        note=f"runner-up candidate; {chart_type} was the chosen pick",
+                    ),
+                )
+            )
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Feature bundle — the structural "why", for a consumer building its own
+# LLM prompt without re-deriving shape from the compiled query.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class VizFeatures:
+    n_rows: int
+    n_measures: int
+    n_dimensions: int
+    n_categorical_dims: int
+    has_time_breakdown: bool
+    measures_additive: bool | None
+    measures_share_unit: bool | None
+    is_flat: bool | None
+    null_rate: float | None
+    caveats: list[str]
+
+
+# ---------------------------------------------------------------------------
+# Render hints — axis sort order, scale, and a rendering guardrail
+# ("top_n") for the chosen chart. Hints only; the library never
+# transforms rows itself.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class RenderHints:
+    y_scale: Literal["linear", "log"] = "linear"
+    sort: Literal["value_desc", "value_asc", "natural"] | None = None
+    top_n: int | None = None
+
+
+# ---------------------------------------------------------------------------
 # Output value
 # ---------------------------------------------------------------------------
 
@@ -202,6 +397,35 @@ class VizDecision:
     # dimension whose values become the stacks). ``None`` for every other
     # chart type.
     series: str | None = None
+    # How likely a human/LLM with the question would pick something
+    # different from ``chart_type`` — escalation value, not correctness.
+    confidence: Confidence = "medium"
+    # Ranked, deduped, ``supported_charts``-filtered menu a consumer's own
+    # LLM can pick from. ``chosen`` first; see ``_build_candidates``.
+    candidates: list[ScoredChart] = field(default_factory=lambda: list[ScoredChart]())
+    # Structural "why" — everything needed to build an LLM prompt without
+    # re-deriving shape from the compiled query.
+    features: VizFeatures = field(
+        default_factory=lambda: VizFeatures(
+            n_rows=0,
+            n_measures=0,
+            n_dimensions=0,
+            n_categorical_dims=0,
+            has_time_breakdown=False,
+            measures_additive=None,
+            measures_share_unit=None,
+            is_flat=None,
+            null_rate=None,
+            caveats=[],
+        )
+    )
+    # Axis / render hints for the chosen chart (sort order, y-scale,
+    # a rendering guardrail). Hints only — the library never transforms
+    # rows itself.
+    hints: RenderHints = field(default_factory=RenderHints)
+    # ``bubble_chart`` only: the measure driving bubble size (m2). ``None``
+    # for every other chart type.
+    size_axis: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -267,6 +491,96 @@ def _reason(
     return DecisionReason(kind=kind, note=note, alternatives=list(alternatives or []))
 
 
+def _stackable(measures: list[VizColumn]) -> bool:
+    """Whether several measures can share a *stacked* area/bar.
+
+    Stacking asserts the stack height is a meaningful sum of its parts.
+    That only holds when the measures are **additive** and share a
+    **common unit**:
+
+    - A non-additive measure (a percentage / ratio / average) is not a
+      sum — stacking two conversion rates yields a number that means
+      nothing. ``VizColumn.additive`` (propagated from
+      ``ColumnMeta.additive``, authoritative from ``agg in {"sum",
+      "count"} and not non_additive``) is the ground truth when the
+      compiler has computed it. When it's ``None`` (a ``VizColumn``
+      built without going through the compiler), fall back to the
+      ``format == "percent"`` heuristic.
+    - Measures with different units (currency vs. count) can't be added
+      onto the same axis at all.
+
+    When either test fails, the caller overlays lines (optionally
+    dual-axis) instead of stacking.
+    """
+    if len(measures) < 2:
+        return True
+    for m in measures:
+        if m.additive is not None:
+            if not m.additive:
+                return False
+        elif m.format == "percent":
+            return False
+    units = {(m.display_unit or m.unit) for m in measures}
+    return len(units) <= 1
+
+
+def _measures_additive(measures: list[VizColumn]) -> bool | None:
+    """``VizFeatures.measures_additive``: ``True`` iff every measure is
+    additive, ``False`` iff at least one is known non-additive, ``None``
+    when there are no measures or additivity is unknown for any of them."""
+    if not measures:
+        return None
+    flags = [m.additive for m in measures]
+    if any(f is None for f in flags):
+        return None
+    return all(flags)
+
+
+def _measures_share_unit(measures: list[VizColumn]) -> bool | None:
+    """``VizFeatures.measures_share_unit``: ``None`` when there's fewer
+    than 2 measures (the question doesn't apply)."""
+    if len(measures) < 2:
+        return None
+    units = {(m.display_unit or m.unit) for m in measures}
+    return len(units) <= 1
+
+
+def _build_hints(
+    chart_type: VizChartType,
+    x_axis_col: VizColumn | None,
+    shape_stats: ShapeStats | None,
+) -> RenderHints:
+    """Axis sort order, y-scale, and a rendering-guardrail top_n hint.
+
+    Hints only — the library never transforms rows itself; a renderer
+    reads these to decide draw order / scale / "bucket the rest into
+    Other", but the row data it receives is untouched.
+    """
+    sort: Literal["value_desc", "value_asc", "natural"] | None = None
+    if chart_type in ("bar_chart", "pie_chart", "stacked_bar_chart"):
+        sort = "natural" if (x_axis_col is not None and x_axis_col.ordinal) else "value_desc"
+    elif chart_type == "histogram":
+        sort = "natural"
+
+    y_scale: Literal["linear", "log"] = "linear"
+    if (
+        shape_stats is not None
+        and shape_stats.measure_min is not None
+        and shape_stats.measure_max is not None
+        and shape_stats.measure_min > 0
+        and shape_stats.measure_max / shape_stats.measure_min >= LOG_SCALE_RATIO
+    ):
+        y_scale = "log"
+
+    top_n: int | None = None
+    if chart_type == "pie_chart":
+        top_n = PIE_MAX_SLICES
+    elif chart_type == "bar_chart":
+        top_n = BAR_MAX_BARS
+
+    return RenderHints(y_scale=y_scale, sort=sort, top_n=top_n)
+
+
 def _pick_chart_type(
     query: SemanticQuery,
     touched_cubes: list[Cube],
@@ -293,6 +607,16 @@ def _pick_chart_type(
     # chart breaks down by. Used to tell a numeric distribution (histogram)
     # from a categorical breakdown (bar / stacked bar).
     cat_dims = [c for c in columns if not c.is_measure and not c.is_time]
+
+    # A *categorical* breakdown with zero variation (every category has the
+    # same value) has nothing to compare — collapse a would-be bar/pie to a
+    # plain text answer. A flat *time* series is deliberately excluded: a
+    # constant line over time legitimately communicates "this held steady",
+    # so it stays a line rather than collapsing.
+    if shape_stats is not None and shape_stats.is_flat and not has_time_breakdown:
+        return "text_only", _reason(
+            "flat_series", "categorical breakdown has zero variation (measure_min == measure_max)"
+        )
 
     # Compare query. The compiler emits per-measure ``<m>_current`` /
     # ``<m>_prior`` / ``<m>_delta`` / ``<m>_pct_change`` columns;
@@ -323,6 +647,19 @@ def _pick_chart_type(
     # else is a line.
     if has_time_breakdown:
         granularity = query.time_dimension.granularity if query.time_dimension else None
+        # A categorical breakdown *alongside* time is one line per category
+        # (multi-series line). This takes precedence over the calendar and
+        # area special cases below, which assume the only non-time axis is
+        # the measure — without this branch the breakdown dimension is
+        # silently dropped from the decision.
+        if n_measures == 1 and len(cat_dims) >= 1:
+            return (
+                "line_chart",
+                _reason(
+                    "time_series_multi_series",
+                    f"time series broken down by '{cat_dims[0].name}' → one line per category",
+                ),
+            )
         # Shape-stats override: a sparse daily series shouldn't be a
         # calendar heatmap, and a flat series shouldn't be a line.
         if (
@@ -339,14 +676,37 @@ def _pick_chart_type(
                 ),
             )
         if n_measures >= 2:
+            # Stack (area) only when the measures are additive and share a
+            # unit; otherwise summing them is meaningless, so overlay lines.
+            measure_cols = [c for c in columns if c.is_measure]
+            if _stackable(measure_cols):
+                return (
+                    "area_chart",
+                    _reason(
+                        "time_series_area",
+                        f"time series, {n_measures} additive same-unit measures "
+                        "(stacked composition)",
+                    ),
+                )
             return (
-                "area_chart",
+                "line_chart",
                 _reason(
-                    "time_series_area",
-                    f"time series, {n_measures} measures (stacked composition)",
+                    "time_series_overlaid_line",
+                    f"time series, {n_measures} measures with diverging units or a "
+                    "non-additive ratio → overlaid lines, not a stacked area",
+                    alternatives=["area_chart"],
                 ),
             )
         return "line_chart", _reason("time_series_line", "time series with granularity")
+
+    # Three measures with one labelling dimension → bubble chart: x=m0,
+    # y=m1, size=m2, the dimension labels each point. Checked before the
+    # 2-measure scatter branch below (which is otherwise unchanged).
+    if n_measures == 3 and n_dims == 1:
+        return (
+            "bubble_chart",
+            _reason("bubble_xyz", "3 measures plotted as x/y/size, dimension labels points"),
+        )
 
     # Two measures with one labelling dimension → XY scatter.
     if n_measures == 2 and n_dims == 1:
@@ -356,12 +716,14 @@ def _pick_chart_type(
         )
 
     # One measure over a single *numeric* dimension → frequency distribution.
+    # No upper row cap: a distribution over *many* numeric buckets is exactly
+    # when a histogram beats every alternative — capping it would demote the
+    # densest, most histogram-worthy data to a bar and then a table.
     if (
         n_dims == 1
         and n_measures == 1
         and len(cat_dims) == 1
         and cat_dims[0].storage_type in _NUMERIC_STORAGE
-        and n_rows <= BAR_MAX_BARS
     ):
         return (
             "histogram",
@@ -480,6 +842,8 @@ def _viz_column(meta: ColumnMeta) -> VizColumn:
         unit=meta.unit,
         display_unit=meta.display_unit,
         storage_type=meta.storage_type,
+        additive=meta.additive,
+        ordinal=meta.ordinal,
     )
 
 
@@ -535,8 +899,10 @@ def decide_visualization(
     x_axis: str | None = None
     y_axes: list[str] = []
     series: str | None = None
+    size_axis: str | None = None
     non_measures = [c for c in ordered if not c.is_measure]
     measures_out = [c for c in ordered if c.is_measure]
+    x_axis_col: VizColumn | None = non_measures[0] if non_measures else None
     if chart_type in (
         "bar_chart",
         "line_chart",
@@ -549,9 +915,19 @@ def decide_visualization(
         # y = the measure that colours each day cell. compare_line_chart
         # is the side-by-side current/prior/delta/pct_change view; x is
         # the time bucket, y is the measure(s) — same shape as line/area.
-        if non_measures:
+        # Prefer the time column for the x axis (a time series' natural
+        # abscissa); fall back to the first non-measure otherwise.
+        time_cols = [c for c in non_measures if c.is_time]
+        cat_cols = [c for c in non_measures if not c.is_time]
+        if time_cols:
+            x_axis = time_cols[0].display_name
+        elif non_measures:
             x_axis = non_measures[0].display_name
         y_axes = [c.display_name for c in measures_out]
+        # A line over time with a leftover categorical dimension is a
+        # multi-series line: the category becomes the series (one line each).
+        if chart_type == "line_chart" and time_cols and cat_cols:
+            series = cat_cols[0].display_name
     elif chart_type in ("stacked_bar_chart", "xy_heatmap"):
         # First dimension is the primary (x) axis; the second is the stack
         # series (stacked_bar) or the row axis (xy_heatmap). The measure is
@@ -566,6 +942,13 @@ def decide_visualization(
         if len(measures_out) >= 2:
             x_axis = measures_out[0].display_name
             y_axes = [measures_out[1].display_name]
+    elif chart_type == "bubble_chart":
+        # x=m0, y=m1, size=m2; the dimension labels each point (same
+        # non-axis role as the 2-measure scatter case above).
+        if len(measures_out) >= 3:
+            x_axis = measures_out[0].display_name
+            y_axes = [measures_out[1].display_name]
+            size_axis = measures_out[2].display_name
     elif chart_type == "pie_chart":
         x_axis = non_measures[0].display_name if non_measures else None
         y_axes = [measures_out[0].display_name] if measures_out else []
@@ -582,6 +965,33 @@ def decide_visualization(
         title_bits.append("over " + first_time.display_name)
     title = " ".join(title_bits) if title_bits else "Result"
 
+    confidence = _confidence_for(reason.kind)
+    candidates = _build_candidates(chart_type, reason, confidence, supported_charts)
+    hints = _build_hints(chart_type, x_axis_col, shape_stats)
+
+    n_dims_total = len(non_measures)
+    n_cat_dims = len([c for c in non_measures if not c.is_time])
+    has_time_breakdown = any(c.is_time for c in non_measures)
+    is_flat = shape_stats.is_flat if shape_stats is not None else None
+    null_rate = shape_stats.null_rate if shape_stats is not None else None
+    caveats: list[str] = []
+    if is_flat:
+        caveats.append("series has zero variation (measure_min == measure_max)")
+    if null_rate is not None and null_rate >= NULL_RATE_CAVEAT_THRESHOLD:
+        caveats.append(f"null_rate={null_rate:.2f} is at or above the caveat threshold")
+    features = VizFeatures(
+        n_rows=n_rows,
+        n_measures=len(measures_out),
+        n_dimensions=n_dims_total,
+        n_categorical_dims=n_cat_dims,
+        has_time_breakdown=has_time_breakdown,
+        measures_additive=_measures_additive(measures_out),
+        measures_share_unit=_measures_share_unit(measures_out),
+        is_flat=is_flat,
+        null_rate=null_rate,
+        caveats=caveats,
+    )
+
     return VizDecision(
         chart_type=chart_type,
         title=title,
@@ -590,20 +1000,31 @@ def decide_visualization(
         columns=ordered,
         reason=reason,
         series=series,
+        confidence=confidence,
+        candidates=candidates,
+        features=features,
+        hints=hints,
+        size_axis=size_axis,
     )
 
 
 __all__ = [
     "BAR_MAX_BARS",
     "CALENDAR_MIN_DAYS",
+    "Confidence",
     "DecisionReason",
     "DecisionReasonKind",
     "HEATMAP_MAX_CELLS",
+    "LOG_SCALE_RATIO",
+    "NULL_RATE_CAVEAT_THRESHOLD",
     "PIE_MAX_SLICES",
+    "RenderHints",
     "STACKED_BAR_MAX_CELLS",
+    "ScoredChart",
     "ShapeStats",
     "VizChartType",
     "VizColumn",
     "VizDecision",
+    "VizFeatures",
     "decide_visualization",
 ]
