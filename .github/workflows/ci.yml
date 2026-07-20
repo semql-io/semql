@@ -1,22 +1,18 @@
 name: CI
 
-# Three tiers by trigger (W5/§10.7):
-#   * pull_request  -> fast lane, budget ~5 min: static checks, the
+# Tiers by trigger (W5/§10.7):
+#   * pull_request to main -> fast lane, budget ~5 min: static checks, the
 #     unit/security test lane (no integration/e2e/bench), per-package
-#     coverage ratchet, and the public-API-breakage diff.
-#   * push to main  -> merge gate, budget ~15 min: everything in the
-#     fast lane plus the full test suite (integration + security) and
-#     the per-package build smoke.
-#   * schedule      -> nightly: the 5000-example Hypothesis profile and
-#     the (currently informational) mutation run.
-# workflow_dispatch stays for manual re-runs of the merge-gate shape.
+#     coverage ratchet, the public-API-breakage diff, and the build smoke.
+#   * push to main         -> merge gate, budget ~15 min: everything in the
+#     fast lane plus the full test suite (integration + security).
+#   * workflow_dispatch    -> manual: the merge-gate shape plus the nightly
+#     deep run (5000-example Hypothesis profile + informational mutation).
 on:
   push:
     branches: [main]
   pull_request:
     branches: [main]
-  schedule:
-    - cron: "0 3 * * *" # 03:00 UTC nightly
   workflow_dispatch:
 
 concurrency:
@@ -215,7 +211,7 @@ jobs:
     name: full tests (all tiers)
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    if: github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     steps:
       - uses: actions/checkout@v4
         with:
@@ -266,12 +262,12 @@ jobs:
       - name: Build
         run: uv build --package ${{ matrix.package }}
 
-  # --- Tier 3: nightly deep runs (schedule) --------------------------------
+  # --- Tier 3: deep runs (manual dispatch only) ----------------------------
   nightly:
     name: nightly (deep Hypothesis + mutation)
     runs-on: ubuntu-latest
     timeout-minutes: 60
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'workflow_dispatch'
     steps:
       - uses: actions/checkout@v4
         with:
