@@ -29,7 +29,7 @@ classifiers = [
 # JWKSVerifier needs PyJWT (with crypto extras for RS/ES verification)
 # plus httpx to fetch the JWKS document; both are imported lazily so the
 # rest of the package works without them.
-jwks = ["pyjwt[crypto]>=2.8", "httpx>=0.27"]
+jwks = ["pyjwt[crypto]>=2.13.0", "httpx>=0.27"]
 # IntrospectMapper posts to an OAuth2 token-introspection endpoint.
 introspect = ["httpx>=0.27"]
 # X509Mapper's reference cert decoder (semql_auth.auth._cryptography_adapter).
