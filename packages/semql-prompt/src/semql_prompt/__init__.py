@@ -19,6 +19,7 @@ from semql_prompt.catalog_tools import (
     planner_prompt,
     planner_prompt_segments,
     prompt_hash,
+    sql_planner_prompt,
     to_langchain_tools,
     to_openai_tools,
 )
@@ -31,6 +32,7 @@ from semql_prompt.prompt import (
     build_presenter_prompt_fragment,
     build_query_generator_prompt_fragment,
     build_router_prompt_fragment,
+    build_sql_planner_prompt_fragment,
     catalog_prompt_hash,
     filter_tool_descriptions,
     project_tool_descriptions,
@@ -57,6 +59,7 @@ __all__ = [
     "build_presenter_prompt_fragment",
     "build_query_generator_prompt_fragment",
     "build_router_prompt_fragment",
+    "build_sql_planner_prompt_fragment",
     "catalog_prompt_hash",
     "filter_tool_descriptions",
     "project_tool_descriptions",
@@ -74,6 +77,7 @@ __all__ = [
     "planner_prompt",
     "planner_prompt_segments",
     "prompt_hash",
+    "sql_planner_prompt",
     "to_langchain_tools",
     "to_openai_tools",
     # Bedrock Converse adaptation

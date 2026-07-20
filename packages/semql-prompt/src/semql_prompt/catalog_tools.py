@@ -14,6 +14,7 @@ from semql.model import AuthContext, ResolutionContext
 from semql_prompt.prompt import (
     CatalogPrompt,
     build_planner_prompt_segments,
+    build_sql_planner_prompt_fragment,
     catalog_prompt_hash,
     project_tool_descriptions,
     render_saved_query_tool_description,
@@ -74,6 +75,46 @@ def planner_prompt(
         current_date=current_date,
         retrieved_snippets=retrieved_snippets,
         extra=extra,
+    )
+
+
+def sql_planner_prompt(
+    catalog: Catalog,
+    *,
+    only_exposed: bool = True,
+    include_introspection: bool = False,
+    include_examples: bool = True,
+    viewer: AuthContext | None = None,
+    ctx: ResolutionContext | None = None,
+    user_query: str | None = None,
+    retriever: Retriever | None = None,
+    top_k: int = 10,
+    retrieval_threshold: int = 50,
+) -> str:
+    """Render the **SQL-path** planner prompt fragment for ``catalog``.
+
+    The SQL-path counterpart to :func:`planner_prompt`: instructs the LLM to
+    emit semantic SQL (parsed by ``parse_sql_statement``) instead of a
+    ``SemanticQuery`` JSON. Same catalog rendering, viewer/retrieval
+    behaviour, and few-shot examples generated from this catalog via the
+    serializer so they never drift from the parser's grammar."""
+    return build_sql_planner_prompt_fragment(
+        catalog.as_dict(),
+        only_exposed=only_exposed,
+        include_introspection=include_introspection,
+        include_examples=include_examples,
+        views=catalog.views,
+        viewer=viewer,
+        policy=catalog.policy,
+        lookups=catalog.lookups,
+        ctx=ctx,
+        glossary=catalog.glossary,
+        relations=catalog.relations,
+        user_query=user_query,
+        retriever=retriever,
+        top_k=top_k,
+        retrieval_threshold=retrieval_threshold,
+        saved_queries=list(catalog.saved_queries.values()),
     )
 
 
