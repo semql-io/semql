@@ -390,6 +390,7 @@ class _SqlEnricher:
     fields: tuple[str, ...]
     execute: Callable[[str, list[Any]], Sequence[Mapping[str, Any]]]
     paramstyle: Literal["qmark", "format"] = "qmark"
+    key_cast: str | None = None
 
     def _table_for(self, ctx: ResolutionContext | None) -> str:
         if ctx is not None and "{" in self.table:
@@ -416,8 +417,15 @@ class _SqlEnricher:
         placeholder = "?" if self.paramstyle == "qmark" else "%s"
         in_clause = ", ".join([placeholder] * len(ids))
         cols = ", ".join((self.key, *self.fields))
+        # Only the WHERE-side comparison needs the cast: a uuid (or other
+        # non-text) key column compared against bound string parameters
+        # fails at the DB level (Postgres does not implicitly cast a bound
+        # parameter to uuid). The SELECT projection returns the raw column
+        # value, which is fine — it already goes through ``str(...)`` in
+        # Python when building ``out`` below.
+        where_key = f"CAST({self.key} AS {self.key_cast})" if self.key_cast else self.key
         sql = (  # noqa: S608 — identifiers are catalog-author-controlled; ids bind as params
-            f"SELECT {cols} FROM {self._table_for(ctx)} WHERE {self.key} IN ({in_clause})"
+            f"SELECT {cols} FROM {self._table_for(ctx)} WHERE {where_key} IN ({in_clause})"
         )
         out: dict[str, dict[str, str]] = {}
         for r in self.execute(sql, list(ids)):
@@ -432,6 +440,7 @@ def sql_enricher(
     fields: Sequence[str],
     execute: Callable[[str, list[Any]], Sequence[Mapping[str, Any]]],
     paramstyle: Literal["qmark", "format"] = "qmark",
+    key_cast: str | None = None,
 ) -> _SqlEnricher:
     """Build a post-query multi-field enricher for the common "reference
     table" case without hand-writing a class.
@@ -459,6 +468,26 @@ def sql_enricher(
       mappings — the only I/O, kept at the edge so the catalog stays sans-io.
     - ``paramstyle`` picks the placeholder: ``"qmark"`` (``?``, the
       default — sqlite/duckdb) or ``"format"`` (``%s`` — psycopg/mysql).
+    - ``key_cast`` casts the key column (via ANSI ``CAST(col AS key_cast)``)
+      on the WHERE-side comparison only, when the reference table's primary
+      key is typed as something other than text. Ids reaching ``enrich_fields``
+      are always Python ``str`` (coerced by :func:`enrich_result`), and some
+      databases — Postgres in particular — refuse to implicitly cast a bound
+      text *parameter* to a non-text column type such as ``uuid`` in a
+      comparison (only literal constants get that implicit cast). A ``uuid``
+      PK reference table therefore needs ``key_cast="text"``::
+
+          Lookup(
+              dimension="orders.customer_id",
+              enricher=sql_enricher(
+                  table="customers", key="id", fields=["name"],
+                  execute=db.execute, key_cast="text",
+              ),
+          )
+
+      which emits ``WHERE CAST(id AS text) IN (%s, %s)`` instead of the
+      unsafe ``WHERE id IN (%s, %s)``. Left unset (the default), the SQL is
+      unchanged from before this parameter existed.
     """
     return _SqlEnricher(
         table=table,
@@ -466,6 +495,7 @@ def sql_enricher(
         fields=tuple(fields),
         execute=execute,
         paramstyle=paramstyle,
+        key_cast=key_cast,
     )
 
 
