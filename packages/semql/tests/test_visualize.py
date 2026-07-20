@@ -1,5 +1,5 @@
 # mypy: disable-error-code=type-arg
-# pyright: reportMissingTypeArgument=false, reportUnknownParameterType=false, reportUnknownArgumentType=false
+# pyright: reportMissingTypeArgument=false, reportUnknownParameterType=false, reportUnknownArgumentType=false, reportPrivateUsage=false
 # (Test helpers pass bare ``frozenset`` literals of chart-type strings to
 # ``supported_charts``; annotating each as ``frozenset[VizChartType]`` adds
 # no test value and the literal-narrowing gymnastics aren't worth it here.)
@@ -711,6 +711,86 @@ def test_percent_measure_time_series_is_not_stacked() -> None:
     assert decision.reason.kind == "time_series_overlaid_line"
 
 
+def test_same_unit_different_display_unit_still_stacks() -> None:
+    """Two measures with the same true ``unit`` but different
+    ``display_unit`` conversions (e.g. one shown in seconds, one in hours)
+    are the same dimensional quantity — they must still stack, not be
+    wrongly refused for a difference that's presentation-only."""
+    cube = _orders().model_copy(
+        update={
+            "measures": [
+                Measure(
+                    name="revenue",
+                    sql="{o}.amount",
+                    agg="sum",
+                    unit="currency",
+                    display_unit="usd",
+                ),
+                Measure(
+                    name="refunds",
+                    sql="{o}.refund",
+                    agg="sum",
+                    unit="currency",
+                    display_unit="cents",
+                ),
+            ],
+        }
+    )
+    decision = _decide(
+        SemanticQuery(
+            measures=["orders.revenue", "orders.refunds"],
+            time_dimension=TimeWindow(
+                dimension="orders.created_at",
+                granularity="day",
+                range=("2026-01-01", "2026-02-01"),
+            ),
+        ),
+        n_rows=31,
+        catalog={"orders": cube.model_copy(update={"dimensions": _orders().dimensions})},
+    )
+    assert decision.chart_type == "area_chart"
+
+
+def test_diverging_unit_same_display_unit_does_not_stack() -> None:
+    """Two measures with genuinely different true units that happen to
+    share a ``display_unit`` string must not be stacked — the true unit,
+    not the display label, decides whether summing them means anything."""
+    cube = _orders().model_copy(
+        update={
+            "measures": [
+                Measure(
+                    name="revenue",
+                    sql="{o}.amount",
+                    agg="sum",
+                    unit="currency",
+                    display_unit="total",
+                ),
+                Measure(
+                    name="session_count",
+                    sql="{o}.session_id",
+                    agg="count",
+                    unit="count",
+                    display_unit="total",
+                ),
+            ],
+        }
+    )
+    decision = _decide(
+        SemanticQuery(
+            measures=["orders.revenue", "orders.session_count"],
+            time_dimension=TimeWindow(
+                dimension="orders.created_at",
+                granularity="day",
+                range=("2026-01-01", "2026-02-01"),
+            ),
+        ),
+        n_rows=31,
+        catalog={"orders": cube.model_copy(update={"dimensions": _orders().dimensions})},
+    )
+    assert decision.chart_type == "line_chart"
+    assert decision.reason.kind == "time_series_overlaid_line"
+
+
 def test_time_series_with_category_is_multi_series_line() -> None:
     """A single measure over time *and* a categorical dimension is one line
     per category: the time column is the x axis and the category is the
@@ -1246,6 +1326,32 @@ def test_features_values_for_simple_pie() -> None:
     assert f.is_flat is None
     assert f.null_rate is None
     assert f.caveats == []
+
+
+def test_measures_additive_false_beats_unknown() -> None:
+    """A known non-additive measure alongside one of unknown additivity
+    must report ``False`` (per the docstring: "False iff at least one
+    measure is known non-additive"), not ``None`` — an unknown measure
+    can't rescue a stacking decision a known non-additive one rules out."""
+    from semql.visualize import _measures_additive
+
+    known_non_additive = VizColumn(
+        name="conversion_rate",
+        display_name="Conversion Rate",
+        format="percent",
+        is_measure=True,
+        is_time=False,
+        additive=False,
+    )
+    unknown = VizColumn(
+        name="derived",
+        display_name="Derived",
+        format="raw",
+        is_measure=True,
+        is_time=False,
+        additive=None,
+    )
+    assert _measures_additive([known_non_additive, unknown]) is False
 
 
 def test_features_has_time_breakdown_true_for_time_series() -> None:

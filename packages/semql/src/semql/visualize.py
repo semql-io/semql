@@ -520,7 +520,7 @@ def _stackable(measures: list[VizColumn]) -> bool:
                 return False
         elif m.format == "percent":
             return False
-    units = {(m.display_unit or m.unit) for m in measures}
+    units = {(m.unit or m.display_unit) for m in measures}
     return len(units) <= 1
 
 
@@ -531,9 +531,11 @@ def _measures_additive(measures: list[VizColumn]) -> bool | None:
     if not measures:
         return None
     flags = [m.additive for m in measures]
+    if any(f is False for f in flags):
+        return False
     if any(f is None for f in flags):
         return None
-    return all(flags)
+    return True
 
 
 def _measures_share_unit(measures: list[VizColumn]) -> bool | None:
@@ -541,7 +543,7 @@ def _measures_share_unit(measures: list[VizColumn]) -> bool | None:
     than 2 measures (the question doesn't apply)."""
     if len(measures) < 2:
         return None
-    units = {(m.display_unit or m.unit) for m in measures}
+    units = {(m.unit or m.display_unit) for m in measures}
     return len(units) <= 1
 
 
@@ -661,7 +663,9 @@ def _pick_chart_type(
                 ),
             )
         # Shape-stats override: a sparse daily series shouldn't be a
-        # calendar heatmap, and a flat series shouldn't be a line.
+        # calendar heatmap. (A flat *time* series stays a line — see the
+        # `is_flat` handling below, which only collapses a flat
+        # *categorical* breakdown to `text_only`.)
         if (
             n_measures == 1
             and granularity == "day"
