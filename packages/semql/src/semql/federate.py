@@ -64,9 +64,12 @@ FederationMode = Literal["distributive", "raw_rows"]
   ``count_distinct`` / ``min`` / ``max`` / ``ratio`` because they
   don't distribute under SUM.
 - ``"raw_rows"`` — fragments emit ungrouped rows; merge applies the
-  full aggregation. Lifts the non-distributive-agg restriction and
-  the ``having`` restriction. Costs more bytes (full join cardinality
-  on the wire) so callers should opt in deliberately.
+  full aggregation. Lifts the non-distributive-agg restriction.
+  Costs more bytes (full join cardinality on the wire) so callers
+  should opt in deliberately.
+
+Both modes apply ``having`` at the merge, against the re-aggregated
+measure aliases (binary comparison ops only).
 """
 
 if TYPE_CHECKING:
@@ -672,7 +675,8 @@ def _build_partition_sub_query(
         segments=sub_segments,
         # ``where`` is routed after partition construction
         # (``_route_where_distributive``); HAVING stays a merge-only
-        # concern and is refused in distributive mode upstream.
+        # concern (``MergeSpec.having``) — fragments never see it in
+        # multi-backend plans.
         order=[],
         # Ordering & limits happen at merge.
     )
@@ -787,6 +791,23 @@ def _build_merge_joins(
 _TimeOutput = tuple[str, FragmentColumn, str | None]
 
 
+def _validate_having_targets(
+    having: Sequence[Filter], measure_outputs: Sequence[MeasureOutput]
+) -> None:
+    """HAVING refusal (compile-time): every HAVING target must be one of
+    the selected measures — the merge renderer references it by output
+    alias."""
+    if not having:
+        return
+    selected = {m.output_name for m in measure_outputs}
+    for hf in having:
+        if field_of(hf.dimension) not in selected:
+            raise FederationError(
+                f"HAVING references {hf.dimension!r}, which is not in query.measures.",
+                reason="having_unknown_measure",
+            )
+
+
 def _build_merge_spec(
     q: SemanticQuery,
     catalog: dict[str, Cube],
@@ -844,17 +865,7 @@ def _build_merge_spec(
     bridge_joins = _build_merge_joins(partitions, bridges, primary_idx, restricting_cubes)
     resolved_cross = _resolve_cross_clauses(cross_partition_clauses or [], cube_to_idx)
 
-    # HAVING refusal (compile-time): every HAVING target must be one of
-    # the selected measures — the renderer references it by output alias.
-    if q.having:
-        selected = {m.output_name for m in measure_outputs}
-        for hf in q.having:
-            alias = field_of(hf.dimension)
-            if alias not in selected:
-                raise FederationError(
-                    f"HAVING references {hf.dimension!r}, which is not in query.measures.",
-                    reason="having_unknown_measure",
-                )
+    _validate_having_targets(q.having, measure_outputs)
 
     return MergeSpec(
         primary_index=primary_idx,
@@ -1618,15 +1629,15 @@ def _detect_cross_backend_symmetric(
     *many* side of a join to one shared bridge cube that is the only non-fact
     touched cube; every projected dimension on the bridge; conformed keys are
     simple ``{a}.col = {b}.col`` equality on the same bridge column; no time
-    breakdown, where-tree, derived measures, segments, having, compare, or
-    ungrouped. Anything outside that stays a refusal so the emit path never
-    sees a half-supported query."""
+    breakdown, where-tree, derived measures, segments, compare, or
+    ungrouped. HAVING is fine — it applies at the merge, against the
+    re-aggregated measure aliases. Anything outside that stays a refusal
+    so the emit path never sees a half-supported query."""
     if (
         q.ungrouped
         or q.where is not None
         or q.derived_measures
         or q.segments
-        or q.having
         or q.compare is not None
         or q.time_dimension is not None
     ):
@@ -1806,12 +1817,14 @@ def _compile_cross_backend_symmetric(
             DimensionOutput(output_name=alias, sources=[FragmentColumn(0, alias)], column_meta=meta)
         )
 
+    _validate_having_targets(q.having, measure_outputs)
+
     merge_spec = MergeSpec(
         primary_index=0,
         bridges=bridges,
         dimensions=dimension_outputs,
         measures=measure_outputs,
-        having=[],
+        having=list(q.having),
         order_by=list(q.order),
         limit=q.limit,
         offset=q.offset,
@@ -1856,12 +1869,6 @@ def compile_federated_query(
             "Federated compare-mode is not supported in v1.",
             reason="compare_in_federated",
         )
-    if q.having and mode == "distributive":
-        raise FederationError(
-            "Federated queries cannot use HAVING in distributive mode.",
-            reason="having_in_distributive_federated",
-        )
-
     touched = _touched(q, catalog)
     if not touched:
         raise FederationError("Empty query.", reason="empty")
