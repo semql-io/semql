@@ -2193,7 +2193,7 @@ requires-dist = [
     { name = "cryptography", marker = "extra == 'x509'", specifier = ">=42" },
     { name = "httpx", marker = "extra == 'introspect'", specifier = ">=0.27" },
     { name = "httpx", marker = "extra == 'jwks'", specifier = ">=0.27" },
-    { name = "pyjwt", extras = ["crypto"], marker = "extra == 'jwks'", specifier = ">=2.8" },
+    { name = "pyjwt", extras = ["crypto"], marker = "extra == 'jwks'", specifier = ">=2.13.0" },
     { name = "semql", editable = "packages/semql" },
 ]
 provides-extras = ["jwks", "introspect", "x509"]
