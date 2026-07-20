@@ -36,7 +36,8 @@ def render_image(
     from the bindings) if the ``dot`` binary isn't on PATH.
     """
     try:
-        from graphviz import Source  # type: ignore[import-untyped,unused-ignore]
+        # graphviz has no type stubs; mypy is handled by a tool.mypy override.
+        from graphviz import Source  # pyright: ignore[reportMissingTypeStubs]
     except ImportError as exc:  # pragma: no cover
         raise ImportError(
             "render_image requires the ``image`` extra. Install with "

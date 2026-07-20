@@ -37,6 +37,13 @@ ignore = []
 strict = true
 python_version = "3.12"
 
+[[tool.mypy.overrides]]
+# graphviz (the optional ``image`` extra) ships no py.typed and has no stub
+# package. A fresh env reports import-not-found; a warm one import-untyped.
+# Silence both here so the type check doesn't depend on venv/cache state.
+module = ["graphviz.*"]
+ignore_missing_imports = true
+
 [tool.pyright]
 pythonVersion = "3.12"
 typeCheckingMode = "strict"
