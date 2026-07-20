@@ -718,6 +718,57 @@ def test_sql_enricher_format_paramstyle() -> None:
     assert "IN (%s, %s)" in seen[-1]
 
 
+def test_sql_enricher_default_key_cast_reproduces_identical_sql() -> None:
+    """Regression: ``key_cast`` unset must emit byte-for-byte the same SQL as
+    before the parameter existed — no no-op CAST wrapper for existing
+    text-keyed callers."""
+    from semql.lookups import sql_enricher
+    from semql.model import ResolutionContext
+
+    seen: list[str] = []
+
+    def execute(sql: str, params: list[object]) -> list[dict[str, object]]:
+        seen.append(sql)
+        return []
+
+    enr = sql_enricher(table="regions", key="id", fields=["name", "manager"], execute=execute)
+    enr.enrich_fields(["r1", "r2"], ResolutionContext())
+    assert seen[-1] == "SELECT id, name, manager FROM regions WHERE id IN (?, ?)"
+    assert "CAST" not in seen[-1]
+
+
+def test_sql_enricher_key_cast_wraps_where_side_only() -> None:
+    """``key_cast`` casts the key column in the WHERE clause (comparison
+    against string-coerced ids), for e.g. a uuid-typed reference table PK.
+    Ids remain bound as parameters, never inlined as literals."""
+    from semql.lookups import sql_enricher
+    from semql.model import ResolutionContext
+
+    calls: list[tuple[str, list[object]]] = []
+
+    def execute(sql: str, params: list[object]) -> list[dict[str, object]]:
+        calls.append((sql, params))
+        return [{"id": "11111111-1111-1111-1111-111111111111", "name": "EMEA"}]
+
+    enr = sql_enricher(
+        table="regions",
+        key="id",
+        fields=["name"],
+        execute=execute,
+        paramstyle="format",
+        key_cast="text",
+    )
+    ids = ["11111111-1111-1111-1111-111111111111"]
+    out = enr.enrich_fields(ids, ResolutionContext())
+
+    sql, params = calls[-1]
+    assert sql == "SELECT id, name FROM regions WHERE CAST(id AS text) IN (%s)"
+    # SELECT projection is not cast — only the WHERE-side comparison.
+    assert "SELECT CAST" not in sql
+    assert params == ids  # ids bound as parameters, not string-interpolated
+    assert out[ids[0]]["name"] == "EMEA"
+
+
 def test_sql_enricher_is_not_a_vocabulary_loader() -> None:
     """The enricher is post-query only — it is not callable as a vocabulary
     loader, so its reference table can never be dumped into the prompt."""
