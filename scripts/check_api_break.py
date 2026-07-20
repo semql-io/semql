@@ -17,12 +17,37 @@ manually before publishing a release is enough for now.
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 from pathlib import Path
 
 import griffe
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+
+# Matches a quoted string literal or a bare identifier — enough to tokenize
+# both a ``Literal['a', 'b']`` alias and a ``Union[Foo, Literal['x']]`` alias
+# into a comparable set of "things this type can be".
+_TOKEN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*|'[^']*'")
+
+
+def _is_pure_widening(breakage: griffe.Breakage) -> bool:
+    """Whether an ``AttributeChangedValueBreakage`` only *adds* alternatives
+    to a ``Literal`` / ``Union`` type alias, without removing or renaming any.
+
+    griffe's generic value-diff can't tell a covariant Literal/Union widening
+    (never breaking for a return-type position — only for a parameter
+    position, which this codebase doesn't use these aliases in) from an
+    actual incompatible change, so it flags both identically. Rather than
+    reaching for a symbol-name allowlist that silently goes stale as new
+    literal members get added, tokenize both sides and require every token
+    on the old side to still be present on the new side."""
+    if not isinstance(breakage, griffe.AttributeChangedValueBreakage):
+        return False
+    old_tokens = set(_TOKEN_RE.findall(str(breakage.old_value)))
+    new_tokens = set(_TOKEN_RE.findall(str(breakage.new_value)))
+    return old_tokens <= new_tokens
+
 
 PACKAGES: tuple[tuple[str, str], ...] = (
     ("semql", "semql"),
@@ -60,7 +85,7 @@ def check(base: str, head: str | None) -> int:
             print(f"# {module_name}: skipped — could not load at {base!r}: {exc}", file=sys.stderr)
             continue
         new = _load(module_name, head)
-        breakages = list(griffe.find_breaking_changes(old, new))
+        breakages = [b for b in griffe.find_breaking_changes(old, new) if not _is_pure_widening(b)]
         if not breakages:
             print(f"# {module_name}: no breaking changes vs {base}")
             continue

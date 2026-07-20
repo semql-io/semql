@@ -1,5 +1,5 @@
 # mypy: disable-error-code=type-arg
-# pyright: reportMissingTypeArgument=false, reportUnknownParameterType=false, reportUnknownArgumentType=false
+# pyright: reportMissingTypeArgument=false, reportUnknownParameterType=false, reportUnknownArgumentType=false, reportPrivateUsage=false
 # (Test helpers pass bare ``frozenset`` literals of chart-type strings to
 # ``supported_charts``; annotating each as ``frozenset[VizChartType]`` adds
 # no test value and the literal-narrowing gymnastics aren't worth it here.)
@@ -20,11 +20,16 @@ from semql.model import Cube, Dialect, Dimension, Join, Measure, TimeDimension
 from semql.spec import CompareWindow, SemanticQuery, TimeWindow
 from semql.visualize import (
     BAR_MAX_BARS,
+    LOG_SCALE_RATIO,
+    NULL_RATE_CAVEAT_THRESHOLD,
     PIE_MAX_SLICES,
     DecisionReason,
+    RenderHints,
+    ScoredChart,
     ShapeStats,
     VizColumn,
     VizDecision,
+    VizFeatures,
     decide_visualization,
 )
 
@@ -639,9 +644,36 @@ def test_dimension_unit_fields_surface_on_viz_column() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_area_chart_for_multi_measure_time_series() -> None:
-    """A time series with several measures composes over time → stacked
+def test_area_chart_for_multi_measure_same_unit_time_series() -> None:
+    """Several *additive same-unit* measures over time compose → stacked
     area (a single-measure time series stays a line)."""
+    cube = _orders().model_copy(
+        update={
+            "measures": [
+                Measure(name="revenue", sql="{o}.amount", agg="sum", unit="currency"),
+                Measure(name="refunds", sql="{o}.refund", agg="sum", unit="currency"),
+            ],
+        }
+    )
+    decision = _decide(
+        SemanticQuery(
+            measures=["orders.revenue", "orders.refunds"],
+            time_dimension=TimeWindow(
+                dimension="orders.created_at",
+                granularity="day",
+                range=("2026-01-01", "2026-02-01"),
+            ),
+        ),
+        n_rows=31,
+        catalog={"orders": cube.model_copy(update={"dimensions": _orders().dimensions})},
+    )
+    assert decision.chart_type == "area_chart"
+    assert decision.y_axes == ["Revenue", "Refunds"]
+
+
+def test_diverging_unit_multi_measure_time_series_overlays_lines() -> None:
+    """Revenue (currency) and order count (count) can't be summed onto one
+    stacked axis — overlay lines instead of an area, and record the reject."""
     decision = _decide(
         SemanticQuery(
             measures=["orders.revenue", "orders.orders"],
@@ -654,8 +686,155 @@ def test_area_chart_for_multi_measure_time_series() -> None:
         n_rows=31,
         catalog=_catalog(_orders()),
     )
-    assert decision.chart_type == "area_chart"
+    assert decision.chart_type == "line_chart"
+    assert decision.reason.kind == "time_series_overlaid_line"
+    assert "area_chart" in decision.reason.alternatives
     assert decision.y_axes == ["Revenue", "Orders"]
+
+
+def test_percent_measure_time_series_is_not_stacked() -> None:
+    """A percentage/ratio measure is an average, not a sum — a multi-measure
+    time series that includes one must not stack into an area."""
+    decision = _decide(
+        SemanticQuery(
+            measures=["orders.revenue", "orders.conversion_rate"],
+            time_dimension=TimeWindow(
+                dimension="orders.created_at",
+                granularity="day",
+                range=("2026-01-01", "2026-02-01"),
+            ),
+        ),
+        n_rows=31,
+        catalog=_catalog(_orders()),
+    )
+    assert decision.chart_type == "line_chart"
+    assert decision.reason.kind == "time_series_overlaid_line"
+
+
+def test_same_unit_different_display_unit_still_stacks() -> None:
+    """Two measures with the same true ``unit`` but different
+    ``display_unit`` conversions (e.g. one shown in seconds, one in hours)
+    are the same dimensional quantity — they must still stack, not be
+    wrongly refused for a difference that's presentation-only."""
+    cube = _orders().model_copy(
+        update={
+            "measures": [
+                Measure(
+                    name="revenue",
+                    sql="{o}.amount",
+                    agg="sum",
+                    unit="currency",
+                    display_unit="usd",
+                ),
+                Measure(
+                    name="refunds",
+                    sql="{o}.refund",
+                    agg="sum",
+                    unit="currency",
+                    display_unit="cents",
+                ),
+            ],
+        }
+    )
+    decision = _decide(
+        SemanticQuery(
+            measures=["orders.revenue", "orders.refunds"],
+            time_dimension=TimeWindow(
+                dimension="orders.created_at",
+                granularity="day",
+                range=("2026-01-01", "2026-02-01"),
+            ),
+        ),
+        n_rows=31,
+        catalog={"orders": cube.model_copy(update={"dimensions": _orders().dimensions})},
+    )
+    assert decision.chart_type == "area_chart"
+
+
+def test_diverging_unit_same_display_unit_does_not_stack() -> None:
+    """Two measures with genuinely different true units that happen to
+    share a ``display_unit`` string must not be stacked — the true unit,
+    not the display label, decides whether summing them means anything."""
+    cube = _orders().model_copy(
+        update={
+            "measures": [
+                Measure(
+                    name="revenue",
+                    sql="{o}.amount",
+                    agg="sum",
+                    unit="currency",
+                    display_unit="total",
+                ),
+                Measure(
+                    name="session_count",
+                    sql="{o}.session_id",
+                    agg="count",
+                    unit="count",
+                    display_unit="total",
+                ),
+            ],
+        }
+    )
+    decision = _decide(
+        SemanticQuery(
+            measures=["orders.revenue", "orders.session_count"],
+            time_dimension=TimeWindow(
+                dimension="orders.created_at",
+                granularity="day",
+                range=("2026-01-01", "2026-02-01"),
+            ),
+        ),
+        n_rows=31,
+        catalog={"orders": cube.model_copy(update={"dimensions": _orders().dimensions})},
+    )
+    assert decision.chart_type == "line_chart"
+    assert decision.reason.kind == "time_series_overlaid_line"
+
+
+def test_time_series_with_category_is_multi_series_line() -> None:
+    """A single measure over time *and* a categorical dimension is one line
+    per category: the time column is the x axis and the category is the
+    series. Previously the category was silently dropped from the decision."""
+    decision = _decide(
+        SemanticQuery(
+            measures=["orders.revenue"],
+            dimensions=["orders.region"],
+            time_dimension=TimeWindow(
+                dimension="orders.created_at",
+                granularity="day",
+                range=("2026-01-01", "2026-02-01"),
+            ),
+        ),
+        n_rows=60,
+        catalog=_catalog(_orders()),
+    )
+    assert decision.chart_type == "line_chart"
+    assert decision.reason.kind == "time_series_multi_series"
+    assert decision.x_axis is not None and "Created At" in decision.x_axis
+    assert decision.series == "Region"
+    assert decision.y_axes == ["Revenue"]
+
+
+def test_long_daily_series_with_category_prefers_multi_series_over_calendar() -> None:
+    """A calendar heatmap can't show categories — a long daily series broken
+    down by a dimension stays a multi-series line, not a calendar heatmap."""
+    from semql.visualize import CALENDAR_MIN_DAYS
+
+    decision = _decide(
+        SemanticQuery(
+            measures=["orders.revenue"],
+            dimensions=["orders.region"],
+            time_dimension=TimeWindow(
+                dimension="orders.created_at",
+                granularity="day",
+                range=("2026-01-01", "2026-12-31"),
+            ),
+        ),
+        n_rows=CALENDAR_MIN_DAYS + 100,
+        catalog=_catalog(_orders()),
+    )
+    assert decision.chart_type == "line_chart"
+    assert decision.series == "Region"
 
 
 def test_histogram_for_numeric_dimension() -> None:
@@ -672,6 +851,22 @@ def test_histogram_for_numeric_dimension() -> None:
     assert decision.chart_type == "histogram"
     assert decision.x_axis == "Bucket"
     assert decision.y_axes == ["Revenue"]
+
+
+def test_histogram_for_large_numeric_dimension() -> None:
+    """A distribution over *many* numeric buckets is the strongest histogram
+    case, not a data table — the numeric-dimension branch has no upper row
+    cap (a categorical dimension of the same size would still fall to a
+    table)."""
+    cube = _orders().model_copy(
+        update={"dimensions": [Dimension(name="bucket", sql="{o}.bucket", type="number")]}
+    )
+    decision = _decide(
+        SemanticQuery(measures=["orders.revenue"], dimensions=["orders.bucket"]),
+        n_rows=BAR_MAX_BARS + 200,
+        catalog={"orders": cube},
+    )
+    assert decision.chart_type == "histogram"
 
 
 # ---------------------------------------------------------------------------
@@ -977,3 +1172,457 @@ def test_compare_line_chart_x_axis_is_time_axis() -> None:
     y_names = " | ".join(decision.y_axes)
     for needle in ("current", "prior", "delta", "% change"):
         assert needle in y_names, f"missing {needle!r} in y_axes={decision.y_axes}"
+
+
+# ---------------------------------------------------------------------------
+# §1 — Confidence: coarse enum mapped from the winning reason kind.
+# ---------------------------------------------------------------------------
+
+
+def test_confidence_high_for_unambiguous_shape() -> None:
+    """A time series with granularity is unambiguous — escalation
+    wouldn't help, so confidence is high."""
+    decision = _decide(
+        SemanticQuery(
+            measures=["orders.revenue"],
+            time_dimension=TimeWindow(
+                dimension="orders.created_at",
+                granularity="day",
+                range=("2026-01-01", "2026-02-01"),
+            ),
+        ),
+        n_rows=31,
+        catalog=_catalog(_orders()),
+    )
+    assert decision.reason.kind == "time_series_line"
+    assert decision.confidence == "high"
+
+
+def test_confidence_medium_for_sound_default() -> None:
+    """A small pie is a sound default the question could override —
+    medium confidence."""
+    decision = _decide(
+        SemanticQuery(measures=["orders.revenue"], dimensions=["orders.region"]),
+        n_rows=3,
+        catalog=_catalog(_orders()),
+    )
+    assert decision.reason.kind == "pie_small"
+    assert decision.confidence == "medium"
+
+
+def test_confidence_low_for_dense_marginal_pick() -> None:
+    """An xy heatmap is the dense/marginal grid case — low confidence."""
+    from semql.visualize import STACKED_BAR_MAX_CELLS
+
+    decision = _decide(
+        SemanticQuery(
+            measures=["orders.revenue"],
+            dimensions=["orders.region", "orders.status"],
+        ),
+        n_rows=STACKED_BAR_MAX_CELLS + 1,
+        catalog=_catalog(_orders()),
+    )
+    assert decision.reason.kind == "xy_heatmap"
+    assert decision.confidence == "low"
+
+
+def test_confidence_high_for_client_capability_fallback() -> None:
+    """A hard client-capability constraint is high confidence — the
+    renderer can't draw anything else anyway."""
+    decision = _decide(
+        SemanticQuery(measures=["orders.revenue"], dimensions=["orders.region"]),
+        n_rows=3,
+        catalog=_catalog(_orders()),
+        supported_charts=frozenset({"bar_chart", "data_table"}),
+    )
+    assert decision.reason.kind == "client_capability_fallback"
+    assert decision.confidence == "high"
+
+
+# ---------------------------------------------------------------------------
+# §2 — Candidates: a constrained, deduped, capability-filtered menu.
+# ---------------------------------------------------------------------------
+
+
+def test_candidates_chosen_first() -> None:
+    decision = _decide(
+        SemanticQuery(measures=["orders.revenue"], dimensions=["orders.region"]),
+        n_rows=3,
+        catalog=_catalog(_orders()),
+    )
+    assert decision.candidates[0].chart_type == decision.chart_type
+    assert decision.candidates[0].confidence == decision.confidence
+    assert decision.candidates[0].reason == decision.reason
+
+
+def test_candidates_are_deduped() -> None:
+    """``alternatives`` recorded a rejected 'pie_chart'; the runner-up
+    path for the chosen ``bar_chart`` is empty, so the menu has no
+    repeats even though both sources could otherwise collide."""
+    decision = _decide(
+        SemanticQuery(measures=["orders.revenue"], dimensions=["orders.region"]),
+        n_rows=3,
+        catalog=_catalog(_orders()),
+        shape_stats=ShapeStats(has_negatives=True),
+    )
+    chart_types = [c.chart_type for c in decision.candidates]
+    assert len(chart_types) == len(set(chart_types))
+    assert "pie_chart" in chart_types
+
+
+def test_candidates_include_universal_fallbacks() -> None:
+    decision = _decide(
+        SemanticQuery(measures=["orders.revenue"], dimensions=["orders.region"]),
+        n_rows=3,
+        catalog=_catalog(_orders()),
+    )
+    chart_types = {c.chart_type for c in decision.candidates}
+    assert "data_table" in chart_types
+    assert "text_only" in chart_types
+
+
+def test_candidates_filtered_by_supported_charts() -> None:
+    decision = _decide(
+        SemanticQuery(measures=["orders.revenue"], dimensions=["orders.region"]),
+        n_rows=3,
+        catalog=_catalog(_orders()),
+        supported_charts=frozenset({"bar_chart", "data_table"}),
+    )
+    chart_types = {c.chart_type for c in decision.candidates}
+    assert chart_types <= {"bar_chart", "data_table"}
+
+
+def test_candidates_runner_up_is_low_confidence() -> None:
+    decision = _decide(
+        SemanticQuery(measures=["orders.revenue"], dimensions=["orders.region"]),
+        n_rows=3,
+        catalog=_catalog(_orders()),
+    )
+    runner_ups = [c for c in decision.candidates if c.chart_type != decision.chart_type]
+    assert runner_ups  # pie has runner-ups (bar, data_table, text_only)
+    assert all(c.confidence == "low" for c in runner_ups)
+
+
+# ---------------------------------------------------------------------------
+# §3 — Feature bundle: the structural "why".
+# ---------------------------------------------------------------------------
+
+
+def test_features_values_for_simple_pie() -> None:
+    decision = _decide(
+        SemanticQuery(measures=["orders.revenue"], dimensions=["orders.region"]),
+        n_rows=3,
+        catalog=_catalog(_orders()),
+    )
+    f = decision.features
+    assert isinstance(f, VizFeatures)
+    assert f.n_rows == 3
+    assert f.n_measures == 1
+    assert f.n_dimensions == 1
+    assert f.n_categorical_dims == 1
+    assert f.has_time_breakdown is False
+    assert f.measures_additive is True  # revenue: agg=sum, not non_additive
+    assert f.measures_share_unit is None  # only 1 measure — the question doesn't apply
+    assert f.is_flat is None
+    assert f.null_rate is None
+    assert f.caveats == []
+
+
+def test_measures_additive_false_beats_unknown() -> None:
+    """A known non-additive measure alongside one of unknown additivity
+    must report ``False`` (per the docstring: "False iff at least one
+    measure is known non-additive"), not ``None`` — an unknown measure
+    can't rescue a stacking decision a known non-additive one rules out."""
+    from semql.visualize import _measures_additive
+
+    known_non_additive = VizColumn(
+        name="conversion_rate",
+        display_name="Conversion Rate",
+        format="percent",
+        is_measure=True,
+        is_time=False,
+        additive=False,
+    )
+    unknown = VizColumn(
+        name="derived",
+        display_name="Derived",
+        format="raw",
+        is_measure=True,
+        is_time=False,
+        additive=None,
+    )
+    assert _measures_additive([known_non_additive, unknown]) is False
+
+
+def test_features_has_time_breakdown_true_for_time_series() -> None:
+    decision = _decide(
+        SemanticQuery(
+            measures=["orders.revenue"],
+            time_dimension=TimeWindow(
+                dimension="orders.created_at",
+                granularity="day",
+                range=("2026-01-01", "2026-02-01"),
+            ),
+        ),
+        n_rows=31,
+        catalog=_catalog(_orders()),
+    )
+    assert decision.features.has_time_breakdown is True
+    assert decision.features.n_dimensions == 1
+
+
+# ---------------------------------------------------------------------------
+# §4 — is_flat → text_only; null_rate → caveat only (no chart change).
+# ---------------------------------------------------------------------------
+
+
+def test_is_flat_forces_text_only_with_caveat() -> None:
+    decision = _decide(
+        SemanticQuery(measures=["orders.revenue"], dimensions=["orders.region"]),
+        n_rows=3,
+        catalog=_catalog(_orders()),
+        shape_stats=ShapeStats(measure_min=5.0, measure_max=5.0),
+    )
+    assert decision.chart_type == "text_only"
+    assert decision.reason.kind == "flat_series"
+    assert decision.confidence == "high"
+    assert decision.features.is_flat is True
+    assert decision.features.caveats  # non-empty
+    assert any("variation" in c for c in decision.features.caveats)
+
+
+def test_is_flat_time_series_stays_line() -> None:
+    """A flat *time* series is NOT collapsed: a constant line over time
+    legitimately shows "this held steady", so it stays a line. The flatness
+    still rides out as an advisory caveat on the feature bundle."""
+    decision = _decide(
+        SemanticQuery(
+            measures=["orders.revenue"],
+            time_dimension=TimeWindow(
+                dimension="orders.created_at",
+                granularity="day",
+                range=("2026-01-01", "2026-02-01"),
+            ),
+        ),
+        n_rows=31,
+        catalog=_catalog(_orders()),
+        shape_stats=ShapeStats(measure_min=10.0, measure_max=10.0),
+    )
+    assert decision.chart_type == "line_chart"
+    assert decision.reason.kind != "flat_series"
+    # Flatness is surfaced, not acted on, for time series.
+    assert decision.features.is_flat is True
+    assert any("variation" in c for c in decision.features.caveats)
+
+
+def test_null_rate_above_threshold_adds_caveat_without_changing_chart() -> None:
+    decision = _decide(
+        SemanticQuery(measures=["orders.revenue"], dimensions=["orders.region"]),
+        n_rows=3,
+        catalog=_catalog(_orders()),
+        shape_stats=ShapeStats(null_rate=NULL_RATE_CAVEAT_THRESHOLD),
+    )
+    assert decision.chart_type == "pie_chart"  # unchanged
+    assert decision.features.null_rate == NULL_RATE_CAVEAT_THRESHOLD
+    assert decision.features.caveats
+    assert any("null_rate" in c for c in decision.features.caveats)
+
+
+def test_null_rate_below_threshold_no_caveat() -> None:
+    decision = _decide(
+        SemanticQuery(measures=["orders.revenue"], dimensions=["orders.region"]),
+        n_rows=3,
+        catalog=_catalog(_orders()),
+        shape_stats=ShapeStats(null_rate=NULL_RATE_CAVEAT_THRESHOLD - 0.05),
+    )
+    assert decision.chart_type == "pie_chart"
+    assert decision.features.caveats == []
+
+
+# ---------------------------------------------------------------------------
+# §5 — Additivity drives stacking; ordinal dimension drives sort; bubble.
+# ---------------------------------------------------------------------------
+
+
+def test_non_additive_measure_flag_forces_overlaid_lines() -> None:
+    """Two sum measures sharing a unit would normally stack — but one is
+    explicitly flagged ``non_additive`` (e.g. a running/point-in-time
+    balance that shouldn't be summed) → overlay lines instead."""
+    cube = _orders().model_copy(
+        update={
+            "measures": [
+                Measure(name="revenue", sql="{o}.amount", agg="sum", unit="currency"),
+                Measure(
+                    name="balance",
+                    sql="{o}.balance",
+                    agg="sum",
+                    unit="currency",
+                    non_additive=True,
+                ),
+            ],
+        }
+    )
+    decision = _decide(
+        SemanticQuery(
+            measures=["orders.revenue", "orders.balance"],
+            time_dimension=TimeWindow(
+                dimension="orders.created_at",
+                granularity="day",
+                range=("2026-01-01", "2026-02-01"),
+            ),
+        ),
+        n_rows=31,
+        catalog={"orders": cube.model_copy(update={"dimensions": _orders().dimensions})},
+    )
+    assert decision.chart_type == "line_chart"
+    assert decision.reason.kind == "time_series_overlaid_line"
+    revenue_col = next(c for c in decision.columns if c.name == "revenue")
+    balance_col = next(c for c in decision.columns if c.name == "balance")
+    assert revenue_col.additive is True
+    assert balance_col.additive is False
+
+
+def test_ordinal_x_axis_sorts_natural() -> None:
+    """An ordinal dimension (weekday) sorts by its natural order, not by
+    measure value — the default bar/pie sort."""
+    cube = _orders().model_copy(
+        update={
+            "dimensions": [
+                Dimension(name="weekday", sql="{o}.weekday", type="string", ordinal=True),
+            ],
+        }
+    )
+    decision = _decide(
+        SemanticQuery(measures=["orders.revenue"], dimensions=["orders.weekday"]),
+        n_rows=15,  # > PIE_MAX_SLICES so it's the bar_chart branch
+        catalog={"orders": cube},
+    )
+    assert decision.chart_type == "bar_chart"
+    assert decision.hints.sort == "natural"
+    weekday_col = next(c for c in decision.columns if c.name == "weekday")
+    assert weekday_col.ordinal is True
+
+
+def test_non_ordinal_x_axis_sorts_value_desc() -> None:
+    decision = _decide(
+        SemanticQuery(measures=["orders.revenue"], dimensions=["orders.region"]),
+        n_rows=15,
+        catalog=_catalog(_orders()),
+    )
+    assert decision.chart_type == "bar_chart"
+    assert decision.hints.sort == "value_desc"
+
+
+def test_histogram_sort_hint_is_natural() -> None:
+    cube = _orders().model_copy(
+        update={"dimensions": [Dimension(name="bucket", sql="{o}.bucket", type="number")]}
+    )
+    decision = _decide(
+        SemanticQuery(measures=["orders.revenue"], dimensions=["orders.bucket"]),
+        n_rows=12,
+        catalog={"orders": cube},
+    )
+    assert decision.chart_type == "histogram"
+    assert decision.hints.sort == "natural"
+
+
+def test_bubble_chart_for_three_measures_one_dim() -> None:
+    """3 measures + 1 dim → bubble chart: x=m0, y=m1, size=m2; the
+    dimension labels each point."""
+    decision = _decide(
+        SemanticQuery(
+            measures=["orders.revenue", "orders.orders", "orders.conversion_rate"],
+            dimensions=["orders.region"],
+        ),
+        n_rows=5,
+        catalog=_catalog(_orders()),
+    )
+    assert decision.chart_type == "bubble_chart"
+    assert decision.reason.kind == "bubble_xyz"
+    assert decision.x_axis == "Revenue"
+    assert decision.y_axes == ["Orders"]
+    assert decision.size_axis == "Conversion Rate"
+    assert decision.confidence == "high"
+
+
+# ---------------------------------------------------------------------------
+# §6 — Render hints: y_scale (log), top_n.
+# ---------------------------------------------------------------------------
+
+
+def test_log_scale_hint_for_strong_positive_skew() -> None:
+    decision = _decide(
+        SemanticQuery(measures=["orders.revenue"], dimensions=["orders.region"]),
+        n_rows=15,  # bar_chart branch
+        catalog=_catalog(_orders()),
+        shape_stats=ShapeStats(measure_min=1.0, measure_max=1.0 * LOG_SCALE_RATIO),
+    )
+    assert decision.chart_type == "bar_chart"
+    assert decision.hints.y_scale == "log"
+
+
+def test_linear_scale_without_stats() -> None:
+    decision = _decide(
+        SemanticQuery(measures=["orders.revenue"], dimensions=["orders.region"]),
+        n_rows=15,
+        catalog=_catalog(_orders()),
+    )
+    assert decision.hints.y_scale == "linear"
+
+
+def test_linear_scale_for_mild_ratio() -> None:
+    decision = _decide(
+        SemanticQuery(measures=["orders.revenue"], dimensions=["orders.region"]),
+        n_rows=15,
+        catalog=_catalog(_orders()),
+        shape_stats=ShapeStats(measure_min=1.0, measure_max=10.0),
+    )
+    assert decision.hints.y_scale == "linear"
+
+
+def test_top_n_hint_for_pie_and_bar() -> None:
+    pie_decision = _decide(
+        SemanticQuery(measures=["orders.revenue"], dimensions=["orders.region"]),
+        n_rows=3,
+        catalog=_catalog(_orders()),
+    )
+    assert pie_decision.hints.top_n == PIE_MAX_SLICES
+
+    bar_decision = _decide(
+        SemanticQuery(measures=["orders.revenue"], dimensions=["orders.region"]),
+        n_rows=15,
+        catalog=_catalog(_orders()),
+    )
+    assert bar_decision.hints.top_n == BAR_MAX_BARS
+
+
+def test_top_n_hint_is_none_for_other_charts() -> None:
+    decision = _decide(
+        SemanticQuery(
+            measures=["orders.revenue"],
+            time_dimension=TimeWindow(
+                dimension="orders.created_at",
+                granularity="day",
+                range=("2026-01-01", "2026-02-01"),
+            ),
+        ),
+        n_rows=31,
+        catalog=_catalog(_orders()),
+    )
+    assert decision.hints.top_n is None
+
+
+def test_render_hints_can_be_constructed_directly() -> None:
+    hints = RenderHints()
+    assert hints.y_scale == "linear"
+    assert hints.sort is None
+    assert hints.top_n is None
+
+
+def test_scored_chart_can_be_constructed_directly() -> None:
+    sc = ScoredChart(
+        chart_type="bar_chart",
+        confidence="low",
+        reason=DecisionReason(kind="bar_medium", note="x"),
+    )
+    assert sc.chart_type == "bar_chart"

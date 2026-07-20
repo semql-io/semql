@@ -109,12 +109,28 @@ def _viz_to_payload(
         "x_axis": decision.x_axis,
         "y_axes": decision.y_axes,
         "series": decision.series,
+        "size_axis": decision.size_axis,
         "columns": [asdict(c) for c in decision.columns],
         "reason": {
             "kind": decision.reason.kind,
             "note": decision.reason.note,
             "alternatives": decision.reason.alternatives,
         },
+        "confidence": decision.confidence,
+        "candidates": [
+            {
+                "chart_type": c.chart_type,
+                "confidence": c.confidence,
+                "reason": {
+                    "kind": c.reason.kind,
+                    "note": c.reason.note,
+                    "alternatives": c.reason.alternatives,
+                },
+            }
+            for c in decision.candidates
+        ],
+        "features": asdict(decision.features),
+        "hints": asdict(decision.hints),
         "_stability": "beta",
     }
     if rows is not None:
