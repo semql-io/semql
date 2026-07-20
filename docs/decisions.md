@@ -469,3 +469,23 @@ over `model_json_schema()` and could be retired — but it is the safe
 default to keep regardless, since it costs nothing on a non-recursive
 schema and guards against the next nested-query field reintroducing the
 trap silently. (Landed with the semi-join primitive, 2026-06-15.)
+
+**Update, 2026-07.** `tool_json_schema()` still contains `prefixItems`
+(`TimeWindow.range` / `CompareWindow.range` / `order`'s tuples) and internal
+recursive `$ref`s (`BoolExpr` self-reference; `SemanticQuery` <-> `SemiJoin`
+through `semi_joins[].source`) — both left untouched by design, per the
+decision above. Bedrock Nova's tool-use decoder has since been observed to
+424 on both, not just a root `$ref`. Rather than change `tool_json_schema()`
+(other decoders tolerate this shape fine, and `where`/`semi_joins` are real
+query features some callers need in the schema), `SemanticQuery` gained a
+second, stricter projection: `SemanticQuery.llm_json_schema()` (backed by
+`semql._schema.to_llm_safe_schema`) rewrites every `prefixItems` node into a
+plain `items`-typed array and removes every `$defs` cycle — which, for this
+model, means dropping the `where` and `semi_joins` properties, the only
+paths into the recursive defs. Its companion,
+`SemanticQuery.from_llm_payload(payload)`, builds a canonical
+`SemanticQuery` back from a payload shaped to that schema (plain-list
+`range`/`order`; Pydantic coerces the lists back to tuples). Use
+`tool_json_schema()` by default; reach for `llm_json_schema()` only against
+a decoder known to reject `prefixItems` or recursive refs, and only for
+queries that don't need `where`/`semi_joins`.
