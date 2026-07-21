@@ -1,6 +1,6 @@
 [project]
 name = "semql-mcp"
-version = "0.6.0"
+version = "0.7.0"
 description = "MCP server that wraps a semql Catalog — compile-only by default, opt-in row execution via a caller-provided executor."
 readme = "README.md"
 license = "BSD-3-Clause"
@@ -11,8 +11,8 @@ authors = [
 requires-python = ">=3.12"
 dependencies = [
     "fastmcp>=3.4.2",
-    "semql>=0.6.0,<0.7",
-    "semql-prompt>=0.6.0,<0.7",
+    "semql>=0.7.0,<0.8",
+    "semql-prompt>=0.7.0,<0.8",
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",

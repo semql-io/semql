@@ -1,6 +1,6 @@
 [project]
 name = "semql-auth"
-version = "0.6.0"
+version = "0.7.0"
 description = "Credential→identity adapters for semql: bearer-token verifiers (HMAC, JWKS, introspection) and mappers (dict, mTLS x509) that produce a semql AuthContext."
 readme = "README.md"
 license = "BSD-3-Clause"
@@ -10,7 +10,7 @@ authors = [
 ]
 requires-python = ">=3.12"
 dependencies = [
-    "semql>=0.6.0,<0.7",
+    "semql>=0.7.0,<0.8",
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",

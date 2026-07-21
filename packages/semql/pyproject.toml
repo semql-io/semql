@@ -1,6 +1,6 @@
 [project]
 name = "semql"
-version = "0.6.0"
+version = "0.7.0"
 description = "Semantic data layer: SemanticQuery → backend SQL with authorisation, row-level scoping, time-spine fill, and a typed four-role LLM prompt pipeline."
 readme = "README.md"
 license = "BSD-3-Clause"

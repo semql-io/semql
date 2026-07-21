@@ -5,6 +5,29 @@ packages version in lockstep. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); this file starts at 0.6.0
 (0.5.0 and earlier predate it — see the git history).
 
+## [0.7.0]
+
+### Added
+
+- **Federated `HAVING`.** Post-aggregation filters in the distributive
+  federated compile path, with end-to-end coverage.
+- **`collapse_unrequested_grain` transform.** Top-N grain collapse for
+  dimensions the query didn't request.
+- **`key_cast` in `sql_enricher`.** Enrich against non-text primary-key
+  reference tables by casting the join key.
+- **Nova-safe `SemanticQuery` schema projection.** A projected schema and
+  `llm_json_schema` variant for tool-schema-constrained LLM APIs.
+- **`SemanticQuery`→SQL serializer** and a SQL-path planner prompt.
+
+### Changed
+
+- Visualization decision correctness and output improvements.
+
+### Fixed
+
+- Dependency bumps: `pyjwt[crypto]` `>=2.13.0`, plus the python and actions
+  dependency groups.
+
 ## [0.6.0]
 
 ### Added
