@@ -190,6 +190,16 @@ def test_prompt_hash_unchanged_when_role_gated_cube_added() -> None:
     )
 
 
+def test_dynamic_policy_cubes_are_excluded_from_static_cache_and_hash() -> None:
+    catalog = Catalog([_public_orders()], policy=lambda _cube, _viewer: True)
+    viewer = AuthContext(viewer_id="u")
+    segments = planner_prompt_segments(catalog, viewer=viewer)
+
+    assert "### orders" not in segments.static
+    assert "### orders" in segments.overlay
+    assert prompt_hash(catalog) == prompt_hash(Catalog([]))
+
+
 # ---------------------------------------------------------------------------
 # joined() fallback for non-cached emission
 # ---------------------------------------------------------------------------

@@ -48,10 +48,10 @@ class _SlowAdapter:
         return AdapterResult(columns=[d[0] for d in cur.description], rows=cur.fetchall())
 
 
-def _orders() -> Cube:
+def _orders(dialect: Dialect = Dialect.DUCKDB) -> Cube:
     return Cube(
         name="orders",
-        dialect=Dialect.DUCKDB,
+        dialect=dialect,
         table="orders",
         alias="o",
         primary_key="id",
@@ -66,10 +66,10 @@ def _orders() -> Cube:
     )
 
 
-def _customers() -> Cube:
+def _customers(dialect: Dialect = Dialect.DUCKDB) -> Cube:
     return Cube(
         name="customers",
-        dialect=Dialect.DUCKDB,
+        dialect=dialect,
         table="customers",
         alias="c",
         primary_key="id",
@@ -141,3 +141,192 @@ def test_concurrent_iter_run_streams_are_isolated(con: duckdb.DuckDBPyConnection
 
     for cid, rows in _run(drive()):
         assert sorted(rows) == sorted(_EXPECTED[cid]), f"customer {cid} got {rows}"
+
+
+def test_async_fragment_success_keeps_plan_order_despite_reverse_completion(
+    con: duckdb.DuckDBPyConnection,
+) -> None:
+    plan = compile_federated_query(
+        SemanticQuery(
+            measures=["orders.revenue"],
+            dimensions=["customers.region"],
+        ),
+        {cube.name: cube for cube in (_orders(Dialect.POSTGRES), _customers(Dialect.BIGQUERY))},
+    )
+    assert len(plan.fragments) == 2
+    customers_completed = asyncio.Event()
+    completion: list[str] = []
+
+    class ReverseCompletionAdapter:
+        async def execute(self, sql: str, params: Mapping[str, Any]) -> AdapterResult:
+            source = "orders" if "orders" in sql else "customers"
+            if source == "orders":
+                await asyncio.wait_for(customers_completed.wait(), timeout=1)
+            result = await _SlowAdapter(con, delay=0).execute(sql, params)
+            completion.append(source)
+            if source == "customers":
+                customers_completed.set()
+            return result
+
+    adapter = ReverseCompletionAdapter()
+    engine = AsyncEngine()
+    engine.register(Dialect.POSTGRES, adapter)
+    engine.register(Dialect.BIGQUERY, adapter)
+
+    result = _run(engine.run(plan))
+
+    assert completion == ["customers", "orders"]
+    assert {region: total for region, total in result.rows} == {"EU": 625.0, "US": 50.0}
+
+
+@pytest.mark.parametrize("streaming", [False, True], ids=["run", "nonfast-stream"])
+def test_fragment_failure_cancels_and_drains_sibling(streaming: bool) -> None:
+    plan = compile_federated_query(
+        SemanticQuery(
+            measures=["orders.revenue"],
+            dimensions=["customers.region"],
+        ),
+        {cube.name: cube for cube in (_orders(Dialect.POSTGRES), _customers(Dialect.BIGQUERY))},
+    )
+    assert len(plan.fragments) == 2
+    sibling_started = asyncio.Event()
+    sibling_finalized = asyncio.Event()
+    failure = RuntimeError("fragment failed")
+
+    class CoordinatedAdapter:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def execute(self, sql: str, params: Mapping[str, Any]) -> AdapterResult:
+            self.calls += 1
+            if self.calls == 1:
+                await asyncio.wait_for(sibling_started.wait(), timeout=1)
+                raise failure
+            sibling_started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                sibling_finalized.set()
+            raise AssertionError("blocking sibling unexpectedly completed")
+
+    adapter = CoordinatedAdapter()
+    engine = AsyncEngine()
+    engine.register(Dialect.POSTGRES, adapter)
+    engine.register(Dialect.BIGQUERY, adapter)
+
+    async def drive() -> None:
+        if streaming:
+            with pytest.raises(RuntimeError) as raised:
+                async for _ in engine.iter_run(plan):
+                    pass
+        else:
+            with pytest.raises(RuntimeError) as raised:
+                await engine.run(plan)
+        assert raised.value is failure
+        assert sibling_finalized.is_set()
+
+    _run(drive())
+
+
+@pytest.mark.parametrize("streaming", [False, True], ids=["run", "nonfast-stream"])
+def test_materialization_failure_closes_all_acquired_row_iterators(
+    streaming: bool,
+) -> None:
+    plan = compile_federated_query(
+        SemanticQuery(
+            measures=["orders.revenue"],
+            dimensions=["customers.region"],
+        ),
+        {cube.name: cube for cube in (_orders(Dialect.POSTGRES), _customers(Dialect.BIGQUERY))},
+    )
+    assert len(plan.fragments) == 2
+
+    class CloseableRows:
+        def __init__(self, fails: bool) -> None:
+            self.fails = fails
+            self.closed = False
+
+        def __iter__(self) -> CloseableRows:
+            return self
+
+        def __next__(self) -> tuple[Any, ...]:
+            if self.fails:
+                raise RuntimeError("row iteration failed")
+            raise StopIteration
+
+        def close(self) -> None:
+            self.closed = True
+
+    row_iters = [CloseableRows(fails=index == 0) for index in range(2)]
+
+    class Adapter:
+        def __init__(self, columns: list[str], rows: CloseableRows) -> None:
+            self.columns = columns
+            self.rows = rows
+
+        async def execute(self, sql: str, params: Mapping[str, Any]) -> AdapterResult:
+            return AdapterResult(columns=self.columns, rows=self.rows)
+
+    engine = AsyncEngine()
+    for fragment, rows in zip(plan.fragments, row_iters, strict=True):
+        engine.register(fragment.dialect, Adapter(list(fragment.columns), rows))
+
+    async def drive() -> None:
+        with pytest.raises(RuntimeError, match="row iteration failed"):
+            if streaming:
+                stream = engine.iter_run(plan)
+                await stream.__anext__()
+            else:
+                await engine.run(plan)
+
+    _run(drive())
+    assert [rows.closed for rows in row_iters] == [True, True]
+
+
+@pytest.mark.parametrize("streaming", [False, True], ids=["run", "nonfast-stream"])
+def test_caller_cancellation_drains_fragment_siblings(streaming: bool) -> None:
+    plan = compile_federated_query(
+        SemanticQuery(
+            measures=["orders.revenue"],
+            dimensions=["customers.region"],
+        ),
+        {cube.name: cube for cube in (_orders(Dialect.POSTGRES), _customers(Dialect.BIGQUERY))},
+    )
+    assert len(plan.fragments) == 2
+    both_started = asyncio.Event()
+    finalized: list[int] = []
+
+    class BlockingAdapter:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def execute(self, sql: str, params: Mapping[str, Any]) -> AdapterResult:
+            self.calls += 1
+            if self.calls == 2:
+                both_started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                finalized.append(self.calls)
+            raise AssertionError("cancelled adapter unexpectedly completed")
+
+    engine = AsyncEngine()
+    adapter = BlockingAdapter()
+    engine.register(Dialect.POSTGRES, adapter)
+    engine.register(Dialect.BIGQUERY, adapter)
+
+    async def drive() -> None:
+        async def execute() -> Any:
+            if streaming:
+                async for chunk in engine.iter_run(plan):
+                    return chunk
+            return await engine.run(plan)
+
+        task = asyncio.create_task(execute())
+        await asyncio.wait_for(both_started.wait(), timeout=1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert len(finalized) == 2
+
+    _run(drive())

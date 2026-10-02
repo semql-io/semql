@@ -76,11 +76,16 @@ class _FixedAdapter:
 
     def __init__(self, columns: list[str]) -> None:
         self.columns = columns
+        self.column_types = ["VARCHAR" if column == "status" else "DOUBLE" for column in columns]
         self.calls = 0
 
     def execute(self, sql: str, params: Any) -> AdapterResult:
         self.calls += 1
-        return AdapterResult(columns=list(self.columns), rows=[])
+        return AdapterResult(
+            columns=list(self.columns),
+            rows=[],
+            column_types=self.column_types,
+        )
 
 
 class _FakeClock:
@@ -254,3 +259,109 @@ def test_cache_ttl_must_be_positive() -> None:
         Engine(cache_size=8, cache_ttl=0)
     with pytest.raises(ValueError, match=r"(?i)cache_ttl"):
         Engine(cache_size=8, cache_ttl=-5.0)
+
+
+def test_nested_mutable_cells_are_isolated_across_miss_and_cache_hits() -> None:
+    plan = _plan()
+    nested: dict[str, Any] = {"items": ["original"], "metadata": {"count": 1}}
+
+    class NestedAdapter:
+        def execute(self, sql: str, params: Any) -> AdapterResult:
+            return AdapterResult(columns=list(plan.fragments[0].columns), rows=[(nested, 7)])
+
+    class PassthroughMerge:
+        def merge(self, fragment_results: list[AdapterResult], spec: Any) -> AdapterResult:
+            return AdapterResult(columns=list(plan.columns), rows=list(fragment_results[0].rows))
+
+    engine = Engine(cache_size=4, merge_engine=PassthroughMerge())
+    engine.register(Dialect.POSTGRES, NestedAdapter())
+
+    miss = engine.run(plan)
+    miss.rows[0][0]["items"].append("miss mutation")
+    first_hit = engine.run(plan)
+    first_hit_cell: Any = first_hit.rows[0][0]
+    first_hit_cell["metadata"]["count"] = 99
+    second_hit = engine.run(plan)
+
+    assert second_hit.rows[0] == ({"items": ["original"], "metadata": {"count": 1}}, 7)
+    assert engine.cache_hits == 2
+
+
+def test_uncached_nested_values_are_not_copied() -> None:
+    plan = _plan()
+    nested: dict[str, Any] = {"items": ["source"]}
+
+    class NestedAdapter:
+        def execute(self, sql: str, params: Any) -> AdapterResult:
+            return AdapterResult(columns=list(plan.fragments[0].columns), rows=[(nested, 7)])
+
+    class PassthroughMerge:
+        def merge(self, fragment_results: list[AdapterResult], spec: Any) -> AdapterResult:
+            return AdapterResult(columns=list(plan.columns), rows=list(fragment_results[0].rows))
+
+    engine = Engine(merge_engine=PassthroughMerge())
+    engine.register(Dialect.POSTGRES, NestedAdapter())
+
+    result = engine.run(plan)
+
+    assert result.rows[0][0] is nested
+
+
+def test_nested_set_and_bytearray_cells_are_isolated_across_cache_hits() -> None:
+    plan = _plan()
+    nested: dict[str, Any] = {"members": {1, 2}, "buffer": bytearray(b"abc")}
+
+    class NestedAdapter:
+        def execute(self, sql: str, params: Any) -> AdapterResult:
+            return AdapterResult(columns=list(plan.fragments[0].columns), rows=[(nested, 7)])
+
+    class PassthroughMerge:
+        def merge(self, fragment_results: list[AdapterResult], spec: Any) -> AdapterResult:
+            return AdapterResult(columns=list(plan.columns), rows=list(fragment_results[0].rows))
+
+    engine = Engine(cache_size=4, merge_engine=PassthroughMerge())
+    engine.register(Dialect.POSTGRES, NestedAdapter())
+
+    first = engine.run(plan)
+    first.rows[0][0]["members"].add(3)
+    first.rows[0][0]["buffer"][0] = ord("z")
+    second = engine.run(plan)
+    assert second.rows[0][0] == {"members": {1, 2}, "buffer": bytearray(b"abc")}
+    second.rows[0][0]["members"].remove(1)
+    third = engine.run(plan)
+    assert third.rows[0][0] == {"members": {1, 2}, "buffer": bytearray(b"abc")}
+    assert engine.cache_hits == 2
+
+
+def test_opaque_mutable_cells_are_not_cached() -> None:
+    plan = _plan()
+
+    class OpaqueCell:
+        def __init__(self) -> None:
+            self.values = ["source"]
+
+    opaque = OpaqueCell()
+
+    class OpaqueAdapter:
+        calls = 0
+
+        def execute(self, sql: str, params: Any) -> AdapterResult:
+            self.calls += 1
+            return AdapterResult(columns=list(plan.fragments[0].columns), rows=[(opaque, 7)])
+
+    class PassthroughMerge:
+        def merge(self, fragment_results: list[AdapterResult], spec: Any) -> AdapterResult:
+            return AdapterResult(columns=list(plan.columns), rows=list(fragment_results[0].rows))
+
+    adapter = OpaqueAdapter()
+    engine = Engine(cache_size=4, merge_engine=PassthroughMerge())
+    engine.register(Dialect.POSTGRES, adapter)
+
+    first = engine.run(plan)
+    first.rows[0][0].values.append("mutated")
+    second = engine.run(plan)
+
+    assert second.rows[0][0] is opaque
+    assert second.rows[0][0].values == ["source", "mutated"]
+    assert adapter.calls == 2
+    assert engine.cache_hits == 0

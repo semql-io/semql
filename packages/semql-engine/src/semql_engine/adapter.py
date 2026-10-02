@@ -35,16 +35,57 @@ from typing import Any, Protocol
 
 @dataclass
 class AdapterResult:
-    """A query result as a column list + row iterator.
+    """A query result with positional rows and optional physical types.
 
-    ``rows`` is positional — each row is a tuple/list aligned to
-    ``columns``. The executor zips them into dicts when materialising
-    into DuckDB temp tables. Iterators are fine; the engine consumes
-    each row exactly once.
+    ``column_types`` uses backend type names understood by DuckDB (or
+    ``None`` for columns whose driver exposes no declaration). Adapters
+    must preserve declared precision/scale; absent schema remains distinct
+    from an empty declaration and is handled conservatively by the engine.
+    Rows are consumed once; the engine closes an acquired iterator when it
+    exposes ``close`` and never closes an adapter-owned connection.
     """
 
     columns: list[str]
     rows: Iterable[Sequence[Any]]
+    column_types: Sequence[str | None] | None = None
+
+
+def _dbapi_column_types(description: Sequence[Any]) -> list[str | None]:
+    types: list[str | None] = []
+    for column in description:
+        type_code = column[1] if len(column) > 1 else None
+        type_name = getattr(type_code, "name", None) or getattr(type_code, "__name__", None)
+        if type_name is None and type_code is not None and not isinstance(type_code, int):
+            type_name = str(type_code)
+
+        precision = column[4] if len(column) > 4 else None
+        scale = column[5] if len(column) > 5 else None
+        normalized = str(type_name).upper() if type_name is not None else ""
+        if normalized in {"NUMERIC", "DECIMAL", "NUMBER", "BIGNUMERIC"}:
+            if (
+                isinstance(precision, int)
+                and isinstance(scale, int)
+                and precision > 0
+                and scale >= 0
+            ):
+                types.append(f"DECIMAL({precision},{scale})")
+            else:
+                # Generic numeric declarations omit precision/scale on
+                # several DB-API drivers. Let the engine infer from all
+                # observed Decimal values; never invent a narrower scale.
+                types.append(None)
+            continue
+        if normalized in {"FLOAT", "FLOAT64", "DOUBLE", "FLOAT8"}:
+            types.append("DOUBLE")
+            continue
+        if normalized == "FLOAT32":
+            types.append("FLOAT")
+            continue
+        if type_name is not None:
+            types.append(str(type_name))
+        else:
+            types.append(None)
+    return types
 
 
 class Adapter(Protocol):
@@ -87,10 +128,11 @@ class DBAPIAdapter:
                 cursor.execute(sql)
             description: list[Any] = list(cursor.description or [])
             columns: list[str] = [str(d[0]) for d in description]
+            column_types = _dbapi_column_types(description)
             rows = list(cursor.fetchall())
         finally:
             cursor.close()
-        return AdapterResult(columns=columns, rows=rows)
+        return AdapterResult(columns=columns, rows=rows, column_types=column_types)
 
 
 class DuckDBAdapter:
@@ -113,8 +155,9 @@ class DuckDBAdapter:
         cursor = self._conn.execute(sql, dict(params) if params else None)
         description: list[Any] = list(cursor.description or [])
         columns: list[str] = [str(d[0]) for d in description]
+        column_types = [str(d[1]) if len(d) > 1 and d[1] is not None else None for d in description]
         rows = cursor.fetchall()
-        return AdapterResult(columns=columns, rows=rows)
+        return AdapterResult(columns=columns, rows=rows, column_types=column_types)
 
 
 class AsyncAdapter(Protocol):
@@ -140,9 +183,8 @@ class _SyncAsAsyncAdapter:
         self._inner = inner
 
     async def execute(self, sql: str, params: Mapping[str, Any]) -> AdapterResult:
-        # ``asyncio.to_thread`` releases the event loop so other
-        # fragments registered on the AsyncEngine can run in parallel
-        # even when this adapter is pure-Python sync.
+        # Cancellation stops awaiting this coroutine, but cannot stop a
+        # synchronous operation already running in the worker thread.
         return await asyncio.to_thread(self._inner.execute, sql, params)
 
 
@@ -212,10 +254,11 @@ class AsyncDBAPIAdapter:
                 cursor.execute(sql)
             description: list[Any] = list(cursor.description or [])
             columns: list[str] = [str(d[0]) for d in description]
+            column_types = _dbapi_column_types(description)
             rows = list(cursor.fetchall())
         finally:
             cursor.close()
-        return AdapterResult(columns=columns, rows=rows)
+        return AdapterResult(columns=columns, rows=rows, column_types=column_types)
 
 
 _BQ_TYPE_HINTS: tuple[tuple[str, tuple[type, ...]], ...] = (
@@ -246,6 +289,23 @@ def _bq_array_type_for(value: Any) -> str:  # noqa: ANN401 — duck-typed on BQ 
         return "ARRAY<STRING>"
     element = value[0]
     return f"ARRAY<{_bq_type_for(element)}>"
+
+
+def _bigquery_physical_type(field: object) -> str | None:
+    field_type = getattr(field, "field_type", None)
+    if field_type is None:
+        return None
+    type_name = str(field_type)
+    normalized = type_name.upper()
+    defaults = {"NUMERIC": (38, 9), "BIGNUMERIC": (76, 38)}
+    if normalized not in defaults:
+        return type_name
+    default_precision, default_scale = defaults[normalized]
+    raw_precision = getattr(field, "precision", None)
+    raw_scale = getattr(field, "scale", None)
+    precision = int(raw_precision) if raw_precision is not None else default_precision
+    scale = int(raw_scale) if raw_scale is not None else default_scale
+    return f"DECIMAL({precision},{scale})"
 
 
 class AsyncBigQueryAdapter:
@@ -289,13 +349,22 @@ class AsyncBigQueryAdapter:
         job_config = self._translator(params)
         result = self._client.query(sql, job_config=job_config)
         schema = getattr(result, "schema", None)
-        column_names: list[str] = list(getattr(schema, "names", []) or [])
+        try:
+            fields = list(schema or [])
+        except TypeError:
+            fields = []
+        field_names = [str(field.name) for field in fields if getattr(field, "name", None)]
+        column_names: list[str] = field_names or list(getattr(schema, "names", []) or [])
+        column_types = [_bigquery_physical_type(field) for field in fields]
         if not column_names:
             first = next(iter(result), None)
             if first is not None:
                 column_names = [str(i) for i in range(len(first))]
         rows: list[Sequence[Any]] = [tuple(r) for r in result]
-        return AdapterResult(columns=column_names, rows=rows)
+        physical_types: list[str | None] | None = (
+            column_types if len(column_types) == len(column_names) else None
+        )
+        return AdapterResult(columns=column_names, rows=rows, column_types=physical_types)
 
 
 def _default_bq_translator(params: Mapping[str, Any]) -> Any:  # noqa: ANN401 — BQ types are duck-typed
@@ -323,6 +392,13 @@ def _default_bq_translator(params: Mapping[str, Any]) -> Any:  # noqa: ANN401 �
                 _bq.ScalarQueryParameter(name, _bq_type_for(value), value)
             )
     return job_config
+
+
+def _clickhouse_physical_type(value: object) -> str | None:
+    if isinstance(value, str):
+        return value
+    type_name = getattr(value, "name", None)
+    return str(type_name) if type_name is not None else None
 
 
 class AsyncClickHouseAdapter:
@@ -354,7 +430,14 @@ class AsyncClickHouseAdapter:
         # ``QueryResult.result_rows`` is a list of positional tuples;
         # ``named_results()`` returns dicts which we don't need.
         raw_rows: list[Sequence[Any]] = [tuple(r) for r in getattr(result, "result_rows", []) or []]
-        return AdapterResult(columns=column_names, rows=raw_rows)
+        column_types = [
+            _clickhouse_physical_type(value)
+            for value in (getattr(result, "column_types", None) or [])
+        ]
+        physical_types: list[str | None] | None = (
+            column_types if len(column_types) == len(column_names) else None
+        )
+        return AdapterResult(columns=column_names, rows=raw_rows, column_types=physical_types)
 
 
 __all__ = [

@@ -22,6 +22,10 @@ without depending on the reference impls.
 from __future__ import annotations
 
 import time
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from cryptography.hazmat.primitives.asymmetric.rsa import RSAPrivateKey
 
 import pytest
 from semql.errors import AuthError
@@ -344,82 +348,193 @@ def test_jwks_verifier_refetches_on_cache_miss() -> None:
     assert call_count["n"] == 1
 
 
-def test_jwks_verifier_caches_public_key_across_verifies() -> None:
-    """The public key for a kid is derived once and reused: a second
-    verify of the same kid is served from the key cache without
-    re-consulting the JWKS."""
+def test_jwks_verifier_reuses_fresh_document_across_public_verifies(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import httpx
     import jwt
     from cryptography.hazmat.primitives import serialization
     from cryptography.hazmat.primitives.asymmetric import rsa
 
     private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     private_pem = private_key.private_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PrivateFormat.PKCS8,
-        encryption_algorithm=serialization.NoEncryption(),
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
     )
-    public_numbers = private_key.public_key().public_numbers()
-
-    def _b64uint(n: int) -> str:
-        import base64
-
-        byte_length = (n.bit_length() + 7) // 8
-        return base64.urlsafe_b64encode(n.to_bytes(byte_length, "big")).rstrip(b"=").decode("ascii")
-
     kid = "cache-kid-1"
-    jwks: dict[str, object] = {
-        "keys": [
-            {
-                "kty": "RSA",
-                "kid": kid,
-                "use": "sig",
-                "alg": "RS256",
-                "n": _b64uint(public_numbers.n),
-                "e": _b64uint(public_numbers.e),
-            }
-        ]
-    }
     token = jwt.encode({"sub": "alice"}, private_pem, algorithm="RS256", headers={"kid": kid})
+    jwks: dict[str, object] = {"keys": [_rsa_jwk(private_key, kid)]}
+    fetch_count = {"count": 0}
 
-    fetch_count = {"n": 0}
-
-    def _fetch() -> dict[str, object]:
-        fetch_count["n"] += 1
-        return jwks
-
-    verifier = JWKSVerifier(jwks_url="https://example.invalid/jwks.json")
-    verifier._fetch_jwks = _fetch  # type: ignore[method-assign]
-
-    verifier.verify(token)
-    verifier.verify(token)
-    # First verify derives + caches the key (one fetch); the second is
-    # served from _key_cache and never reaches _fetch_jwks.
-    assert fetch_count["n"] == 1
-    assert kid in verifier._key_cache
-
-
-def test_jwks_verifier_clears_key_cache_on_refetch(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A real JWKS refetch drops every derived public key, so a rotated
-    kid can never be served a stale key (security invariant)."""
-    import httpx
-
-    class _FakeResponse:
+    class Response:
         def raise_for_status(self) -> None:
-            pass
+            return None
 
         def json(self) -> dict[str, object]:
-            return {"keys": []}
+            return jwks
 
-    def _fake_get(*args: object, **kwargs: object) -> _FakeResponse:
-        return _FakeResponse()
+    def get(*args: object, **kwargs: object) -> Response:
+        fetch_count["count"] += 1
+        return Response()
 
-    monkeypatch.setattr(httpx, "get", _fake_get)
+    monkeypatch.setattr(httpx, "get", get)
+    verifier = JWKSVerifier("https://example.invalid/jwks.json")
 
-    # ttl=0 disables the TTL short-circuit, so _fetch_jwks always does a
-    # real fetch — the path that must invalidate the derived-key cache.
-    verifier = JWKSVerifier(jwks_url="https://example.invalid/jwks.json", ttl=0)
-    sentinel = object()
-    verifier._key_cache["stale-kid"] = sentinel
+    assert verifier.verify(token).viewer_id == "alice"
+    assert verifier.verify(token).viewer_id == "alice"
+    assert fetch_count["count"] == 1
 
-    verifier._fetch_jwks()
-    assert verifier._key_cache == {}
+
+def _rsa_jwk(private_key: RSAPrivateKey, kid: str) -> dict[str, str]:
+    import base64
+
+    public_numbers = private_key.public_key().public_numbers()
+
+    def _uint(value: int) -> str:
+        size = (value.bit_length() + 7) // 8
+        return base64.urlsafe_b64encode(value.to_bytes(size, "big")).rstrip(b"=").decode()
+
+    return {
+        "kty": "RSA",
+        "kid": kid,
+        "use": "sig",
+        "alg": "RS256",
+        "n": _uint(public_numbers.n),
+        "e": _uint(public_numbers.e),
+    }
+
+
+def test_jwks_public_verify_respects_document_lifetime_and_rotation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cached parsed key is trusted only while its published document is fresh."""
+    import httpx
+    import jwt
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    old = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    new = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    old_pem = old.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
+    )
+    new_pem = new.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
+    )
+    old_token = jwt.encode({"sub": "alice"}, old_pem, algorithm="RS256", headers={"kid": "shared"})
+    new_token = jwt.encode({"sub": "alice"}, new_pem, algorithm="RS256", headers={"kid": "shared"})
+    active: dict[str, object] = {"keys": [_rsa_jwk(old, "shared")]}
+    fetches = {"count": 0}
+    now = {"value": 100.0}
+
+    class Response:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, object]:
+            return active
+
+    def get(*args: object, **kwargs: object) -> Response:
+        fetches["count"] += 1
+        return Response()
+
+    monkeypatch.setattr(httpx, "get", get)
+    monkeypatch.setattr(time, "monotonic", lambda: now["value"])
+    verifier = JWKSVerifier("https://example.invalid/jwks.json", ttl=10)
+
+    assert verifier.verify(old_token).viewer_id == "alice"
+    assert verifier.verify(old_token).viewer_id == "alice"
+    assert fetches["count"] == 1
+
+    active["keys"] = [_rsa_jwk(new, "shared")]
+    now["value"] = 110.0
+    assert verifier.verify(new_token).viewer_id == "alice"
+    with pytest.raises(AuthError):
+        verifier.verify(old_token)
+    assert fetches["count"] == 2
+
+
+@pytest.mark.parametrize("ttl", [0, 10])
+def test_jwks_public_verify_rejects_removed_key_when_refresh_required(
+    monkeypatch: pytest.MonkeyPatch,
+    ttl: int,
+) -> None:
+    import httpx
+    import jwt
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    pem = key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
+    )
+    token = jwt.encode({"sub": "alice"}, pem, algorithm="RS256", headers={"kid": "gone"})
+    active: dict[str, object] = {"keys": [_rsa_jwk(key, "gone")]}
+    now = {"value": 1.0}
+
+    class Response:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, object]:
+            return active
+
+    def get(*args: object, **kwargs: object) -> Response:
+        return Response()
+
+    monkeypatch.setattr(httpx, "get", get)
+    monkeypatch.setattr(time, "monotonic", lambda: now["value"])
+    verifier = JWKSVerifier("https://example.invalid/jwks.json", ttl=ttl)
+    assert verifier.verify(token).viewer_id == "alice"
+    active["keys"] = []
+    now["value"] = 12.0
+    with pytest.raises(AuthError):
+        verifier.verify(token)
+
+
+def test_jwks_public_verify_fails_closed_when_expired_refresh_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import httpx
+    import jwt
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    pem = key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
+    )
+    token = jwt.encode({"sub": "alice"}, pem, algorithm="RS256", headers={"kid": "current"})
+    now = {"value": 1.0}
+    count = {"value": 0}
+
+    class Response:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, object]:
+            return {"keys": [_rsa_jwk(key, "current")]}
+
+    def get(*args: object, **kwargs: object) -> Response:
+        count["value"] += 1
+        if count["value"] > 1:
+            raise httpx.ConnectError("idp unavailable")
+        return Response()
+
+    monkeypatch.setattr(httpx, "get", get)
+    monkeypatch.setattr(time, "monotonic", lambda: now["value"])
+    verifier = JWKSVerifier("https://example.invalid/jwks.json", ttl=1)
+    assert verifier.verify(token).viewer_id == "alice"
+    now["value"] = 2.0
+    with pytest.raises(AuthError) as exc_info:
+        verifier.verify(token)
+    assert exc_info.value.reason == "jwks_unavailable"

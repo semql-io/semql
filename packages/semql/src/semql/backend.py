@@ -104,6 +104,9 @@ class DialectStrategy(Protocol):
         end: exp.Expression,
         bucket_alias: str,
     ) -> exp.Expression: ...
+    def emit_null_safe_eq(
+        self, left: exp.Expression, right: exp.Expression, value_type: str
+    ) -> exp.Expression: ...
 
 
 # ---------------------------------------------------------------------------
@@ -242,6 +245,14 @@ class _StdSqlDialect:
     def placeholder(self, name: str, dim_type: str) -> exp.Placeholder:
         return placeholder_for(name, dim_type, self.dialect)
 
+    def emit_null_safe_eq(
+        self,
+        left: exp.Expression,
+        right: exp.Expression,
+        value_type: str,  # noqa: ARG002
+    ) -> exp.Expression:
+        return exp.NullSafeEQ(this=left, expression=right)
+
     def trunc(
         self,
         granularity: str,
@@ -302,18 +313,18 @@ class _StdSqlDialect:
         # does not implicitly type these placeholders from context).
         start = exp.Cast(this=start.copy(), to=exp.DataType.build("TIMESTAMP"))
         end = exp.Cast(this=end.copy(), to=exp.DataType.build("TIMESTAMP"))
-        # generate_series(date_trunc(g, start), date_trunc(g, end - 1 step), 1 step)
-        # BigQuery and Snowflake override this with their own table-function shapes.
         step = exp.Interval(
             this=exp.Literal.number(1),
             unit=exp.Var(this=granularity.upper()),
         )
         trunc_start = exp.Anonymous(
-            this="date_trunc", expressions=[exp.Literal.string(granularity), start]
+            this="date_trunc", expressions=[exp.Literal.string(granularity), start.copy()]
         )
-        end_minus_step = exp.Paren(this=exp.Sub(this=end, expression=step.copy()))
+        # Generate through the end bucket, then retain only buckets whose
+        # starts precede the exclusive end. Subtracting one whole interval
+        # loses the end bucket whenever the bound is inside that bucket.
         trunc_end = exp.Anonymous(
-            this="date_trunc", expressions=[exp.Literal.string(granularity), end_minus_step]
+            this="date_trunc", expressions=[exp.Literal.string(granularity), end.copy()]
         )
         series = exp.Anonymous(this="generate_series", expressions=[trunc_start, trunc_end, step])
         if self.dialect == Dialect.DUCKDB:
@@ -328,15 +339,78 @@ class _StdSqlDialect:
                 ),
             )
             bucket = exp.column(bucket_alias, table="generated")
-            return exp.Select().select(bucket, copy=False).from_(series_table, copy=False)
+            return (
+                exp.Select()
+                .select(bucket, copy=False)
+                .from_(series_table, copy=False)
+                .where(exp.LT(this=bucket.copy(), expression=end.copy()), copy=False)
+            )
         inner = exp.Select().select(exp.alias_(series, bucket_alias, copy=False), copy=False)
-        return inner
+        return (
+            exp.Select()
+            .select(exp.column(bucket_alias), copy=False)
+            .from_(
+                exp.Subquery(
+                    this=inner,
+                    alias=exp.TableAlias(this=exp.to_identifier("generated")),
+                ),
+                copy=False,
+            )
+            .where(
+                exp.LT(this=exp.column(bucket_alias), expression=end.copy()),
+                copy=False,
+            )
+        )
 
 
 class PostgresDialect(_StdSqlDialect):
     """Postgres convention. Placeholders render as ``%(name)s``."""
 
     dialect = Dialect.POSTGRES
+
+    def emit_null_safe_eq(
+        self, left: exp.Expression, right: exp.Expression, value_type: str
+    ) -> exp.Expression:
+        """Build hash-joinable null-safe equality for PostgreSQL FULL JOIN.
+
+        PostgreSQL cannot hash-join ``IS NOT DISTINCT FROM`` in a FULL
+        JOIN. Pair a null-status equality with ordinary equality over
+        COALESCEd values. The marker prevents a real sentinel value from
+        matching a NULL key.
+        """
+        sentinels: dict[str, exp.Expression] = {
+            "string": exp.Cast(
+                this=exp.Literal.string(""),
+                to=exp.DataType.build("TEXT"),
+            ),
+            "number": exp.Cast(
+                this=exp.Literal.number(0),
+                to=exp.DataType.build("NUMERIC"),
+            ),
+            "bool": exp.Boolean(this=False),
+            "date": exp.Cast(
+                this=exp.Literal.string("0001-01-01"),
+                to=exp.DataType.build("DATE"),
+            ),
+            "time": exp.Cast(
+                this=exp.Literal.string("0001-01-01 00:00:00"),
+                to=exp.DataType.build("TIMESTAMP"),
+            ),
+            "uuid": exp.Cast(
+                this=exp.Literal.string("00000000-0000-0000-0000-000000000000"),
+                to=exp.DataType.build("UUID"),
+            ),
+        }
+        sentinel = sentinels[value_type]
+        nulls_equal = exp.EQ(
+            this=exp.Paren(this=exp.Is(this=left.copy(), expression=exp.Null())),
+            expression=exp.Paren(this=exp.Is(this=right.copy(), expression=exp.Null())),
+        )
+        values_equal = exp.EQ(
+            this=exp.Anonymous(this="COALESCE", expressions=[left.copy(), sentinel.copy()]),
+            expression=exp.Anonymous(this="COALESCE", expressions=[right.copy(), sentinel.copy()]),
+        )
+        return exp.And(this=nulls_equal, expression=values_equal)
 
 
 class DuckDBDialect(_StdSqlDialect):
@@ -383,9 +457,8 @@ class BigQueryDialect(_StdSqlDialect):
         # into rows, then ``DATE_TRUNC`` each one to the requested grain.
         # DISTINCT collapses duplicate week / month buckets.
         one_day = exp.Interval(this=exp.Literal.number(1), unit=exp.Var(this="DAY"))
-        start_date = exp.Anonymous(this="DATE", expressions=[start])
-        end_minus_one = exp.Paren(this=exp.Sub(this=end, expression=one_day.copy()))
-        end_date = exp.Anonymous(this="DATE", expressions=[end_minus_one])
+        start_date = exp.Anonymous(this="DATE", expressions=[start.copy()])
+        end_date = exp.Anonymous(this="DATE", expressions=[end.copy()])
         series = exp.Anonymous(
             this="GENERATE_DATE_ARRAY",
             expressions=[start_date, end_date, one_day.copy()],
@@ -402,7 +475,13 @@ class BigQueryDialect(_StdSqlDialect):
             alias=exp.TableAlias(this=exp.to_identifier("d")),
         )
         inner = inner.from_(unnest)
-        return inner
+        return inner.where(
+            exp.LT(
+                this=exp.Cast(this=trunc_node.copy(), to=exp.DataType.build("TIMESTAMP")),
+                expression=exp.Cast(this=end.copy(), to=exp.DataType.build("TIMESTAMP")),
+            ),
+            copy=False,
+        )
 
 
 class SnowflakeDialect(_StdSqlDialect):
@@ -434,13 +513,16 @@ class SnowflakeDialect(_StdSqlDialect):
             this="DATE_TRUNC",
             expressions=[exp.Literal.string(granularity), add_days],
         )
-        day_diff = exp.Anonymous(
-            this="DATEDIFF",
-            expressions=[
-                exp.Literal.string("day"),
-                exp.Anonymous(this="TO_DATE", expressions=[start.copy()]),
-                exp.Anonymous(this="TO_DATE", expressions=[end]),
-            ],
+        day_diff = exp.Add(
+            this=exp.Anonymous(
+                this="DATEDIFF",
+                expressions=[
+                    exp.Literal.string("day"),
+                    exp.Anonymous(this="TO_DATE", expressions=[start.copy()]),
+                    exp.Anonymous(this="TO_DATE", expressions=[end.copy()]),
+                ],
+            ),
+            expression=exp.Literal.number(1),
         )
         generator = exp.Anonymous(
             this="GENERATOR",
@@ -456,7 +538,21 @@ class SnowflakeDialect(_StdSqlDialect):
             exp.alias_(bucket, bucket_alias, copy=False), copy=False
         )
         inner = inner.from_(table_func, copy=False)
-        return inner
+        return (
+            exp.Select()
+            .select(exp.column(bucket_alias), copy=False)
+            .from_(
+                exp.Subquery(
+                    this=inner,
+                    alias=exp.TableAlias(this=exp.to_identifier("generated")),
+                ),
+                copy=False,
+            )
+            .where(
+                exp.LT(this=exp.column(bucket_alias), expression=end.copy()),
+                copy=False,
+            )
+        )
 
 
 class _TranspilingSqlDialect(_StdSqlDialect):
@@ -666,18 +762,29 @@ class ClickHouseDialect:
             ],
         )
         bucket = exp.Anonymous(this=trunc_name, expressions=[add_days])
-        day_diff = exp.Anonymous(
-            this="dateDiff",
-            expressions=[
-                exp.Literal.string("day"),
-                exp.Anonymous(this="toDate", expressions=[start.copy()]),
-                exp.Anonymous(this="toDate", expressions=[end.copy()]),
-            ],
+        day_diff = exp.Add(
+            this=exp.Anonymous(
+                this="dateDiff",
+                expressions=[
+                    exp.Literal.string("day"),
+                    exp.Anonymous(this="toDate", expressions=[start.copy()]),
+                    exp.Anonymous(this="toDate", expressions=[end.copy()]),
+                ],
+            ),
+            expression=exp.Literal.number(1),
         )
         inner = exp.Select(distinct=exp.Distinct())
         inner = inner.select(exp.alias_(bucket, bucket_alias, copy=False), copy=False)
         inner = inner.from_(exp.Anonymous(this="numbers", expressions=[day_diff]), copy=False)
-        return inner
+        return inner.where(exp.LT(this=bucket.copy(), expression=end.copy()), copy=False)
+
+    def emit_null_safe_eq(
+        self,
+        left: exp.Expression,
+        right: exp.Expression,
+        value_type: str,  # noqa: ARG002
+    ) -> exp.Expression:
+        return exp.NullSafeEQ(this=left, expression=right)
 
 
 class MetaDialect:
@@ -748,6 +855,14 @@ class MetaDialect:
         bucket_alias: str,  # noqa: ARG002
     ) -> exp.Expression:
         raise NotImplementedError("Time spine emission is not applicable to META reflection cubes.")
+
+    def emit_null_safe_eq(
+        self,
+        left: exp.Expression,
+        right: exp.Expression,
+        value_type: str,  # noqa: ARG002
+    ) -> exp.Expression:
+        return exp.NullSafeEQ(this=left, expression=right)
 
 
 # ---------------------------------------------------------------------------

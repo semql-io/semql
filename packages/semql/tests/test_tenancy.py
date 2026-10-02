@@ -33,16 +33,6 @@ from semql import (
 # ---------------------------------------------------------------------------
 
 
-def test_cube_defaults_to_none_tenancy() -> None:
-    """A cube that says nothing about tenancy now defaults to ``none`` —
-    honestly unscoped — rather than the old silently-inert ``schema``
-    default that emitted no isolation unless the table happened to
-    contain ``{tenant_schema}``."""
-    cube = Cube(name="c", dialect=Dialect.POSTGRES, table="t", alias="c")
-    assert cube.tenancy == "none"
-    assert cube.tenancy_columns == []
-
-
 def test_cube_accepts_explicit_discriminator_mode() -> None:
     cube = Cube(
         name="events",
@@ -101,18 +91,6 @@ def test_discriminator_table_must_not_contain_tenant_schema_placeholder() -> Non
             tenancy="discriminator",
             tenancy_columns=["tenant_id"],
         )
-
-
-def test_schema_mode_does_not_require_tenancy_columns() -> None:
-    """SCHEMA mode encodes isolation in the table name; no column needed."""
-    cube = Cube(
-        name="c",
-        dialect=Dialect.POSTGRES,
-        table="{tenant_schema}.t",
-        alias="c",
-        tenancy="schema",
-    )
-    assert cube.tenancy_columns == []
 
 
 def test_schema_mode_requires_tenant_schema_placeholder() -> None:

@@ -7,6 +7,34 @@ packages version in lockstep. Format loosely follows
 
 ## [Unreleased]
 
+### Fixed
+
+- JWKS document expiry now invalidates parsed signing keys too, including
+  caching-disabled verification, key removal/replacement, and refresh failures.
+- Prompt and provider-tool discovery honor dynamic catalog policies. Reusable
+  descriptions exclude viewer-specific fields and policy-dependent cubes even
+  when first rendered without a viewer; authorized overlays take precedence.
+- Structural prompt-budget trimming preserves protected cube fields.
+- Dense time fill retains the final intersecting bucket and complete derived
+  projections, aliases, and schema. Comparison joins preserve NULL group
+  identity, and completed-output filters execute before final ordering/limits.
+- Catalog reconstruction retains runtime overrides; wire round-trips preserve
+  entity write declarations and mutation/list admission limits.
+- Frozen catalog/identity collections now prevent nested mutation and input
+  aliasing. Validated copies retain value semantics; unsupported mutable value
+  graphs are deliberately unhashable rather than producing unstable keys.
+- Engine adapters carry physical column schema through numeric merges,
+  including decimal precision/scale and empty/all-NULL fragments. Ambiguous or
+  unsupported schemas fail explicitly instead of silently becoming text.
+- Async fragment failures cancel and drain sibling work; acquired adapter row
+  iterators close on exhaustion, errors, and explicit early stream closure.
+- Cached mutable cells are isolated on insertion and retrieval; unsupported
+  opaque values are not cached, without adding cache-only copies to uncached runs.
+
+See [the migration guide](docs/migrations/core-library-defect-repairs.md) for
+immutable collection APIs, catalog spec schema 2, backend strategies, and adapter
+schema/resource ownership contracts.
+
 ## [0.9.0] - 2026-10-02
 
 ### Added

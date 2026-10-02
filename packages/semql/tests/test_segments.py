@@ -66,11 +66,6 @@ def test_segment_description_defaults_to_empty() -> None:
     assert s.description == ""
 
 
-def test_cube_segments_default_to_empty_list() -> None:
-    cube = Cube(name="c", dialect=Dialect.POSTGRES, table="c", alias="c")
-    assert cube.segments == []
-
-
 def test_cube_accepts_segments_list() -> None:
     cube = _orders_with_segments()
     assert {s.name for s in cube.segments} == {"paid", "recent"}

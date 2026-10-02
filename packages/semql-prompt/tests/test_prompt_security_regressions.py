@@ -25,6 +25,7 @@ from semql_prompt import (
     build_router_prompt_fragment,
     planner_prompt,
     planner_prompt_segments,
+    render_catalog_block,
     render_tool_description,
     to_openai_tools,
 )
@@ -76,6 +77,124 @@ def test_static_segment_omits_protected_field_of_public_cube() -> None:
     assert "orders.margin" not in low.static
     assert "orders.margin" not in low.overlay
     assert anon.static == finance.static == low.static
+
+
+def test_dynamic_policy_is_authoritative_for_direct_and_segmented_planners() -> None:
+    cube = _public_cube_with_protected_field()
+    cat = Catalog([cube], policy=lambda _cube, _viewer: False)
+    guest = AuthContext(viewer_id="guest")
+
+    direct = render_catalog_block(
+        cat.as_dict(),
+        viewer=guest,
+        policy=cat.policy,
+    )
+    segmented = planner_prompt_segments(cat, viewer=guest)
+    combined = planner_prompt(cat, viewer=guest)
+
+    assert "orders" not in direct
+    assert "orders" not in segmented.static
+    assert "orders" not in segmented.overlay
+    assert "orders" not in combined
+
+
+def test_viewer_dependent_policy_uses_only_authorized_planner_overlay() -> None:
+    cube = _public_cube_with_protected_field()
+    cat = Catalog(
+        [cube],
+        policy=lambda _cube, viewer: viewer.viewer_id == "admin",
+    )
+    admin = AuthContext(viewer_id="admin")
+    guest = AuthContext(viewer_id="guest")
+
+    admin_segments = planner_prompt_segments(cat, viewer=admin)
+    guest_segments = planner_prompt_segments(cat, viewer=guest)
+    admin_direct = planner_prompt(cat, viewer=admin)
+    guest_direct = planner_prompt(cat, viewer=guest)
+
+    assert "orders" not in admin_segments.static
+    assert "orders.revenue" in admin_segments.overlay
+    assert "orders" not in guest_segments.static
+    assert "orders" not in guest_segments.overlay
+    assert "orders.revenue" in admin_direct
+    assert "orders" not in guest_direct
+
+
+def test_policy_dependent_planner_cache_is_invariant_with_no_viewer_discovery() -> None:
+    cat = Catalog(
+        [_public_cube_with_protected_field()],
+        policy=lambda _cube, viewer: viewer.viewer_id == "admin",
+    )
+    no_viewer = planner_prompt_segments(cat)
+    admin = planner_prompt_segments(
+        cat,
+        viewer=AuthContext(viewer_id="admin", roles=["finance"]),
+    )
+    guest = planner_prompt_segments(cat, viewer=AuthContext(viewer_id="guest"))
+
+    assert no_viewer.static == admin.static == guest.static
+    assert "orders" not in no_viewer.static
+    assert "orders.revenue" in no_viewer.overlay
+    assert "orders.margin" in no_viewer.overlay
+    assert "orders.revenue" in admin.overlay
+    assert "orders.margin" in admin.overlay
+    assert "orders" not in guest.overlay
+    assert "orders.revenue" in no_viewer.joined()
+    assert "orders.margin" in no_viewer.joined()
+
+
+def test_no_viewer_mode_preserves_unfiltered_catalog_discovery() -> None:
+    cat = Catalog(
+        [_public_cube_with_protected_field()],
+        policy=lambda _cube, _viewer: False,
+    )
+
+    assert "orders.revenue" in planner_prompt(cat)
+    assert [tool["function"]["name"] for tool in to_openai_tools(cat)] == ["query_orders"]
+
+
+def test_dynamic_policy_filters_openai_and_bedrock_tool_exports() -> None:
+    guest = AuthContext(viewer_id="guest")
+    denied = Catalog(
+        [_public_cube_with_protected_field()],
+        policy=lambda _cube, _viewer: False,
+    )
+    assert to_openai_tools(denied, viewer=guest) == []
+    assert to_bedrock_converse_tools(denied, viewer=guest) == []
+
+    viewer_dependent = Catalog(
+        [_public_cube_with_protected_field()],
+        policy=lambda _cube, viewer: viewer.viewer_id == "admin",
+    )
+    admin = AuthContext(viewer_id="admin")
+    openai_admin = to_openai_tools(viewer_dependent, viewer=admin)
+    bedrock_admin = to_bedrock_converse_tools(viewer_dependent, viewer=admin)
+    assert [tool["function"]["name"] for tool in openai_admin] == ["query_orders"]
+    assert [tool["toolSpec"]["name"] for tool in bedrock_admin] == ["query_orders"]
+    assert to_openai_tools(viewer_dependent, viewer=guest) == []
+    assert to_bedrock_converse_tools(viewer_dependent, viewer=guest) == []
+
+
+def test_dynamic_policy_filters_langchain_tool_exports() -> None:
+    pytest.importorskip("langchain_core")
+    from semql_prompt import to_langchain_tools
+
+    denied = Catalog(
+        [_public_cube_with_protected_field()],
+        policy=lambda _cube, _viewer: False,
+    )
+    viewer_dependent = Catalog(
+        [_public_cube_with_protected_field()],
+        policy=lambda _cube, viewer: viewer.viewer_id == "admin",
+    )
+    guest = AuthContext(viewer_id="guest")
+    admin = AuthContext(viewer_id="admin")
+
+    assert to_langchain_tools(denied, viewer=guest) == []
+    assert [
+        getattr(tool, "name", None) for tool in to_langchain_tools(viewer_dependent, viewer=admin)
+    ] == ["query_orders"]
+    assert to_langchain_tools(viewer_dependent, viewer=guest) == []
 
 
 # ---------------------------------------------------------------------------

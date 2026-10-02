@@ -40,10 +40,11 @@ from __future__ import annotations
 
 import functools
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from dataclasses import field as dc_field
 from dataclasses import replace as _dc_replace
+from itertools import chain
 from typing import Any, Literal
 
 import sqlglot
@@ -1222,7 +1223,7 @@ def _check_field_visibility(
     if viewer is None:
         return
 
-    def _sees(field_required: list[str]) -> bool:
+    def _sees(field_required: Sequence[str]) -> bool:
         if not field_required:
             return True
         return any(r in viewer.roles for r in field_required)
@@ -1276,10 +1277,11 @@ def _check_field_visibility(
             continue
         if not _sees(field.required_roles):
             # Indistinguishable from "field doesn't exist".
-            hint = _closest_match(
-                field_name, [f.name for f in cube.measures + cube.dimensions + cube.time_dimensions]
+            candidates = chain(cube.measures, cube.dimensions, cube.time_dimensions)
+            hint = _closest_match(field_name, (field.name for field in candidates))
+            known = sorted(
+                field.name for field in chain(cube.measures, cube.dimensions, cube.time_dimensions)
             )
-            known = sorted(f.name for f in cube.measures + cube.dimensions + cube.time_dimensions)
             suffix = f" Did you mean {hint!r}?" if hint else ""
             raise UnknownIdentifierError(
                 f"Unknown field {field_name!r} on cube {cube_name!r}. "
@@ -1321,17 +1323,17 @@ def _find_field(
     return None
 
 
-def _closest_match(name: str, candidates: list[str]) -> str | None:
+def _closest_match(name: str, candidates: Iterable[str]) -> str | None:
     """Tiny typo-tolerance for the field-hide gate (no info leak — we
     only suggest names from the visible set)."""
-    if not candidates:
-        return None
+    first: str | None = None
     name_lower = name.lower()
-    # Prefix match first (the most common case).
-    for c in candidates:
-        if c.lower().startswith(name_lower[:3]):
-            return c
-    return candidates[0]
+    for candidate in candidates:
+        if first is None:
+            first = candidate
+        if candidate.lower().startswith(name_lower[:3]):
+            return candidate
+    return first
 
 
 def _check_lifecycle(touched: list[Cube]) -> None:
@@ -2559,21 +2561,9 @@ def _resolve_compare_outer_ref(
     measure_col_names: list[str],
     *,
     what: str,
+    measure_aliases: dict[str, str] | None = None,
 ) -> str:
-    """Translate a compare-mode ``order`` / ``having`` reference into an
-    actual outer-SELECT column name.
-
-    Accepts two shapes:
-    - The raw underscore alias (``revenue_delta``) — must be in
-      ``outer_columns``.
-    - The synthetic ``compare.<measure>.<facet>`` form — rewritten to
-      ``<measure>_<facet>`` after validating ``<measure>`` is a measure
-      in the query and ``<facet>`` is one of the four supported
-      derivatives.
-
-    Raises ``CompileError`` for any other shape so callers don't
-    accidentally smuggle a raw inner-CTE column ref through to the
-    outer SELECT."""
+    """Resolve canonical or aliased compare output references."""
     if ref in outer_columns:
         return ref
     if ref.startswith("compare.") and ref.count(".") == 2:
@@ -2583,13 +2573,14 @@ def _resolve_compare_outer_ref(
                 f"{what} {ref!r}: unknown compare facet {facet!r}. "
                 f"Supported: {', '.join(_COMPARE_FACETS)}."
             )
-        if measure_name not in measure_col_names:
+        aliases = measure_aliases or {}
+        if measure_name not in measure_col_names and measure_name not in aliases.values():
             raise CompileError(
                 f"{what} {ref!r}: measure {measure_name!r} is not in this "
                 f"query's measures. Add it to ``measures`` or pick from "
                 f"{measure_col_names}."
             )
-        return f"{measure_name}_{facet}"
+        return f"{aliases.get(measure_name, measure_name)}_{facet}"
     raise CompileError(
         f"{what} {ref!r}: in compare mode, references must be an outer "
         f"output column (e.g. {measure_col_names[0]}_delta) or the "
@@ -2665,13 +2656,17 @@ def _emit_compare_query(env: _CompileEnv) -> CompiledQuery:
         )
         outer_columns.append(time_col_name)
 
+    measure_aliases = {
+        col_name: env.alias_map.get(col_name, col_name) for col_name in measure_col_names
+    }
     for col_name in measure_col_names:
+        output_name = measure_aliases[col_name]
         cur_ref = exp.column(col_name, table="current")
         pri_ref = exp.column(col_name, table="prior")
-        cur_col = f"{col_name}_current"
-        pri_col = f"{col_name}_prior"
-        delta_col = f"{col_name}_delta"
-        pct_col = f"{col_name}_pct_change"
+        cur_col = f"{output_name}_current"
+        pri_col = f"{output_name}_prior"
+        delta_col = f"{output_name}_delta"
+        pct_col = f"{output_name}_pct_change"
 
         outer = outer.select(exp.alias_(cur_ref.copy(), cur_col, copy=False), copy=False)
         outer = outer.select(exp.alias_(pri_ref.copy(), pri_col, copy=False), copy=False)
@@ -2724,11 +2719,18 @@ def _emit_compare_query(env: _CompileEnv) -> CompiledQuery:
     outer = outer.from_(exp.to_table("current"), copy=False)
     join_dims = dim_col_names + ([time_col_name] if time_col_name else [])
     if join_dims:
+        value_types = {
+            col_name: dimension.type
+            for (_cube, dimension), col_name in zip(env.dim_fields, dim_col_names, strict=True)
+        }
+        if time_col_name is not None and env.time_dim is not None:
+            value_types[time_col_name] = env.time_dim.type
         on_expr: exp.Expression | None = None
         for jd in join_dims:
-            eq = exp.EQ(
-                this=exp.column(jd, table="current"),
-                expression=exp.column(jd, table="prior"),
+            eq = env.strategy.emit_null_safe_eq(
+                exp.column(jd, table="current"),
+                exp.column(jd, table="prior"),
+                value_types[jd],
             )
             on_expr = eq if on_expr is None else exp.And(this=on_expr, expression=eq)
         outer = outer.join(exp.to_table("prior"), on=on_expr, join_type="full outer", copy=False)
@@ -2741,36 +2743,67 @@ def _emit_compare_query(env: _CompileEnv) -> CompiledQuery:
             copy=False,
         )
 
-    for ref, direction in env.plan.order.keys:
-        col = _resolve_compare_outer_ref(ref, outer_columns, measure_col_names, what="ORDER BY")
-        outer = outer.order_by(
-            exp.Ordered(this=exp.column(col), desc=(direction == "desc")), copy=False
+    # Apply predicates against the completed comparison output relation;
+    # HAVING has no aggregate/grouping stage in this outer query.
+    compared = outer
+    outer = (
+        exp.Select()
+        .select("*", copy=False)
+        .from_(
+            exp.Subquery(
+                this=compared,
+                alias=exp.TableAlias(this=exp.to_identifier("compared")),
+            ),
+            copy=False,
         )
-
-    # HAVING — compare mode supports it against any outer column,
-    # including the synthetic ``compare.<measure>.delta`` form. Most
-    # dialects accept ``HAVING`` without ``GROUP BY`` as a top-level
-    # row filter; the FULL OUTER JOIN's COALESCE'd-dim row identity
-    # makes that exactly the right shape.
+    )
     for hf in q.having:
         col = _resolve_compare_outer_ref(
-            hf.dimension, outer_columns, measure_col_names, what="HAVING"
+            hf.dimension,
+            outer_columns,
+            measure_col_names,
+            what="HAVING",
+            measure_aliases=measure_aliases,
         )
-        outer = outer.having(
-            _filter_node(hf, exp.column(col), "number", env.strategy, env.bind), copy=False
+        outer = outer.where(
+            _filter_node(hf, exp.column(col, table="compared"), "number", env.strategy, env.bind),
+            copy=False,
         )
 
+    for ref, direction in env.plan.order.keys:
+        col = _resolve_compare_outer_ref(
+            ref,
+            outer_columns,
+            measure_col_names,
+            what="ORDER BY",
+            measure_aliases=measure_aliases,
+        )
+        outer = outer.order_by(
+            exp.Ordered(this=exp.column(col, table="compared"), desc=(direction == "desc")),
+            copy=False,
+        )
     if env.plan.limit.limit is not None:
         outer = outer.limit(int(env.plan.limit.limit), copy=False)
     if env.plan.limit.offset is not None and env.plan.limit.offset > 0:
         outer = outer.offset(int(env.plan.limit.offset), copy=False)
-
     outer = _apply_with_clause(
         outer, _collect_hoisted_ctes(env.touched, env.resolve_in_ctx), env.dialect
     )
     sql = outer.sql(dialect=env.sqlglot_dialect, pretty=False, normalize_functions=False)
+
+    canonical_output_columns = [
+        next(
+            (
+                f"{canonical}{name[len(alias) :]}"
+                for canonical, alias in measure_aliases.items()
+                if name.startswith(f"{alias}_")
+            ),
+            name,
+        )
+        for name in outer_columns
+    ]
     cm = _build_column_meta(
-        outer_columns,
+        canonical_output_columns,
         env.dim_fields,
         dim_col_names,
         env.measure_fields,
@@ -2780,6 +2813,8 @@ def _emit_compare_query(env: _CompileEnv) -> CompiledQuery:
         is_compare=True,
     )
     cm = _apply_mask_metadata(cm, env)
+    for meta, output_name in zip(cm, outer_columns, strict=True):
+        meta.name = output_name
     return CompiledQuery(
         dialect=env.dialect,
         sql=sql,
@@ -3111,18 +3146,30 @@ def _emit_simple_query(env: _CompileEnv) -> CompiledQuery:
         outer = outer.with_("spine", spine_inner, copy=False)
         outer = outer.select(exp.column(time_col_name, table="spine"), copy=False)
         for col_name in measure_col_names:
+            output_name = env.alias_map.get(col_name, col_name)
             outer = outer.select(
                 exp.alias_(
                     exp.Anonymous(
                         this="COALESCE",
                         expressions=[
-                            exp.column(col_name, table="agg"),
+                            exp.column(output_name, table="agg"),
                             exp.Literal.number(fill_value),
                         ],
                     ),
-                    col_name,
+                    output_name,
                     copy=False,
                 ),
+                copy=False,
+            )
+        for derived in q.derived_measures:
+            derived_value: exp.Expression = exp.column(derived.name, table="agg")
+            if derived.op != "ratio":
+                derived_value = exp.Anonymous(
+                    this="COALESCE",
+                    expressions=[derived_value, exp.Literal.number(fill_value)],
+                )
+            outer = outer.select(
+                exp.alias_(derived_value, derived.name, copy=False),
                 copy=False,
             )
         outer = outer.from_(exp.to_table("spine"), copy=False)
@@ -3201,8 +3248,12 @@ def _emit_simple_query(env: _CompileEnv) -> CompiledQuery:
         env.dialect,
     )
     sql = select_node.sql(dialect=env.sqlglot_dialect, pretty=False, normalize_functions=False)
+    canonical_columns = [
+        next((source for source, alias in env.alias_map.items() if alias == name), name)
+        for name in columns
+    ]
     cm = _build_column_meta(
-        columns,
+        canonical_columns,
         env.dim_fields,
         dim_col_names,
         env.measure_fields,
@@ -3212,6 +3263,8 @@ def _emit_simple_query(env: _CompileEnv) -> CompiledQuery:
         is_compare=False,
     )
     cm = _apply_mask_metadata(cm, env)
+    for meta, output_name in zip(cm, columns, strict=True):
+        meta.name = output_name
     return CompiledQuery(
         dialect=env.dialect,
         sql=sql,

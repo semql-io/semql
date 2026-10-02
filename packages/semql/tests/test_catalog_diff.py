@@ -84,8 +84,10 @@ def test_diff_measure_added_is_additive() -> None:
     old = _orders()
     new_cube = old.model_copy(
         update={
-            "measures": old.measures
-            + [Measure(name="avg_amount", sql="{o}.amount", agg="avg", unit="currency")],
+            "measures": [
+                *old.measures,
+                Measure(name="avg_amount", sql="{o}.amount", agg="avg", unit="currency"),
+            ],
         }
     )
     diff = diff_catalogs({"orders": old}, {"orders": new_cube})
@@ -154,8 +156,10 @@ def test_diff_join_added_is_additive() -> None:
     old = _orders()
     new_cube = old.model_copy(
         update={
-            "joins": old.joins
-            + [Join(to="products", relationship="many_to_one", on="{o}.product_id = {p}.id")],
+            "joins": [
+                *old.joins,
+                Join(to="products", relationship="many_to_one", on="{o}.product_id = {p}.id"),
+            ],
         }
     )
     diff = diff_catalogs({"orders": old}, {"orders": new_cube})
@@ -237,8 +241,10 @@ def test_diff_breaking_changes_appear_before_additive_in_markdown() -> None:
     new_cube = old.model_copy(
         update={
             "measures": [old.measures[0]],  # removed 'count' (breaking)
-            "dimensions": old.dimensions
-            + [Dimension(name="amount", sql="{o}.amount", type="number")],  # additive
+            "dimensions": [
+                *old.dimensions,
+                Dimension(name="amount", sql="{o}.amount", type="number"),
+            ],  # additive
         }
     )
     diff = diff_catalogs({"orders": old}, {"orders": new_cube})

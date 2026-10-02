@@ -175,6 +175,8 @@ attachments cannot overwrite an existing output.
   the inner query in `current` / `prior` CTEs joined via `FULL OUTER
   JOIN` and emits `{m}_current` / `{m}_prior` / `{m}_delta` /
   `{m}_pct_change` columns per measure.
+  Nullable grouping keys identify the same group in both periods; result
+  filters apply after the comparison projection, before final order/limit.
 - **Temporal model** — time dimensions group by `second` / `minute` /
   `hour` / `day` / `week` / `month` / `quarter` / `year`; a
   `type="date"` time dimension drops sub-day grain and timezone shifts;
@@ -183,6 +185,10 @@ attachments cannot overwrite an existing output.
   ZONE`, `CONVERT_TIMEZONE`, ClickHouse's native arg, …); per-cube
   `week_start` (`monday` default, or `sunday`) sets the `week` bucket
   boundary consistently across dialects.
+  Dense fill retains every bucket intersecting the half-open time range,
+  including an unaligned final bucket. Inline-derived output names, aliases,
+  and order match the compiled schema; missing ratio values remain NULL
+  rather than inventing a division result.
 - **Explicit raw SQL** — every hand-written fragment (`Measure.sql`,
   `Join.on`, `Cube.base_predicate`, …) is wrapped in a `RawSQL` marker
   at validation: when raw SQL is used, the model says so.
@@ -201,6 +207,24 @@ attachments cannot overwrite an existing output.
   `semql-mcp` wraps it as a server.
 - **Pluggable backends** — `DialectStrategy` Protocol lets out-of-tree
   Snowflake / BigQuery adapters slot in without forking the compiler.
+  Implement `emit_null_safe_eq(left, right, value_type)` for comparison
+  grouping identity using a predicate valid in the backend's full join.
+  PostgreSQL requires hash/merge-joinable typed equality plus a NULL marker;
+  `IS NOT DISTINCT FROM` alone is not executable in that full-join shape.
+
+## Value and wire contracts
+
+Catalog value collections expose immutable `Sequence`/`Mapping` interfaces.
+List/dict construction and JSON arrays/objects remain supported; change values
+with validated `model_copy(update=...)`, not nested mutation. Hashing rejects
+unsupported mutable value graphs instead of producing unstable dictionary keys.
+
+Catalog spec schema 2 preserves operational limits and explicit read-only versus
+mutable entity declarations. Supplied runtime behavior survives `from_spec`;
+`None` falls back to keyword values while explicit empty registries/hooks win.
+
+See [the defect-repair migration](../../docs/migrations/core-library-defect-repairs.md)
+for wire upgrades, custom backend strategies, and adapter ownership/schema changes.
 
 ## Philosophy
 

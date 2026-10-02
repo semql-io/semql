@@ -173,6 +173,7 @@ def prompt_hash(
         ctx=ctx,
         glossary=catalog.glossary,
         relations=catalog.relations,
+        policy=catalog.policy,
     )
 
 

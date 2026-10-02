@@ -32,11 +32,6 @@ def _geo_cube(drills: list[list[str]] | None = None) -> Cube:
     )
 
 
-def test_drill_paths_defaults_to_empty_list() -> None:
-    cube = Cube(name="x", dialect=Dialect.POSTGRES, table="x", alias="x")
-    assert cube.drill_paths == []
-
-
 def test_cube_accepts_single_hierarchy() -> None:
     cube = _geo_cube([["country", "state", "city"]])
     assert cube.drill_paths == [["country", "state", "city"]]

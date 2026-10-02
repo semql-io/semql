@@ -340,24 +340,13 @@ class JWKSVerifier:
         return new_jwks
 
     def _public_key_for(self, kid: str) -> object:
-        """Return the parsed public key for ``kid``, deriving it at most
-        once per JWKS document.
-
-        On a cache miss the JWKS is consulted; if the kid still isn't
-        present the document is refetched once (key rotations land
-        between TTL windows) before giving up. The derived key is then
-        memoised until the next refetch clears the cache."""
+        """Return a parsed public key from the currently valid JWKS document."""
         import jwt
-
-        cached_key = self._key_cache.get(kid)
-        if cached_key is not None:
-            return cached_key
 
         jwks = self._fetch_jwks()
         key = next((k for k in jwks.get("keys", []) if k.get("kid") == kid), None)
         if key is None:
-            # Cache miss — refetch once before giving up. Key rotations
-            # land between TTL windows; this handles the common case.
+            # A newly published key may appear between TTL refreshes.
             self._cached_jwks = None
             jwks = self._fetch_jwks()
             key = next((k for k in jwks.get("keys", []) if k.get("kid") == kid), None)
@@ -367,15 +356,16 @@ class JWKSVerifier:
                     reason="unknown_kid",
                 )
 
-        # PyJWT accepts a JWK dict directly via from_jwk, but we have
-        # the key in raw form; serialise to a PEM-like public key.
-        public_key: Any = jwt.algorithms.RSAAlgorithm.from_jwk(  # type: ignore[attr-defined]
-            json.dumps(key)
-        )
+        cached_key = self._key_cache.get(kid)
+        if cached_key is not None:
+            return cached_key
+
+        public_key: Any = jwt.algorithms.RSAAlgorithm.from_jwk(json.dumps(key))  # type: ignore[attr-defined]
         self._key_cache[kid] = public_key
         return public_key
 
     def verify(self, token: str) -> AuthContext:
+        import httpx
         import jwt
 
         try:
@@ -388,7 +378,10 @@ class JWKSVerifier:
                 "Token header is missing 'kid' (key id).",
                 reason="missing_kid",
             )
-        public_key = self._public_key_for(kid)
+        try:
+            public_key = self._public_key_for(kid)
+        except httpx.HTTPError as exc:
+            raise AuthError("JWKS provider is unavailable.", reason="jwks_unavailable") from exc
 
         decode_kwargs: dict[str, Any] = {
             "key": public_key,

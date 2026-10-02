@@ -203,31 +203,16 @@ def test_catalog_to_openai_tools_all_have_type_function() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_to_langchain_tools_importable() -> None:
-    from semql_prompt import to_langchain_tools
-
-    assert to_langchain_tools is not None
-
-
-def test_catalog_to_langchain_tools_raises_import_error_without_langchain() -> None:
-    """Without langchain-core installed, raises ImportError with helpful message."""
+def test_catalog_to_langchain_tools_raises_import_error_without_langchain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A missing optional dependency fails clearly, even when installed for other tests."""
     import sys
 
-    # Temporarily hide langchain_core from imports
-    langchain_mod = sys.modules.pop("langchain_core", None)
-    langchain_tools_mod = sys.modules.pop("langchain_core.tools", None)
-    try:
-        cat = _catalog()
-        # Re-import with hidden module
-        with pytest.raises(ImportError, match="langchain"):
-            to_langchain_tools(
-                cat,
-            )
-    finally:
-        if langchain_mod is not None:
-            sys.modules["langchain_core"] = langchain_mod
-        if langchain_tools_mod is not None:
-            sys.modules["langchain_core.tools"] = langchain_tools_mod
+    monkeypatch.setitem(sys.modules, "langchain_core", None)
+    monkeypatch.setitem(sys.modules, "langchain_core.tools", None)
+    with pytest.raises(ImportError, match="langchain"):
+        to_langchain_tools(_catalog())
 
 
 # ---------------------------------------------------------------------------

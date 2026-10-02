@@ -20,6 +20,7 @@ import asyncio
 import re
 import time
 from collections.abc import Awaitable, Mapping
+from decimal import Decimal
 from typing import Any
 
 import duckdb
@@ -253,3 +254,32 @@ def test_async_dbapi_adapter_closes_cursor_after_execute_failure() -> None:
 
     assert raised.value is error
     assert cursor.closed
+
+
+@pytest.mark.parametrize(
+    ("source_rows", "expected"),
+    [
+        ([(1, "paid", Decimal("12.34"))], [("paid", Decimal("12.34"))]),
+        ([(1, "paid", None)], [("paid", None)]),
+        ([], []),
+    ],
+    ids=["decimal", "all-null", "empty"],
+)
+def test_async_dbapi_physical_schema_executes_empty_and_null_numeric_results(
+    source_rows: list[tuple[int, str, Any]],
+    expected: list[tuple[Any, ...]],
+) -> None:
+    raw = duckdb.connect(":memory:")
+    raw.execute("CREATE TABLE orders (id INTEGER, status TEXT, amount DECIMAL(12, 2))")
+    if source_rows:
+        raw.executemany("INSERT INTO orders VALUES (?, ?, ?)", source_rows)
+    plan = compile_federated_query(
+        SemanticQuery(measures=["orders.revenue"], dimensions=["orders.status"]),
+        {"orders": _orders_cube()},
+    )
+    engine = AsyncEngine()
+    engine.register(Dialect.POSTGRES, AsyncDBAPIAdapter(_DBAPIConn(raw)))
+
+    result = _run(engine.run(plan))
+
+    assert result.rows == expected

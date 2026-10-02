@@ -14,6 +14,7 @@ caller to supply ``range``.
 
 from __future__ import annotations
 
+import duckdb
 import pytest
 from semql import (
     Catalog,
@@ -318,15 +319,169 @@ def test_compare_order_by_synthetic_current_and_prior_refs() -> None:
     assert "revenue_prior" in out.sql
 
 
-def test_compare_having_synthetic_delta_ref() -> None:
-    """HAVING now works in compare mode against the synthetic
-    delta column — the high-leverage "show me improvers > N" case."""
-    q = _basic_compare_query().model_copy(
-        update={"having": [Filter(dimension="compare.revenue.delta", op="gt", values=[100])]}
+@pytest.mark.parametrize(
+    ("facet", "threshold", "expected_regions"),
+    [
+        ("current", 6, {"north"}),
+        ("prior", 4, {"north"}),
+        ("delta", 0, {"north", "current-only"}),
+        ("pct_change", 50, {"north"}),
+    ],
+)
+def test_compare_output_filters_execute_after_projection_with_order_and_limit(
+    facet: str, threshold: float, expected_regions: set[str]
+) -> None:
+    cube = Cube(
+        name="orders",
+        dialect=Dialect.DUCKDB,
+        table="orders",
+        alias="o",
+        measures=[Measure(name="revenue", sql="{o}.amount", agg="sum")],
+        dimensions=[Dimension(name="region", sql="{o}.region", type="string")],
+        time_dimensions=[TimeDimension(name="created_at", sql="{o}.created_at")],
     )
-    out = _cat().compile(q)
-    assert "HAVING" in out.sql.upper()
-    assert "revenue_delta" in out.sql
+    query = SemanticQuery(
+        measures=["orders.revenue"],
+        dimensions=["orders.region"],
+        time_dimension=TimeWindow(
+            dimension="orders.created_at",
+            range=("2026-01-01", "2026-02-01"),
+        ),
+        compare=CompareWindow(),
+        having=[Filter(dimension=f"compare.revenue.{facet}", op="gt", values=[threshold])],
+        order=[("compare.revenue.delta", "desc")],
+        limit=1,
+    )
+    compiled = Catalog([cube]).compile(query)
+    con = duckdb.connect(":memory:")
+    try:
+        con.execute("CREATE TABLE orders (region VARCHAR, amount DOUBLE, created_at TIMESTAMP)")
+        con.execute(
+            "INSERT INTO orders VALUES "
+            "('north', 10, '2026-01-10'), ('north', 5, '2025-12-10'), "
+            "('current-only', 3, '2026-01-11'), ('prior-only', 4, '2025-12-11')"
+        )
+        rows = con.execute(compiled.sql, compiled.params).fetchall()
+        assert len(rows) == 1
+        assert rows[0][0] in expected_regions
+        assert rows[0][1:] == (
+            10.0 if rows[0][0] == "north" else 3.0,
+            5.0 if rows[0][0] == "north" else None,
+            5.0 if rows[0][0] == "north" else 3.0,
+            100.0 if rows[0][0] == "north" else None,
+        )
+    finally:
+        con.close()
+
+
+def test_compare_null_safe_identity_for_multiple_keys_and_one_sided_groups() -> None:
+    cube = Cube(
+        name="orders",
+        dialect=Dialect.DUCKDB,
+        table="orders",
+        alias="o",
+        measures=[Measure(name="revenue", sql="{o}.amount", agg="sum")],
+        dimensions=[
+            Dimension(name="region", sql="{o}.region", type="string"),
+            Dimension(name="channel", sql="{o}.channel", type="string"),
+        ],
+        time_dimensions=[TimeDimension(name="created_at", sql="{o}.created_at")],
+    )
+    query = SemanticQuery(
+        measures=["orders.revenue"],
+        dimensions=["orders.region", "orders.channel"],
+        time_dimension=TimeWindow(
+            dimension="orders.created_at",
+            range=("2026-01-01", "2026-02-01"),
+        ),
+        compare=CompareWindow(),
+    )
+    compiled = Catalog([cube]).compile(query)
+    con = duckdb.connect(":memory:")
+    try:
+        con.execute(
+            "CREATE TABLE orders "
+            "(region VARCHAR, channel VARCHAR, amount DOUBLE, created_at TIMESTAMP)"
+        )
+        con.execute(
+            "INSERT INTO orders VALUES "
+            "(NULL, NULL, 5, '2026-01-10'), (NULL, NULL, 2, '2025-12-10'), "
+            "(NULL, 'web', 7, '2026-01-11'), (NULL, 'web', 3, '2025-12-11'), "
+            "('west', NULL, 11, '2026-01-12'), ('east', 'store', 13, '2025-12-12')"
+        )
+        rows = con.execute(compiled.sql, compiled.params).fetchall()
+        actual = {
+            (region, channel): (current, prior, delta, pct)
+            for region, channel, current, prior, delta, pct in rows
+        }
+        assert actual == {
+            (None, None): (5.0, 2.0, 3.0, 150.0),
+            (None, "web"): (7.0, 3.0, 4.0, 400.0 / 3.0),
+            ("west", None): (11.0, None, 11.0, None),
+            ("east", "store"): (None, 13.0, -13.0, None),
+        }
+        assert len(rows) == len(actual)
+    finally:
+        con.close()
+
+
+@pytest.mark.parametrize("facet", ["current", "prior", "delta", "pct_change"])
+@pytest.mark.parametrize("grouped", [False, True], ids=["no-dimension", "grouped"])
+def test_compare_filters_execute_for_all_facets_and_grouping_shapes(
+    facet: str, grouped: bool
+) -> None:
+    cube = Cube(
+        name="orders",
+        dialect=Dialect.DUCKDB,
+        table="orders",
+        alias="o",
+        measures=[Measure(name="revenue", sql="{o}.amount", agg="sum")],
+        dimensions=[Dimension(name="region", sql="{o}.region", type="string")],
+        time_dimensions=[TimeDimension(name="created_at", sql="{o}.created_at")],
+    )
+    filt = Filter(dimension=f"compare.sales.{facet}", op="gt", values=[0])
+    query = SemanticQuery(
+        measures=["orders.revenue"],
+        dimensions=["orders.region"] if grouped else [],
+        aliases={"sales": "orders.revenue"},
+        time_dimension=TimeWindow(
+            dimension="orders.created_at",
+            range=("2026-01-01", "2026-02-01"),
+        ),
+        compare=CompareWindow(),
+        having=[filt],
+        order=[("compare.sales.delta", "desc")],
+        limit=2,
+    )
+    compiled = Catalog([cube]).compile(query)
+    con = duckdb.connect(":memory:")
+    try:
+        con.execute("CREATE TABLE orders (region VARCHAR, amount DOUBLE, created_at TIMESTAMP)")
+        con.execute(
+            "INSERT INTO orders VALUES "
+            "('a', 10, '2026-01-10'), ('a', 5, '2025-12-10'), "
+            "('b', 2, '2026-01-11'), ('b', 4, '2025-12-11')"
+        )
+        cursor = con.execute(compiled.sql, compiled.params)
+        names = [item[0] for item in cursor.description]
+        rows = cursor.fetchall()
+        facet_index = {
+            "current": names.index("sales_current"),
+            "prior": names.index("sales_prior"),
+            "delta": names.index("sales_delta"),
+            "pct_change": names.index("sales_pct_change"),
+        }[facet]
+        assert len(rows) == (1 if facet in {"delta", "pct_change"} else (2 if grouped else 1))
+        assert rows[0][facet_index] is not None and rows[0][facet_index] > 0
+        assert [meta.name for meta in compiled.column_meta] == compiled.columns
+        assert "sales_current" in names and "sales_delta" in names
+        assert all(len(row) == len(names) for row in rows)
+        if grouped:
+            assert [row[0] for row in rows] == (
+                ["a"] if facet in {"delta", "pct_change"} else ["a", "b"]
+            )
+    finally:
+        con.close()
 
 
 def test_compare_synthetic_ref_unknown_measure_rejected() -> None:

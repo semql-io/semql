@@ -27,6 +27,7 @@ import asyncio
 import re
 import time
 from collections.abc import Awaitable, Mapping
+from decimal import Decimal
 from typing import Any
 
 import duckdb
@@ -40,7 +41,7 @@ from semql import (
     SemanticQuery,
     compile_federated_query,
 )
-from semql_engine import AsyncBigQueryAdapter, AsyncEngine
+from semql_engine import AsyncBigQueryAdapter, AsyncEngine, ExecutionContractError
 
 
 def _run[T](coro: Awaitable[T]) -> T:
@@ -313,6 +314,125 @@ def test_async_bq_adapter_runs_through_async_engine_via_duckdb_stand_in() -> Non
     assert any("@" in c["sql"] for c in client.calls), (
         f"AsyncBigQueryAdapter rewrote the SQL; should have been a pass-through: {client.calls}"
     )
+
+
+@pytest.mark.parametrize(
+    ("source_rows", "expected"),
+    [
+        ([(1, "paid", Decimal("12.34"))], [("paid", Decimal("12.34"))]),
+        ([(1, "paid", None)], [("paid", None)]),
+        ([], []),
+    ],
+    ids=["decimal", "all-null", "empty"],
+)
+def test_async_bq_physical_schema_executes_empty_and_null_numeric_results(
+    source_rows: list[tuple[int, str, Any]],
+    expected: list[tuple[Any, ...]],
+) -> None:
+    raw = duckdb.connect(":memory:")
+    raw.execute("CREATE TABLE orders (id INTEGER, status TEXT, amount DECIMAL(12, 2))")
+    if source_rows:
+        raw.executemany("INSERT INTO orders VALUES (?, ?, ?)", source_rows)
+
+    class Field:
+        def __init__(self, name: str, field_type: str) -> None:
+            self.name = name
+            self.field_type = field_type
+
+    class TypedResult:
+        def __init__(self, rows: list[tuple[Any, ...]], schema: list[Field]) -> None:
+            self._rows = rows
+            self.schema = schema
+
+        def __iter__(self) -> Any:
+            return iter(_FakeBQRow(row) for row in self._rows)
+
+    class TypedClient:
+        def query(self, sql: str, job_config: Any = None) -> TypedResult:
+            translated = re.sub(r"@(\w+)", r"$\1", sql)
+            params = {item.name: item.value for item in getattr(job_config, "query_parameters", [])}
+            cursor = raw.execute(translated, params if params else None)
+            description = list(cursor.description or [])
+            schema = [Field(str(col[0]), str(col[1])) for col in description]
+            return TypedResult(list(cursor.fetchall()), schema)
+
+    cube = Cube(
+        name="orders",
+        dialect=Dialect.BIGQUERY,
+        table="orders",
+        alias="o",
+        primary_key="id",
+        measures=[Measure(name="revenue", sql="{o}.amount", agg="sum")],
+        dimensions=[Dimension(name="status", sql="{o}.status", type="string")],
+    )
+    plan = compile_federated_query(
+        SemanticQuery(measures=["orders.revenue"], dimensions=["orders.status"]),
+        {cube.name: cube},
+    )
+    engine = AsyncEngine()
+    engine.register(
+        Dialect.BIGQUERY,
+        AsyncBigQueryAdapter(TypedClient(), translator=_fake_translator),
+    )
+
+    result = _run(engine.run(plan))
+
+    assert result.rows == expected
+
+
+def test_bignumeric_schema_is_preserved_and_rejected_without_precision_loss() -> None:
+    cube = Cube(
+        name="orders",
+        dialect=Dialect.BIGQUERY,
+        table="orders",
+        alias="o",
+        primary_key="id",
+        measures=[Measure(name="revenue", sql="{o}.amount", agg="sum")],
+        dimensions=[Dimension(name="status", sql="{o}.status", type="string")],
+    )
+    plan = compile_federated_query(
+        SemanticQuery(measures=["orders.revenue"], dimensions=["orders.status"]),
+        {cube.name: cube},
+    )
+
+    class Field:
+        def __init__(self, name: str, field_type: str) -> None:
+            self.name = name
+            self.field_type = field_type
+
+    class Result:
+        def __init__(self) -> None:
+            self.schema = [
+                Field(
+                    name,
+                    "BIGNUMERIC" if name.endswith("revenue") else "STRING",
+                )
+                for name in plan.fragments[0].columns
+            ]
+            self.rows = [
+                tuple(
+                    Decimal("1.25") if name.endswith("revenue") else "paid"
+                    for name in plan.fragments[0].columns
+                )
+            ]
+
+        def __iter__(self) -> Any:
+            return iter(_FakeBQRow(row) for row in self.rows)
+
+    class Client:
+        def query(self, sql: str, job_config: Any = None) -> Result:
+            return Result()
+
+    engine = AsyncEngine()
+    engine.register(
+        Dialect.BIGQUERY,
+        AsyncBigQueryAdapter(Client(), translator=_fake_translator),
+    )
+
+    with pytest.raises(ExecutionContractError) as raised:
+        _run(engine.run(plan))
+
+    assert raised.value.reason == "physical_schema_unsupported"
 
 
 def test_async_bq_adapter_default_translator_raises_without_google_cloud() -> None:

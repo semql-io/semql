@@ -52,6 +52,7 @@ def _materialize_result(result: AdapterResult) -> AdapterResult:
     return AdapterResult(
         columns=list(result.columns),
         rows=[tuple(row) for row in result.rows],
+        column_types=(list(result.column_types) if result.column_types is not None else None),
     )
 
 

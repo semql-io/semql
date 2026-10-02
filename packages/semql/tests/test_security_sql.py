@@ -10,8 +10,10 @@ can't smuggle in rows the policy excludes. Values flow through
 
 from __future__ import annotations
 
+import duckdb
 import pytest
 from semql import (
+    AuthContext,
     Catalog,
     CompileError,
     Cube,
@@ -211,16 +213,22 @@ def test_security_sql_undeclared_ctx_key_rejected_at_construction() -> None:
 
 
 def test_security_sql_viewer_id_is_exempt_from_declaration() -> None:
-    """``{ctx.viewer_id}`` auto-flattens from the viewer, so it needs no
-    declaration."""
+    """The viewer identity binds without an explicit context-key declaration."""
     cube = Cube(
         name="c",
-        dialect=Dialect.POSTGRES,
+        dialect=Dialect.DUCKDB,
         table="t",
         alias="c",
+        dimensions=[Dimension(name="assignee", sql="{c}.assignee", type="string")],
         security_sql="{c}.assignee = {ctx.viewer_id}",
     )
-    assert cube.security_ctx_keys == []
+    compiled = Catalog([cube]).compile(
+        SemanticQuery(dimensions=["c.assignee"]), viewer=AuthContext(viewer_id="viewer-a")
+    )
+    with duckdb.connect(":memory:") as connection:
+        connection.execute("CREATE TABLE t(assignee VARCHAR)")
+        connection.executemany("INSERT INTO t VALUES (?)", [("viewer-a",), ("viewer-b",)])
+        assert connection.execute(compiled.sql, compiled.params).fetchall() == [("viewer-a",)]
 
 
 def test_security_sql_declared_key_constructs_cleanly() -> None:

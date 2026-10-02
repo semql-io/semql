@@ -36,6 +36,7 @@ round-trips and can be cached as a build artefact.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from enum import StrEnum
 from typing import Literal
 
@@ -202,10 +203,10 @@ def _label_for(kind: ChangeKind) -> str:
 def _set_role_diff(
     cube_name: str,
     field_name: str,
-    old_roles: list[str],
-    new_roles: list[str],
+    old_roles: Sequence[str],
+    new_roles: Sequence[str],
 ) -> Change | None:
-    """Compare two ``required_roles`` lists.
+    """Compare two required-role sequences.
 
     Sets are unordered: we sort, deduplicate, then compare. Returns
     a change only if the role set actually shifted.
@@ -241,8 +242,8 @@ def _set_role_diff(
     )
 
 
-def _diff_measures(cube_name: str, old: list[Measure], new: list[Measure]) -> list[Change]:
-    """Compare two measure lists on a cube.
+def _diff_measures(cube_name: str, old: Sequence[Measure], new: Sequence[Measure]) -> list[Change]:
+    """Compare two measure sequences on a cube.
 
     Pairs are matched by ``name``. Agg changes are breaking (e.g.
     switching from ``sum`` to ``avg`` changes every consumer's number).
@@ -274,7 +275,9 @@ def _diff_measures(cube_name: str, old: list[Measure], new: list[Measure]) -> li
     return out
 
 
-def _diff_dimensions(cube_name: str, old: list[Dimension], new: list[Dimension]) -> list[Change]:
+def _diff_dimensions(
+    cube_name: str, old: Sequence[Dimension], new: Sequence[Dimension]
+) -> list[Change]:
     out: list[Change] = []
     by_name_old = {d.name: d for d in old}
     by_name_new = {d.name: d for d in new}
@@ -309,7 +312,7 @@ def _diff_dimensions(cube_name: str, old: list[Dimension], new: list[Dimension])
     return out
 
 
-def _diff_segments(cube_name: str, old: list[Segment], new: list[Segment]) -> list[Change]:
+def _diff_segments(cube_name: str, old: Sequence[Segment], new: Sequence[Segment]) -> list[Change]:
     out: list[Change] = []
     by_name_old = {s.name: s for s in old}
     by_name_new = {s.name: s for s in new}
@@ -324,7 +327,7 @@ def _join_signature(j: Join) -> tuple[str, str, str]:
     return (j.to, j.relationship, j.on)
 
 
-def _diff_joins(cube_name: str, old: list[Join], new: list[Join]) -> list[Change]:
+def _diff_joins(cube_name: str, old: Sequence[Join], new: Sequence[Join]) -> list[Change]:
     """Compare two join lists.
 
     Joins are matched by ``to`` (the joined-to cube name). A

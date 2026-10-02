@@ -346,12 +346,11 @@ def render_catalog_block(
 class CatalogPrompt:
     """Two-segment rendering of the catalog for prompt caching.
 
-    ``static`` is identical for every viewer — only cubes with empty
-    ``required_roles`` appear here. Splice it above your Anthropic /
-    Bedrock prompt-cache breakpoint so cache hits land. ``overlay`` is
-    the per-viewer addition: role-gated cubes the viewer holds a role
-    for, preceded by a short visibility note. Splice below the
-    breakpoint.
+    ``static`` contains only viewer-invariant cube visibility and universally
+    visible fields. Dynamic-policy cubes never enter this reusable segment.
+    The overlay contains authorized additions; with ``viewer=None``,
+    policy-dependent public cubes are returned unfiltered in the
+    noncacheable overlay for catalog-tooling use.
 
     ``joined()`` concatenates both for the non-cached case so a
     consumer can fall back to a single string when caching isn't
@@ -445,27 +444,26 @@ def _field_is_public(field: BaseField) -> bool:
     return not field.required_roles
 
 
-def _cube_has_viewer_only_fields(cube: Cube, viewer: AuthContext | None) -> bool:
-    """Does ``cube`` carry a role-protected field this viewer is allowed to
-    see? Such fields are dropped from the anon-rendered static segment, so the
-    overlay must re-render the cube to surface them to an authorised viewer."""
-    if viewer is None:
-        return False
-    return any(
-        not _field_is_public(f) and _field_visible_to(f, viewer)
-        for f in (*cube.measures, *cube.dimensions, *cube.time_dimensions)
+def _is_public(cube: Cube) -> bool:
+    """A cube is *statically visible* when its access is viewer-independent."""
+    return not cube.required_roles
+
+
+def _cube_fields_are_public(cube: Cube) -> bool:
+    return all(
+        _field_is_public(field)
+        for field in (
+            *cube.measures,
+            *cube.dimensions,
+            *cube.time_dimensions,
+            *cube.segments,
+        )
     )
 
 
-def _is_public(cube: Cube) -> bool:
-    """A cube is *publicly visible* when its ``required_roles`` is empty.
-
-    The cacheable layout uses this to gate the static segment: only
-    cubes that don't depend on viewer roles can sit above the cache
-    breakpoint. ``policy`` is orthogonal — when the catalog has a
-    dynamic policy, callers should review whether that policy is
-    viewer-discriminating before trusting the cacheable layout."""
-    return not cube.required_roles
+def _cube_is_invariant(cube: Cube, policy: PolicyFn | None) -> bool:
+    """Whether cube visibility can safely be cached across viewers."""
+    return _is_public(cube) and policy is None
 
 
 def render_catalog_segments(
@@ -485,23 +483,14 @@ def render_catalog_segments(
     saved_queries: Sequence[SavedQuery] | None = None,
     cube_prompt_hooks: list[CubePromptHook] | None = None,
 ) -> CatalogPrompt:
-    """Split the catalog into a static + per-viewer overlay rendering.
+    """Split the catalog into cache-invariant static and noncacheable overlay.
 
-    Static segment: public cubes (empty ``required_roles``), rendered
-    against an empty-role viewer so role-protected *fields* on those cubes
-    are dropped too. Stable across viewer changes — cache it.
-
-    Overlay segment: the per-viewer additions — role-gated cubes the viewer
-    holds a role for, plus public cubes carrying role-protected fields the
-    viewer may see (re-rendered so those fields, dropped from the anon static
-    segment, surface for the authorised viewer). Preceded by a one-line note
-    so the planner knows which extras showed up.
-
-    The auth invariant — "viewers should not learn cubes or fields they
-    cannot access" — is preserved: role-gated cubes and role-protected
-    fields only appear when ``viewer_sees`` / ``_field_visible_to`` passes
-    for that viewer, and they live in the overlay segment, never the static
-    one.
+    Static contains only cubes whose visibility does not depend on viewer
+    roles or a dynamic policy, and only universally visible fields on them.
+    Authorized dynamic-policy cubes and protected-field additions live in
+    the per-viewer overlay. With ``viewer=None``, dynamic-policy public cubes
+    are placed unfiltered in the overlay without evaluating policy; role-gated
+    cubes retain the existing no-viewer behavior.
     """
     lookups_by_dim = dict(lookups or {})
     all_cubes = _drop_deprecated(
@@ -510,13 +499,17 @@ def render_catalog_segments(
                 catalog,
                 include_meta=True,
                 only_exposed=only_exposed,
-                viewer=None,  # static segment ignores viewer
+                viewer=None,
                 policy=None,
             )
         )
     )
 
-    public_cubes = [c for c in all_cubes if _is_public(c)]
+    # A dynamic policy is request-dependent by definition. Without an
+    # explicit proof of viewer-independence, keep its cubes out of the
+    # cross-viewer cache even when it currently admits this viewer.
+    static_cubes = [c for c in all_cubes if _cube_is_invariant(c, policy)]
+    public_cubes = static_cubes
     header, preamble = _retrieval_header_preamble(
         public_cubes,
         saved_queries,
@@ -532,8 +525,6 @@ def render_catalog_segments(
         retriever=retriever,
         retrieval_threshold=retrieval_threshold,
     ):
-        # Auth invariant: retrieval can only narrow the public set;
-        # it cannot promote a role-gated cube into the static segment.
         assert user_query is not None and retriever is not None
         public_cubes = _filter_by_retrieval(
             public_cubes,
@@ -547,35 +538,36 @@ def render_catalog_segments(
         ctx,
         header=header,
         preamble=preamble,
-        # Render against an empty-role viewer, not ``None``: a public cube can
-        # still carry role-protected fields, and ``viewer=None`` would emit
-        # them into this cross-viewer cached segment. The anon viewer drops
-        # them; the overlay below re-adds those the real viewer may see
-        # (SEMQL-PROMPT-CACHE-FIELD-ROLES).
         viewer=_ANON_VIEWER,
         cube_prompt_hooks=cube_prompt_hooks,
     )
-    # Domain context (glossary + cross-cube relations) is viewer-
-    # invariant, so it lives in the static segment above the cubes.
     domain = _render_domain_context(glossary, relations)
     static = domain + "\n" + catalog_body if domain and catalog_body else domain or catalog_body
 
-    # Overlay holds the additional cubes this viewer has been authorised
-    # to see beyond the public set. With viewer=None we treat the overlay
-    # as empty — the static segment is the whole prompt.
     overlay = ""
-    if viewer is not None:
-        # Two kinds of cube belong in the per-viewer overlay:
-        #  - role-gated cubes the viewer is authorised to see (never in the
-        #    static segment, which only carries public cubes), and
-        #  - public cubes carrying role-protected fields the viewer may see —
-        #    the static segment rendered those cubes with the anon viewer, so
-        #    the protected fields were dropped and must be re-added here.
+    if viewer is None and policy is not None:
+        # No-viewer catalog tooling bypasses authorization as before, but
+        # policy-dependent content is never safe to put in the cache segment.
+        overlay_cubes = [c for c in all_cubes if _is_public(c)]
+        if overlay_cubes:
+            overlay = _render_cube_block(
+                overlay_cubes,
+                lookups_by_dim,
+                ctx,
+                header="## UNFILTERED CATALOG (NONCACHEABLE)",
+                preamble=(
+                    "No viewer was supplied. The catalog is unfiltered for "
+                    "tooling; do not reuse this segment across viewers."
+                ),
+                viewer=None,
+                cube_prompt_hooks=cube_prompt_hooks,
+            )
+    elif viewer is not None:
         overlay_cubes = [
             c
             for c in all_cubes
             if viewer_sees(c, viewer, policy)
-            and (not _is_public(c) or _cube_has_viewer_only_fields(c, viewer))
+            and (not _cube_is_invariant(c, policy) or not _cube_fields_are_public(c))
         ]
         if overlay_cubes:
             names = ", ".join(f"`{c.name}`" for c in overlay_cubes)
@@ -601,13 +593,11 @@ class ToolDescriptionProjection:
     """Per-cube MCP tool descriptions, partitioned for prompt caching.
 
     Mirrors :class:`CatalogPrompt` at the tool-schema layer. ``invariant``
-    holds the static set: cubes with empty ``required_roles``, whose
-    description is the same for every viewer — cache them aggressively
-    on the MCP client side. ``viewer_gated`` holds the per-viewer
-    additions: role-gated cubes the viewer is authorised to see beyond
-    the public set. Each value is the full MCP tool description string
-    (matching what the semql-mcp server uses for ``__doc__`` on the
-    per-cube ``query_<cube>`` tool).
+    contains universally visible fields on cubes without dynamic-policy or
+    role dependencies. ``viewer_gated`` holds non-invariant descriptions:
+    authorized policy-/role-dependent cubes and protected-field additions.
+    For no-viewer tooling, it contains policy-dependent public cubes
+    unfiltered and must not be cached across viewers.
 
     Both maps are keyed by ``cube.name`` so a consumer can correlate
     them with the catalog prompt segments (which list cubes by name)
@@ -620,12 +610,12 @@ class ToolDescriptionProjection:
     saved_query_viewer_gated: dict[str, str] = field(default_factory=lambda: dict[str, str]())
 
     def all(self) -> dict[str, str]:
-        """Concatenate all four maps into one. Cube invariant and saved-query
-        invariant keys win on collision within their respective categories."""
-        out = dict(self.viewer_gated)
-        out.update(self.invariant)
-        sq_out = dict(self.saved_query_viewer_gated)
-        sq_out.update(self.saved_query_invariant)
+        """Merge all maps, letting an authorized per-viewer value override
+        its viewer-invariant base for the same cube or saved query."""
+        out = dict(self.invariant)
+        out.update(self.viewer_gated)
+        sq_out = dict(self.saved_query_invariant)
+        sq_out.update(self.saved_query_viewer_gated)
         out.update(sq_out)
         return out
 
@@ -731,24 +721,14 @@ def project_tool_descriptions(
     policy: PolicyFn | None = None,
     saved_queries: Sequence[SavedQuery] | None = None,
 ) -> ToolDescriptionProjection:
-    """Return tool descriptions projected to the visible cubes (relational projection).
+    """Project viewer-invariant and noncacheable MCP tool descriptions.
 
-    "Project" here is the relational-algebra sense — pick the columns/rows
-    that match a predicate, drop the rest. Despite the bare name, this has
-    nothing to do with "this project" / a project directory.
-
-    Splits per-cube MCP tool descriptions into invariant + viewer-gated.
-
-    ``invariant`` segment: cubes with empty ``required_roles``, identical
-    for every viewer. MCP clients should cache these schemas aggressively.
-
-    ``viewer_gated`` segment: cubes the viewer holds a role for (passes
-    ``viewer_sees``) that aren't in the invariant set. Without a viewer,
-    this segment is empty.
-
-    Auth invariant — like :func:`render_catalog_segments`, role-gated
-    cubes only appear when the viewer authorises them, so a viewer never
-    learns names of cubes they can't access via this projection.
+    ``invariant`` contains only cubes without dynamic policy or cube-level
+    role requirements, rendered with universally visible fields.
+    ``viewer_gated`` holds authorized dynamic/role-dependent content. When
+    ``viewer=None``, policy is intentionally bypassed and policy-dependent
+    public cubes are placed unfiltered in ``viewer_gated`` so no-viewer
+    tooling remains complete without contaminating the reusable invariant.
 
     See also :data:`filter_tool_descriptions` — same callable, more
     discoverable name."""
@@ -756,9 +736,9 @@ def project_tool_descriptions(
         list(
             iter_cubes(
                 catalog,
-                include_meta=False,  # META cubes don't get per-cube MCP tools
+                include_meta=False,
                 only_exposed=only_exposed,
-                viewer=None,  # invariant ignores viewer
+                viewer=None,
                 policy=None,
             )
         )
@@ -767,14 +747,18 @@ def project_tool_descriptions(
     invariant: dict[str, str] = {}
     viewer_gated: dict[str, str] = {}
     for cube in all_cubes:
-        # Pass viewer so fields with required_roles are filtered out of the
-        # tool description for viewers who lack those roles
-        # (SEMQL-PROMPT-FIELD-ROLES-001).
-        rendered = render_tool_description(cube, viewer=viewer)
-        if _is_public(cube):
-            invariant[cube.name] = rendered
-        elif viewer is not None and viewer_sees(cube, viewer, policy):
-            viewer_gated[cube.name] = rendered
+        is_invariant = _is_public(cube) and policy is None
+        if is_invariant:
+            invariant[cube.name] = render_tool_description(cube, viewer=_ANON_VIEWER)
+
+        if viewer is None:
+            if policy is not None and _is_public(cube):
+                viewer_gated[cube.name] = render_tool_description(cube)
+            continue
+        if not viewer_sees(cube, viewer, policy):
+            continue
+        if not _is_public(cube) or policy is not None or not _cube_fields_are_public(cube):
+            viewer_gated[cube.name] = render_tool_description(cube, viewer=viewer)
 
     sq_invariant: dict[str, str] = {}
     sq_viewer_gated: dict[str, str] = {}
@@ -832,21 +816,16 @@ def catalog_prompt_hash(
     ctx: ResolutionContext | None = None,
     glossary: list[GlossaryEntry] | None = None,
     relations: str = "",
+    policy: PolicyFn | None = None,
 ) -> str:
-    """SHA256 hex digest of the static catalog segment.
-
-    Stable across viewer changes — call this to key your own
-    prompt-fragment cache so a measure rename or new public cube
-    invalidates entries even when the viewer (and overlay) doesn't
-    change. Loader-backed dynamic lookups change the hash when their
-    resolved values change for the given ``ctx``. Glossary edits
-    and the cross-cube ``relations`` narrative also flow into the
-    hash so editing them busts the cache."""
+    """SHA256 hex digest of the viewer-invariant static catalog segment."""
+    # A supplied policy makes every cube potentially viewer-dependent, so
+    # none belongs in the cache hash. Avoid invoking it while hashing.
+    static_catalog = catalog if policy is None else {}
     segments = render_catalog_segments(
-        catalog,
+        static_catalog,
         only_exposed=only_exposed,
         viewer=None,
-        policy=None,
         lookups=lookups,
         ctx=ctx,
         glossary=glossary,

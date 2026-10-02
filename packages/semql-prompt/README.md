@@ -42,6 +42,14 @@ key = prompt_hash(catalog)
 tools = to_openai_tools(catalog, viewer=viewer)
 ```
 
+Cacheable `static`/`invariant` content contains only viewer-independent
+catalog information and public fields. A dynamic `Catalog.policy` moves
+cube content into the authorized per-viewer projection; empty cube roles
+do not bypass that policy. Authorized field descriptions override their
+public baseline when combining projections. The documented no-viewer
+mode remains unfiltered tooling access, not an authorization decision for
+a later viewer-scoped request.
+
 Role builders keep mandatory query, authorization, and untrusted-data guidance
 while accepting optional trusted `instructions`. With no explicit router
 `scope_to`, the Query Generator can use the existing catalog retriever
@@ -84,6 +92,11 @@ result = PromptBudget(max_tokens=8_000).apply(
 The same `count_tokens` callback is accepted by `apply_budget`. Trimming
 removes known optional catalog sections; if required or otherwise untrimmable
 text remains over budget, it is preserved and `fits` is `False`.
+
+Trimming optional domain prose requires recognized section boundaries.
+An ordinary cube's `**Relations:**` marker never permits removing its
+fields or following protected cubes. Missing domain context is left intact
+when no safe structural trim is available.
 
 ## License
 

@@ -25,12 +25,26 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import datetime as dt
+import sys
 import time
+import uuid
 import warnings
 from collections import OrderedDict
-from collections.abc import AsyncIterator, Callable, Generator, Iterator, Mapping, Sequence
+from collections.abc import (
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Generator,
+    Iterable,
+    Iterator,
+    Mapping,
+    Sequence,
+)
+from copy import deepcopy
 from dataclasses import dataclass, replace
-from typing import Any, Literal, Protocol, cast, runtime_checkable
+from decimal import Decimal
+from typing import Any, Literal, NoReturn, Protocol, TypeGuard, cast, runtime_checkable
 
 import duckdb
 from semql.analysis import SemanticAnalysis
@@ -213,20 +227,92 @@ def _plan_analysis(plan: FederatedPlan) -> SemanticAnalysis:
     return plan.analysis
 
 
+def _close_iterator(iterator: object) -> None:
+    close = getattr(iterator, "close", None)
+    if not callable(close):
+        return
+    active_error = sys.exc_info()[0] is not None
+    try:
+        close()
+    except Exception:
+        if not active_error:
+            raise
+
+
 def _materialize_result(result: AdapterResult) -> _MaterializedAdapterResult:
-    """Consume adapter rows once so evidence checks and merge share rows."""
+    """Consume and close the acquired adapter row iterator exactly once."""
+    row_iter = iter(result.rows)
+    try:
+        rows = [tuple(row) for row in row_iter]
+    finally:
+        _close_iterator(row_iter)
     return _MaterializedAdapterResult(
         columns=list(result.columns),
-        rows=[tuple(row) for row in result.rows],
+        rows=rows,
+        column_types=(list(result.column_types) if result.column_types is not None else None),
     )
+
+
+def _materialize_results(
+    results: Sequence[AdapterResult],
+) -> list[_MaterializedAdapterResult]:
+    """Materialize adapter rows and close later iterators if one fails."""
+    materialized: list[_MaterializedAdapterResult] = []
+    for index, result in enumerate(results):
+        try:
+            materialized.append(_materialize_result(result))
+        except BaseException:
+            for unconsumed in results[index + 1 :]:
+                try:
+                    row_iter = iter(unconsumed.rows)
+                except Exception:
+                    continue
+                _close_iterator(row_iter)
+            raise
+    return materialized
+
+
+async def _gather_owned[T](operations: Iterable[Awaitable[T]]) -> list[T]:
+    """Run request-owned operations and cancel/drain siblings on any exit."""
+    tasks: list[asyncio.Future[T]] = []
+    try:
+        for operation in operations:
+            tasks.append(asyncio.ensure_future(operation))
+        return list(await asyncio.gather(*tasks))
+    except BaseException:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
 
 
 def _duckdb_key_value(value: object, duckdb_type: str, null_sentinel: object) -> object:
     """Normalize supported keys as DuckDB stores them; reject uncertain casts."""
     if value is None:
         return null_sentinel
-    import datetime as dt
-
+    integer_types = {
+        "TINYINT",
+        "SMALLINT",
+        "INTEGER",
+        "BIGINT",
+        "HUGEINT",
+        "UTINYINT",
+        "USMALLINT",
+        "UINTEGER",
+        "UBIGINT",
+    }
+    if duckdb_type in integer_types and isinstance(value, (int, bool)):
+        return int(value)
+    if duckdb_type in integer_types and isinstance(value, str):
+        return int(value)
+    if duckdb_type.startswith("DECIMAL(") and isinstance(value, (Decimal, int, str)):
+        return Decimal(value)
+    if duckdb_type == "BIGNUM" and isinstance(value, (Decimal, int, str)):
+        return Decimal(value)
+    if duckdb_type in {"FLOAT", "REAL", "DOUBLE"} and isinstance(value, (int, float, str)):
+        converted = float(value)
+        return ("DOUBLE", "NaN") if converted != converted else converted
     if duckdb_type == "BOOLEAN":
         if isinstance(value, bool):
             return value
@@ -234,21 +320,17 @@ def _duckdb_key_value(value: object, duckdb_type: str, null_sentinel: object) ->
             return bool(value)
         if isinstance(value, str) and value.casefold() in {"true", "false"}:
             return value.casefold() == "true"
-    if duckdb_type == "BIGINT":
-        if isinstance(value, (int, bool)):
-            return int(value)
-        if isinstance(value, str):
-            return int(value)
-    if duckdb_type == "DOUBLE" and isinstance(value, (int, float, str)):
-        converted = float(value)
-        return ("DOUBLE", "NaN") if converted != converted else converted
-    if duckdb_type == "VARCHAR" and isinstance(value, str):
+    if duckdb_type in {"VARCHAR", "CHAR", "JSON"} and isinstance(value, str):
         return value
+    if duckdb_type == "UUID" and isinstance(value, uuid.UUID | str):
+        return uuid.UUID(str(value))
     if duckdb_type == "DATE" and isinstance(value, (dt.date, dt.datetime)):
         return value.date() if isinstance(value, dt.datetime) else value
-    if duckdb_type == "TIMESTAMP" and isinstance(value, dt.datetime):
+    if duckdb_type in {"TIMESTAMP", "TIMESTAMPTZ", "TIMESTAMP WITH TIME ZONE"} and isinstance(
+        value, dt.datetime
+    ):
         return value
-    if duckdb_type == "TIME" and isinstance(value, dt.time):
+    if duckdb_type in {"TIME", "TIME WITH TIME ZONE"} and isinstance(value, dt.time):
         return value
     if duckdb_type == "BLOB" and isinstance(value, bytes):
         return value
@@ -284,7 +366,12 @@ def _validate_merge_keys(
                 stage="preflight",
             )
         positions = tuple(result.columns.index(name) for name in columns)
-        types = _infer_column_types(list(result.columns), [tuple(row) for row in result.rows])
+        types = _infer_column_types(
+            list(result.columns),
+            [tuple(row) for row in result.rows],
+            result.column_types,
+            fragment_index=index,
+        )
         null_sentinel = object()
         seen: set[tuple[object, ...]] = set()
         for row in result.rows:
@@ -299,7 +386,7 @@ def _validate_merge_keys(
                 duplicate = normalized in seen
                 if not duplicate:
                     seen.add(normalized)
-            except (TypeError, ValueError, OverflowError):
+            except (TypeError, ValueError, ArithmeticError):
                 raise ExecutionContractError(
                     "Materialized merge-key values cannot be validated.",
                     reason="merge_key_validation_uncheckable",
@@ -327,6 +414,7 @@ def _validate_merge_keys(
 class _MaterializedAdapterResult:
     columns: list[str]
     rows: list[tuple[Any, ...]]
+    column_types: list[str | None] | None = None
 
 
 OnExecuteHook = Callable[..., Any]
@@ -423,20 +511,72 @@ class _CacheEntry:
     expires_at: float | None
 
 
-def _isolate(result: ExecutionResult) -> ExecutionResult:
-    """Return a copy that shares no mutable container (or mutable
-    element) with ``result``.
+type _CacheCell = (
+    None
+    | bool
+    | int
+    | float
+    | complex
+    | str
+    | bytes
+    | Decimal
+    | dt.date
+    | dt.datetime
+    | dt.time
+    | dt.timedelta
+    | uuid.UUID
+    | list[object]
+    | dict[object, object]
+    | set[object]
+    | bytearray
+    | frozenset[object]
+    | tuple[object, ...]
+)
 
-    The cache hands a fresh ``ExecutionResult`` to every caller so that
-    ``result.rows.sort()`` / ``.append(...)`` / ``columns.pop()`` on one
-    consumer can't corrupt the stored entry or any other consumer.
-    ``rows`` elements are tuples and ``columns`` elements are strings —
-    both immutable, so new lists suffice — but ``column_meta`` holds
-    mutable :class:`ColumnMeta` dataclasses, so each is duplicated."""
+
+def _cache_cell_supported(value: object) -> TypeGuard[_CacheCell]:
+    if type(value) in {
+        type(None),
+        bool,
+        int,
+        float,
+        complex,
+        str,
+        bytes,
+        Decimal,
+        dt.date,
+        dt.datetime,
+        dt.time,
+        dt.timedelta,
+        uuid.UUID,
+    } or isinstance(value, bytearray):
+        return True
+    if isinstance(value, list):
+        return all(_cache_cell_supported(item) for item in cast(Iterable[object], value))
+    if isinstance(value, dict):
+        entries = cast(Mapping[object, object], value)
+        return all(
+            _cache_cell_supported(key) and _cache_cell_supported(item)
+            for key, item in entries.items()
+        )
+    if isinstance(value, (set, frozenset, tuple)):
+        return all(_cache_cell_supported(item) for item in cast(Iterable[object], value))
+    return False
+
+
+def _copy_cached_cell(value: object) -> Any:  # noqa: ANN401 — result cells are adapter-defined
+    """Isolate supported built-in containers; reject opaque mutable cells."""
+    if not _cache_cell_supported(value):
+        raise TypeError("cache result contains an unsupported mutable cell")
+    return deepcopy(value)
+
+
+def _isolate(result: ExecutionResult) -> ExecutionResult:
+    """Return a copy that shares no mutable list/dict cells with ``result``."""
     return ExecutionResult(
         columns=list(result.columns),
         column_meta=[replace(m) for m in result.column_meta],
-        rows=list(result.rows),
+        rows=cast("list[tuple[Any, ...]]", [_copy_cached_cell(row) for row in result.rows]),
         analysis=result.analysis,
         validation_evidence=result.validation_evidence,
     )
@@ -543,18 +683,21 @@ class DuckDBMergeEngine:
         _assert_merge_read_only(sql)
         requirements = _execution_final_binding_requirements(sql, Dialect.DUCKDB, params)
         _execution_validate_bindings(sql, Dialect.DUCKDB, params, requirements, artifact="merge")
-        materialized = [_materialize_result(result) for result in fragment_results]
+        materialized = _materialize_results(fragment_results)
         _validate_merge_keys(spec, materialized)
         con = duckdb.connect(":memory:")
         try:
             for i, result in enumerate(materialized):
-                _load_fragment_into(con, i, result.columns, list(result.rows))
+                _load_fragment_into(
+                    con, i, result.columns, list(result.rows), result.column_types, fragment_index=i
+                )
             cursor = con.execute(sql, params)
             columns = [d[0] for d in cursor.description]
+            column_types = [str(d[1]) if len(d) > 1 else None for d in cursor.description]
             rows = cursor.fetchall()
         finally:
             con.close()
-        return AdapterResult(columns=columns, rows=rows)
+        return AdapterResult(columns=columns, rows=rows, column_types=column_types)
 
 
 class Engine:
@@ -718,16 +861,16 @@ class Engine:
         elapsed_ms = (time.perf_counter() - start) * 1000.0
         if cache_enabled and cache_key is not None:
             expires_at = self._clock() + self._cache_ttl if self._cache_ttl is not None else None
-            physical_result = ExecutionResult(
-                columns=list(result.columns),
-                column_meta=[replace(m) for m in result.column_meta],
-                rows=list(result.rows),
-                validation_evidence=result.validation_evidence,
-            )
-            self._cache[cache_key] = _CacheEntry(physical_result, expires_at)
-            self._cache.move_to_end(cache_key)
-            while len(self._cache) > self._cache_size:
-                self._cache.popitem(last=False)
+            try:
+                physical_result = _isolate(result)
+            except TypeError:
+                # Do not cache opaque adapter values whose mutability is unknown.
+                physical_result = None
+            if physical_result is not None:
+                self._cache[cache_key] = _CacheEntry(physical_result, expires_at)
+                self._cache.move_to_end(cache_key)
+                while len(self._cache) > self._cache_size:
+                    self._cache.popitem(last=False)
         self._cache_misses += 1
         self._fire_hook(plan, elapsed_ms, cache_hit=False)
         return result
@@ -794,7 +937,7 @@ class Engine:
 
         self._reset_frag_tables(len(plan.fragments))
         for i, result in enumerate(fragment_results):
-            self._load_fragment(i, result.columns, list(result.rows))
+            self._load_fragment(i, result.columns, list(result.rows), result.column_types)
 
         self._warn_inline_once()
         merge_cursor = self._con.execute(merge_sql, dict(merge_params))
@@ -845,36 +988,223 @@ class Engine:
         index: int,
         columns: list[str],
         rows: list[tuple[Any, ...]],
+        column_types: list[str | None] | None = None,
     ) -> None:
-        """Materialise a fragment's rows into ``frag_<index>`` on the
-        engine's connection."""
-        _load_fragment_into(self._con, index, columns, rows)
+        """Materialise a fragment using its authoritative physical schema."""
+        _load_fragment_into(self._con, index, columns, rows, column_types, fragment_index=index)
 
 
-def _infer_column_types(columns: list[str], rows: list[tuple[Any, ...]]) -> list[str]:
-    """Pick a DuckDB type per column from the first non-NULL value.
+def _incompatible_legacy_schema(
+    column: str,
+    fragment_index: int | None,
+    *,
+    reason: str = "physical_schema_incompatible",
+    message: str = "Legacy adapter values have no lossless common DuckDB type.",
+) -> NoReturn:
+    raise ExecutionContractError(
+        message,
+        reason=reason,
+        artifact=f"fragment_{fragment_index}" if fragment_index is not None else "fragment",
+        names=(column,),
+        operation="merge",
+        stage="materialization",
+    )
 
-    Falls back to ``VARCHAR`` for fully-NULL columns and unknown types
-    — DuckDB will widen on insert if the data is heterogeneous, and
-    callers wanting strict types should cast on the source side."""
+
+def _infer_legacy_column_type(
+    values: Sequence[object],
+    column: str,
+    fragment_index: int | None,
+) -> str:
+    if all(type(value) is bool for value in values):
+        return "BOOLEAN"
+    if any(type(value) is bool for value in values):
+        _incompatible_legacy_schema(column, fragment_index)
+
+    if all(isinstance(value, (int, float, Decimal)) for value in values):
+        has_float = any(isinstance(value, float) for value in values)
+        decimals = [value for value in values if isinstance(value, Decimal)]
+        if has_float and decimals:
+            _incompatible_legacy_schema(column, fragment_index)
+        if has_float:
+            return "DOUBLE"
+        if not decimals:
+            int_values = [value for value in values if isinstance(value, int)]
+            minimum = min(int_values)
+            maximum = max(int_values)
+            if minimum >= -(2**63) and maximum < 2**63:
+                return "BIGINT"
+            if minimum >= -(2**127) and maximum < 2**127:
+                return "HUGEINT"
+            _incompatible_legacy_schema(
+                column,
+                fragment_index,
+                reason="physical_schema_unsupported",
+                message="Legacy integer values exceed DuckDB's lossless binding range.",
+            )
+
+        if any(not value.is_finite() for value in decimals):
+            if all(isinstance(value, Decimal) and not value.is_finite() for value in values):
+                return "DOUBLE"
+            _incompatible_legacy_schema(column, fragment_index)
+
+        scale = 0
+        integer_digits = 0
+        for decimal_value in decimals:
+            _, digits, exponent = decimal_value.as_tuple()
+            exponent = cast(int, exponent)
+            value_scale = max(-exponent, 0)
+            scale = max(scale, value_scale)
+            integer_digits = max(integer_digits, len(digits) + max(exponent, 0) - value_scale)
+        for observed_value in values:
+            if isinstance(observed_value, int):
+                value_digits = (
+                    39 if abs(observed_value) >= 10**38 else len(str(abs(observed_value)))
+                )
+                integer_digits = max(integer_digits, value_digits)
+        precision = max(integer_digits + scale, scale, 1)
+        if precision > 38:
+            _incompatible_legacy_schema(
+                column,
+                fragment_index,
+                reason="physical_schema_unsupported",
+                message="Legacy decimal values exceed DuckDB's lossless precision limit.",
+            )
+        return f"DECIMAL({precision},{scale})"
+
+    observed_types = {_duckdb_type_for(value, column, fragment_index) for value in values}
+    if len(observed_types) == 1:
+        return observed_types.pop()
+    if observed_types.issubset({"DATE", "TIMESTAMP"}):
+        return "TIMESTAMP"
+    _incompatible_legacy_schema(column, fragment_index)
+
+
+def _infer_column_types(
+    columns: list[str],
+    rows: list[tuple[Any, ...]],
+    column_types: Sequence[str | None] | None = None,
+    *,
+    fragment_index: int | None = None,
+) -> list[str]:
+    """Resolve declared types, using all observed values only for legacy adapters."""
+    if column_types is not None and len(column_types) != len(columns):
+        raise ExecutionContractError(
+            "Adapter physical schema does not match its columns.",
+            reason="physical_schema_invalid",
+            artifact=f"fragment_{fragment_index}" if fragment_index is not None else "fragment",
+            operation="merge",
+            stage="materialization",
+        )
     types: list[str] = []
-    for col_idx in range(len(columns)):
-        chosen = "VARCHAR"
-        for row in rows:
-            v = row[col_idx]
-            if v is None:
-                continue
-            chosen = _duckdb_type_for(v)
-            break
-        types.append(chosen)
+    for col_idx, column in enumerate(columns):
+        declared = column_types[col_idx] if column_types is not None else None
+        if declared is not None:
+            types.append(_duckdb_declared_type(declared, column, fragment_index))
+            continue
+        values = [row[col_idx] for row in rows if row[col_idx] is not None]
+        if not values:
+            raise ExecutionContractError(
+                "Adapter omitted physical type metadata for an empty or all-NULL column.",
+                reason="physical_schema_missing",
+                artifact=f"fragment_{fragment_index}" if fragment_index is not None else "fragment",
+                names=(column,),
+                operation="merge",
+                stage="materialization",
+            )
+        types.append(_infer_legacy_column_type(values, column, fragment_index))
     return types
 
 
-def _duckdb_type_for(value: Any) -> str:  # noqa: ANN401 — any row value
-    """Map a Python value to a DuckDB type literal.
+def _duckdb_declared_type(
+    value: str,
+    column: str,
+    fragment_index: int | None,
+) -> str:
+    raw = " ".join(value.strip().upper().split())
+    while True:
+        for wrapper in ("NULLABLE", "LOWCARDINALITY"):
+            prefix = wrapper + "("
+            if raw.startswith(prefix) and raw.endswith(")"):
+                raw = raw[len(prefix) : -1].strip()
+                break
+        else:
+            break
+    aliases = {
+        "INT8": "TINYINT",
+        "INT16": "SMALLINT",
+        "INT32": "INTEGER",
+        "INT64": "BIGINT",
+        "UINT8": "UTINYINT",
+        "UINT16": "USMALLINT",
+        "UINT32": "UINTEGER",
+        "UINT64": "UBIGINT",
+        "FLOAT32": "FLOAT",
+        "FLOAT64": "DOUBLE",
+        "BOOL": "BOOLEAN",
+        "STRING": "VARCHAR",
+        "BYTES": "BLOB",
+        "DATETIME": "TIMESTAMP",
+    }
+    raw = aliases.get(raw, raw)
+    if raw.startswith(("DECIMAL(", "NUMERIC(")) and raw.endswith(")"):
+        body = raw[raw.index("(") + 1 : -1]
+        parts = [part.strip() for part in body.split(",")]
+        if len(parts) == 2 and all(part.isdigit() for part in parts):
+            precision, scale = map(int, parts)
+            if precision >= 1 and 0 <= scale <= precision:
+                if precision > 38:
+                    _incompatible_legacy_schema(
+                        column,
+                        fragment_index,
+                        reason="physical_schema_unsupported",
+                        message="Declared decimal precision exceeds DuckDB's lossless limit.",
+                    )
+                return f"DECIMAL({precision},{scale})"
+    allowed = {
+        "BOOLEAN",
+        "TINYINT",
+        "SMALLINT",
+        "INTEGER",
+        "BIGINT",
+        "HUGEINT",
+        "UTINYINT",
+        "USMALLINT",
+        "UINTEGER",
+        "UBIGINT",
+        "FLOAT",
+        "REAL",
+        "DOUBLE",
+        "DATE",
+        "TIME",
+        "TIMESTAMP",
+        "TIMESTAMPTZ",
+        "TIMESTAMP WITH TIME ZONE",
+        "VARCHAR",
+        "CHAR",
+        "BLOB",
+        "UUID",
+        "JSON",
+        "BIGNUM",
+    }
+    if raw in allowed:
+        return raw
+    raise ExecutionContractError(
+        "Adapter declared a physical type that DuckDB cannot safely materialize.",
+        reason="physical_schema_unsupported",
+        artifact=f"fragment_{fragment_index}" if fragment_index is not None else "fragment",
+        names=(column,),
+        operation="merge",
+        stage="materialization",
+    )
 
-    Order matters: ``bool`` is a subclass of ``int`` in Python, check
-    it first."""
+
+def _duckdb_type_for(
+    value: object,
+    column: str,
+    fragment_index: int | None,
+) -> str:
+    """Infer supported legacy-adapter types without coercing unknowns to text."""
     import datetime as _dt
 
     if isinstance(value, bool):
@@ -883,6 +1213,21 @@ def _duckdb_type_for(value: Any) -> str:  # noqa: ANN401 — any row value
         return "BIGINT"
     if isinstance(value, float):
         return "DOUBLE"
+    if isinstance(value, Decimal):
+        if not value.is_finite():
+            return "DOUBLE"
+        _, digits, exponent = value.as_tuple()
+        exponent = cast(int, exponent)
+        scale = max(-exponent, 0)
+        precision = max(len(digits) + max(exponent, 0), scale, 1)
+        if precision <= 38:
+            return f"DECIMAL({precision},{scale})"
+        _incompatible_legacy_schema(
+            column,
+            fragment_index,
+            reason="physical_schema_unsupported",
+            message="Legacy decimal values exceed DuckDB's lossless precision limit.",
+        )
     if isinstance(value, str):
         return "VARCHAR"
     if isinstance(value, _dt.datetime):
@@ -893,7 +1238,14 @@ def _duckdb_type_for(value: Any) -> str:  # noqa: ANN401 — any row value
         return "TIME"
     if isinstance(value, bytes):
         return "BLOB"
-    return "VARCHAR"
+    raise ExecutionContractError(
+        "Adapter omitted physical type metadata for a value the engine cannot infer.",
+        reason="physical_schema_missing",
+        artifact=f"fragment_{fragment_index}" if fragment_index is not None else "fragment",
+        names=(column,),
+        operation="merge",
+        stage="materialization",
+    )
 
 
 def _quote(name: str) -> str:
@@ -914,14 +1266,18 @@ def _load_fragment_into(
     index: int,
     columns: list[str],
     rows: list[tuple[Any, ...]],
+    column_types: list[str | None] | None = None,
+    *,
+    fragment_index: int | None = None,
 ) -> None:
-    """Materialise a fragment's rows into ``frag_<index>`` on ``con``.
-
-    Infers a DuckDB type per column from the first non-NULL value, then
-    ``executemany``s the rows. Empty result sets get a VARCHAR-typed
-    table (no per-column type info in the adapter contract)."""
+    """Materialise fragment rows using declared schema or safe legacy inference."""
     col_idents = ", ".join(_quote(c) for c in columns)
-    types = _infer_column_types(columns, rows)
+    types = _infer_column_types(
+        columns,
+        rows,
+        column_types,
+        fragment_index=fragment_index if fragment_index is not None else index,
+    )
     type_decls = ", ".join(f"{_quote(c)} {t}" for c, t in zip(columns, types, strict=True))
     con.execute(f"CREATE TABLE frag_{index} ({type_decls})")
     if not rows:
@@ -1029,15 +1385,10 @@ class AsyncEngine:
         merge_sql, merge_params = _preflight(plan)
         self._adapters_present(plan)
         _assert_fragments_read_only(plan)
-        results = [
-            _materialize_result(result)
-            for result in await asyncio.gather(
-                *(
-                    self._adapters[frag.dialect].execute(frag.sql, frag.params)
-                    for frag in plan.fragments
-                )
-            )
-        ]
+        adapter_results = await _gather_owned(
+            self._adapters[frag.dialect].execute(frag.sql, frag.params) for frag in plan.fragments
+        )
+        results = _materialize_results(adapter_results)
         for i, (fragment, result) in enumerate(zip(plan.fragments, results, strict=True)):
             self._validate_result(i, fragment, result)
         evidence = _validate_merge_keys(plan.merge_spec, results)
@@ -1067,7 +1418,9 @@ class AsyncEngine:
 
         with self._merge_con(len(plan.fragments)) as con:
             for i, result in enumerate(results):
-                _load_fragment_into(con, i, result.columns, list(result.rows))
+                _load_fragment_into(
+                    con, i, result.columns, list(result.rows), result.column_types, fragment_index=i
+                )
             self._warn_inline_once()
             cursor = con.execute(merge_sql, dict(merge_params))
             columns = [item[0] for item in cursor.description]
@@ -1112,40 +1465,50 @@ class AsyncEngine:
                 adapter_result = await self._adapters[fragment.dialect].execute(
                     fragment.sql, fragment.params
                 )
-                self._validate_result(0, fragment, adapter_result)
-                if plan.merge_spec.merge_key_requirements:
-                    materialized_result = _materialize_result(adapter_result)
-                    stream.validation_evidence = _validate_merge_keys(
-                        plan.merge_spec, [materialized_result]
-                    )
-                    row_iter: Iterator[Sequence[Any]] = iter(materialized_result.rows)
-                else:
+                row_iter: Iterator[Sequence[Any]] | None = None
+                try:
                     row_iter = iter(adapter_result.rows)
-                while True:
-                    chunk: list[tuple[Any, ...]] = []
-                    for _ in range(chunk_rows):
-                        try:
-                            chunk.append(tuple(next(row_iter)))
-                        except StopIteration:
-                            break
-                    if not chunk:
-                        return
-                    yield chunk
+                    self._validate_result(0, fragment, adapter_result)
+                    if plan.merge_spec.merge_key_requirements:
+                        materialized_result = _materialize_result(
+                            AdapterResult(
+                                columns=adapter_result.columns,
+                                rows=row_iter,
+                                column_types=adapter_result.column_types,
+                            )
+                        )
+                        row_iter = iter(materialized_result.rows)
+                        stream.validation_evidence = _validate_merge_keys(
+                            plan.merge_spec, [materialized_result]
+                        )
+                    while True:
+                        chunk: list[tuple[Any, ...]] = []
+                        for _ in range(chunk_rows):
+                            try:
+                                chunk.append(tuple(next(row_iter)))
+                            except StopIteration:
+                                break
+                        if not chunk:
+                            return
+                        yield chunk
+                finally:
+                    if row_iter is not None:
+                        _close_iterator(row_iter)
 
-            adapter_results: list[AdapterResult] = await asyncio.gather(
-                *(
-                    self._adapters[frag.dialect].execute(frag.sql, frag.params)
-                    for frag in plan.fragments
-                )
+            adapter_results = await _gather_owned(
+                self._adapters[frag.dialect].execute(frag.sql, frag.params)
+                for frag in plan.fragments
             )
-            results = [_materialize_result(result) for result in adapter_results]
+            results = _materialize_results(adapter_results)
             for i, (fragment, result) in enumerate(zip(plan.fragments, results, strict=True)):
                 self._validate_result(i, fragment, result)
             stream.validation_evidence = _validate_merge_keys(plan.merge_spec, results)
 
             with self._merge_con(len(plan.fragments)) as con:
                 for i, result in enumerate(results):
-                    _load_fragment_into(con, i, result.columns, result.rows)
+                    _load_fragment_into(
+                        con, i, result.columns, result.rows, result.column_types, fragment_index=i
+                    )
                 self._warn_inline_once()
                 cursor = con.execute(merge_sql, dict(merge_params))
                 columns = [item[0] for item in cursor.description]

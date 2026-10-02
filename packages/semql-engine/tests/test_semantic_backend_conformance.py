@@ -42,6 +42,7 @@ from semql import (
     compile_query,
 )
 from semql.compile import CompiledQuery
+from semql.model import DimTypeLiteral
 from semql_engine import AdapterResult, DBAPIAdapter, DuckDBAdapter, DuckDBMergeEngine, Engine
 from semql_engine.adapter import Adapter
 from testcontainers.core.container import DockerContainer
@@ -83,6 +84,7 @@ class _HTTPClickHouse:
         return AdapterResult(
             columns=columns,
             rows=[tuple(row[column] for column in columns) for row in payload["data"]],
+            column_types=[str(item["type"]) for item in payload["meta"]],
         )
 
 
@@ -694,3 +696,190 @@ def test_real_time_range_excludes_its_half_open_end(backend: _Backend) -> None:
     time_column = compiled.columns[0]
     assert str(rows[0][time_column])[:10] == "2023-12-01"
     assert float(rows[0]["amount"]) == 0
+
+
+@pytest.mark.parametrize(
+    ("start", "end", "expected"),
+    [
+        ("2024-01-02T12:00:00", "2024-01-03T12:00:00", {"2024-01-02": 0, "2024-01-03": 120}),
+        ("2024-01-02T12:00:00", "2024-01-03T00:00:00", {"2024-01-02": 0}),
+        ("2024-01-03T00:00:00", "2024-01-03T12:00:00", {"2024-01-03": 120}),
+    ],
+)
+def test_dense_spine_preserves_intersecting_buckets(
+    backend: _Backend, start: str, end: str, expected: dict[str, int]
+) -> None:
+    compiled = backend.compile(
+        SemanticQuery(
+            measures=["events.amount"],
+            time_dimension=TimeWindow(
+                dimension="events.at", granularity="day", range=(start, end), fill_nulls_with=0
+            ),
+        )
+    )
+    rows = backend.rows(compiled)
+    bucket = compiled.columns[0]
+    assert {str(row[bucket])[:10]: float(row["amount"]) for row in rows} == expected
+
+
+def test_dense_derived_schema_and_numeric_meaning(backend: _Backend) -> None:
+    compiled = backend.compile(
+        SemanticQuery(
+            measures=["events.amount"],
+            derived_measures=[
+                InlineDerived(name="per_event", op="ratio", operands=["events.amount", "events.n"])
+            ],
+            time_dimension=TimeWindow(
+                dimension="events.at",
+                granularity="day",
+                range=("2024-01-01", "2024-01-04"),
+                fill_nulls_with=0,
+            ),
+        )
+    )
+    result = backend.adapter.execute(compiled.sql, compiled.params)
+    names = compiled.columns
+    assert result.columns == names
+    assert [output.sql_alias for output in compiled.analysis.outputs] == names
+    rows = [tuple(row) for row in result.rows]
+    assert all(len(row) == len(names) for row in rows)
+    by_day = {str(row[0])[:10]: row[1:] for row in rows}
+    assert float(by_day["2024-01-01"][0]) == 30
+    assert float(by_day["2024-01-01"][1]) == 15
+    assert by_day["2024-01-02"] == (0, None)
+    assert float(by_day["2024-01-03"][0]) == 120
+    assert float(by_day["2024-01-03"][1]) == 60
+
+
+@pytest.mark.parametrize(
+    ("facet", "threshold", "expected"),
+    [
+        ("current", 7, {"negative", "positive"}),
+        ("prior", 0, {"positive"}),
+        ("delta", 20, {"negative"}),
+        ("pct_change", 0, {"positive"}),
+    ],
+)
+def test_comparison_output_filters_execute(
+    backend: _Backend, facet: str, threshold: int, expected: set[str]
+) -> None:
+    compiled = backend.compile(
+        SemanticQuery(
+            dimensions=["events.region"],
+            measures=["events.amount"],
+            time_dimension=TimeWindow(dimension="events.at", range=("2024-01-01", "2024-02-01")),
+            compare=CompareWindow(mode="explicit", range=("2023-12-01", "2024-01-01")),
+            having=[Filter(dimension=f"compare.amount.{facet}", op="gt", values=[threshold])],
+        ),
+        table="comparisons",
+    )
+    assert {row["region"] for row in backend.rows(compiled)} == expected
+
+
+def test_comparison_null_group_identity(backend: _Backend) -> None:
+    table = f"{backend.prefix}nullable_groups"
+    if backend.dialect == Dialect.CLICKHOUSE:
+        backend.setup(
+            f"CREATE TABLE {table} (region Nullable(String), amount Nullable(Float64), "
+            "occurred_at DateTime) ENGINE=Memory"
+        )
+    else:
+        backend.setup(
+            f"CREATE TABLE {table} (region VARCHAR, amount DOUBLE PRECISION, occurred_at TIMESTAMP)"
+        )
+    backend.setup(
+        f"INSERT INTO {table} VALUES "
+        "(NULL,5,'2024-01-01 00:00:00'), (NULL,2,'2023-12-01 00:00:00'), "
+        "('EU',7,'2024-01-01 00:00:00'), ('EU',4,'2023-12-01 00:00:00'), "
+        "('old',3,'2023-12-01 00:00:00'), ('new',11,'2024-01-01 00:00:00')"
+    )
+    compiled = backend.compile(
+        SemanticQuery(
+            dimensions=["events.region"],
+            measures=["events.amount"],
+            time_dimension=TimeWindow(dimension="events.at", range=("2024-01-01", "2024-02-01")),
+            compare=CompareWindow(mode="explicit", range=("2023-12-01", "2024-01-01")),
+        ),
+        table="nullable_groups",
+    )
+    rows = backend.rows(compiled)
+    by_region = {row["region"]: row for row in rows}
+    assert len(rows) == len(by_region) == 4
+    null_group = by_region[None]
+    assert float(null_group["amount_current"]) == 5
+    assert float(null_group["amount_prior"]) == 2
+    assert float(null_group["amount_delta"]) == 3
+    assert float(null_group["amount_pct_change"]) == 150
+    assert float(by_region["EU"]["amount_delta"]) == 3
+    assert by_region["old"]["amount_current"] is None
+    assert by_region["new"]["amount_prior"] is None
+
+
+@pytest.mark.parametrize(
+    ("kind", "sql_type", "clickhouse_type", "sentinel", "other"),
+    [
+        ("string", "VARCHAR", "String", "''", "'other'"),
+        ("number", "INTEGER", "Int32", "0", "1"),
+        ("bool", "BOOLEAN", "Bool", "FALSE", "TRUE"),
+        ("date", "DATE", "Date", "'1970-01-01'", "'2020-01-01'"),
+        ("time", "TIMESTAMP", "DateTime", "'1970-01-01 00:00:00'", "'2020-01-01 00:00:00'"),
+        (
+            "uuid",
+            "UUID",
+            "UUID",
+            "'00000000-0000-0000-0000-000000000000'",
+            "'11111111-1111-1111-1111-111111111111'",
+        ),
+    ],
+)
+def test_nullable_comparison_keys_do_not_collide_with_typed_sentinels(
+    backend: _Backend,
+    kind: DimTypeLiteral,
+    sql_type: str,
+    clickhouse_type: str,
+    sentinel: str,
+    other: str,
+) -> None:
+    table = f"{backend.prefix}comparison_keys_{kind}"
+    if backend.dialect == Dialect.CLICKHOUSE:
+        backend.setup(
+            f"CREATE TABLE {table} (group_key Nullable({clickhouse_type}), "
+            "amount Nullable(Float64), occurred_at DateTime) ENGINE=Memory"
+        )
+    else:
+        backend.setup(
+            f"CREATE TABLE {table} (group_key {sql_type}, "
+            "amount DOUBLE PRECISION, occurred_at TIMESTAMP)"
+        )
+    backend.setup(
+        f"INSERT INTO {table} VALUES "
+        "(NULL,5,'2024-01-01 00:00:00'), (NULL,2,'2023-12-01 00:00:00'), "
+        f"({sentinel},7,'2024-01-01 00:00:00'), ({sentinel},4,'2023-12-01 00:00:00'), "
+        f"({other},11,'2024-01-01 00:00:00'), ({other},1,'2023-12-01 00:00:00')"
+    )
+    cube = Cube(
+        name="keys",
+        table=table,
+        alias="e",
+        dialect=backend.dialect,
+        dimensions=[Dimension(name="key", sql="{e}.group_key", type=kind)],
+        measures=[Measure(name="amount", sql="{e}.amount", agg="sum")],
+        time_dimensions=[TimeDimension(name="at", sql="{e}.occurred_at")],
+    )
+    compiled = Catalog([cube]).compile(
+        SemanticQuery(
+            dimensions=["keys.key"],
+            measures=["keys.amount"],
+            time_dimension=TimeWindow(dimension="keys.at", range=("2024-01-01", "2024-02-01")),
+            compare=CompareWindow(mode="explicit", range=("2023-12-01", "2024-01-01")),
+        )
+    )
+    rows = backend.rows(compiled)
+    assert len(rows) == 3
+    assert sum(row["key"] is None for row in rows) == 1
+    assert {
+        tuple(
+            float(row[f"amount_{facet}"]) for facet in ("current", "prior", "delta", "pct_change")
+        )
+        for row in rows
+    } == {(5, 2, 3, 150), (7, 4, 3, 75), (11, 1, 10, 1000)}

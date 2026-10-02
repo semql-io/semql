@@ -23,12 +23,19 @@ anything the platform shouldn't know about. Round-trips through
 from __future__ import annotations
 
 import re
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from enum import StrEnum
-from typing import Annotated, Any, Literal, cast
+from typing import Annotated, Any, Literal, Self, cast, overload
 
 import sqlglot
-from pydantic import AfterValidator, BaseModel, ConfigDict, Field, model_validator
+from pydantic import (
+    AfterValidator,
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_serializer,
+    model_validator,
+)
 
 from semql._grounding import (
     validate_keywords as _grounding_validate_keywords,
@@ -188,7 +195,7 @@ TenancyMode = Literal["schema", "discriminator", "none"]
 
 # k8s-annotation style: opaque string→string map. SemQL never touches
 # the contents — the user owns the namespace and meaning.
-Metadata = dict[str, str]
+Metadata = Mapping[str, str]
 
 # ``{ctx.X}`` placeholder keys inside ``security_sql`` — must mirror the
 # ``_CTX_PLACEHOLDER_RE`` the compiler resolves with, so construction-time
@@ -232,51 +239,175 @@ def _as_raw_sql(value: str) -> RawSQL:
 _Raw = Annotated[str, AfterValidator(_as_raw_sql)]
 
 
-def _freeze(value: object) -> object:
-    """Recursively turn a field value into a hashable, order-normalised key.
+class _FrozenSequence(Sequence[object]):
+    """An immutable sequence with list-compatible equality and indexing."""
 
-    Mirrors :class:`_HashableModel`'s contract: equal field values produce
-    equal frozen keys, so equal models hash equal. ``dict`` items are
-    sorted by key (insertion order is not part of value identity); ``set``
-    becomes a ``frozenset``; nested models recurse through their fields.
+    __slots__ = ("_items",)
+    _items: tuple[object, ...]
 
-    >>> from semql.model import _freeze
-    >>> _freeze({"b": 1, "a": 2}) == _freeze({"a": 2, "b": 1})
-    True
-    >>> _freeze([1, 2, 3])
-    (1, 2, 3)
-    """
+    def __init__(self, values: Sequence[object]) -> None:
+        object.__setattr__(self, "_items", tuple(_freeze_container(value) for value in values))
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise TypeError("frozen sequence")
+
+    @overload
+    def __getitem__(self, index: int) -> object: ...
+
+    @overload
+    def __getitem__(self, index: slice) -> Sequence[object]: ...
+
+    def __getitem__(self, index: int | slice) -> object:
+        result = self._items[index]
+        if isinstance(index, slice):
+            return _FrozenSequence(cast(Sequence[object], result))
+        return result
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+    def __add__(self, other: Sequence[object]) -> _FrozenSequence:
+        return _FrozenSequence((*self._items, *other))
+
+    def __radd__(self, other: Sequence[object]) -> _FrozenSequence:
+        return _FrozenSequence((*other, *self._items))
+
+    def copy(self) -> list[object]:
+        return list(self._items)
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, Sequence) and not isinstance(other, (str, bytes)):
+            return self._items == tuple(cast(Sequence[object], other))
+        return NotImplemented
+
+
+class _FrozenMapping(Mapping[object, object]):
+    """An immutable mapping detached from caller-owned mutable inputs."""
+
+    __slots__ = ("_items",)
+    _items: Mapping[object, object]
+
+    def __init__(self, values: Mapping[object, object]) -> None:
+        from types import MappingProxyType
+
+        items = {_freeze_container(key): _freeze_container(value) for key, value in values.items()}
+        object.__setattr__(self, "_items", MappingProxyType(items))
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise TypeError("frozen mapping")
+
+    def __getitem__(self, key: object) -> object:
+        return self._items[key]
+
+    def __iter__(self) -> Iterator[object]:
+        return iter(self._items)
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+    def copy(self) -> dict[object, object]:
+        return dict(self.items())
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, Mapping):
+            return dict(self.items()) == dict(cast(Mapping[object, object], other).items())
+        return NotImplemented
+
+
+def _freeze_container(value: object) -> object:
+    """Detach and recursively freeze every mutable model-field container."""
     if isinstance(value, BaseModel):
-        return (
-            type(value).__name__,
-            tuple(_freeze(getattr(value, n)) for n in type(value).model_fields),
-        )
-    # ``value`` is ``object``; isinstance-narrowing to a bare container
-    # leaves the element type unknown, but every element is itself an
-    # ``object`` we recurse into — cast says so explicitly.
-    if isinstance(value, (list, tuple)):
-        return tuple(_freeze(v) for v in cast("Sequence[object]", value))
-    if isinstance(value, dict):
-        items = cast("dict[str, object]", value).items()
-        return tuple(sorted((k, _freeze(v)) for k, v in items))
+        return value
+    if isinstance(value, Mapping):
+        return _FrozenMapping(cast(Mapping[object, object], value))
+    if isinstance(value, list):
+        return _FrozenSequence(cast(list[object], value))
+    if isinstance(value, tuple):
+        return tuple(_freeze_container(item) for item in cast(tuple[object, ...], value))
     if isinstance(value, (set, frozenset)):
-        return frozenset(_freeze(v) for v in cast("frozenset[object]", value))
+        items = cast(set[object] | frozenset[object], value)
+        return frozenset(_freeze_container(item) for item in items)
     return value
 
 
-class _HashableModel(BaseModel):
-    """Base for frozen catalog models that restores the frozen→hashable
-    contract.
+def _thaw_container(value: object) -> object:
+    """Return ordinary JSON/model-validation containers for public dumps."""
+    if isinstance(value, Mapping):
+        return {
+            key: _thaw_container(item) for key, item in cast(Mapping[object, object], value).items()
+        }
+    if isinstance(value, _FrozenSequence):
+        return [_thaw_container(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_thaw_container(item) for item in cast(tuple[object, ...], value))
+    if isinstance(value, frozenset):
+        return frozenset(_thaw_container(item) for item in cast(frozenset[object], value))
+    return value
 
-    ``ConfigDict(frozen=True)`` is meant to make a model hashable, but
-    Pydantic's generated ``__hash__`` hashes the raw field tuple and so
-    raises ``unhashable type: 'list'`` / ``'dict'`` for any model carrying
-    a collection field — which is most of them. We override ``__hash__``
-    with a recursive value-based hash (:func:`_freeze`) so a ``Measure``
-    can go in a ``set`` and a ``Join`` can be a dict key. Pydantic respects
-    an inherited ``__hash__`` (it does not regenerate one when the subclass
-    redeclares ``frozen=True``), and equality stays Pydantic's field-wise
-    ``__eq__`` — so equal models still hash equal."""
+
+def _freeze(value: object) -> object:
+    """Create a stable hash key or reject values whose state can change."""
+    if isinstance(value, FrozenModel):
+        return (
+            type(value),
+            tuple(_freeze(getattr(value, name)) for name in type(value).model_fields),
+        )
+    if isinstance(value, BaseModel):
+        raise TypeError(
+            f"cannot hash a frozen catalog value containing mutable model {type(value).__name__}"
+        )
+    if isinstance(value, _FrozenMapping):
+        return tuple(sorted((_freeze(key), _freeze(item)) for key, item in value.items()))
+    if isinstance(value, _FrozenSequence):
+        return tuple(_freeze(item) for item in value)
+    if isinstance(value, tuple):
+        return tuple(_freeze(item) for item in cast(tuple[object, ...], value))
+    if isinstance(value, frozenset):
+        return frozenset(_freeze(item) for item in cast(frozenset[object], value))
+    if isinstance(value, (Mapping, list, set)):
+        kind = type(cast(object, value)).__name__
+        raise TypeError(f"cannot hash a frozen catalog value containing mutable {kind}")
+    if isinstance(value, (str, bytes, int, float, bool, complex, type(None), StrEnum)):
+        return value
+    raise TypeError(f"cannot hash mutable or unsupported value of type {type(value).__name__}")
+
+
+class FrozenModel(BaseModel):
+    """Pydantic model base that detaches and freezes nested containers."""
+
+    model_config = ConfigDict(frozen=True)
+
+    @model_validator(mode="after")
+    def _freeze_nested_containers(self) -> Self:
+        for name in type(self).model_fields:
+            value = getattr(self, name)
+            frozen = _freeze_container(value)
+            if frozen is not value:
+                object.__setattr__(self, name, frozen)
+        return self
+
+    @field_serializer("*", check_fields=False, when_used="always")
+    def _serialize_frozen_containers(self, value: object) -> object:
+        return _thaw_container(value)
+
+    def model_copy(
+        self,
+        *,
+        update: Mapping[str, object] | None = None,
+        deep: bool = False,
+    ) -> Self:
+        data = self.model_dump(mode="python")
+        if update:
+            data.update(update)
+        if deep:
+            from copy import deepcopy
+
+            data = deepcopy(data)
+        return type(self).model_validate(data)
+
+
+class _HashableModel(FrozenModel):
+    """Frozen catalog values hash from their recursively immutable values."""
 
     def __hash__(self) -> int:
         return hash(
@@ -311,7 +442,7 @@ class BaseField(_HashableModel):
     # the field is open to all viewers who can see the cube. Compiled
     # errors for missing roles are indistinguishable from "field
     # doesn't exist" so callers can't infer the field exists.
-    required_roles: list[str] = Field(default_factory=list)
+    required_roles: Sequence[str] = Field(default_factory=list)
 
     @property
     def kind(self) -> str:
@@ -395,7 +526,7 @@ class Measure(BaseField):
     # a string → a SQL literal (``'REDACTED'``, ``'0'``, etc.). The
     # constructor enforces ``mask_roles ⊆ required_roles`` — you
     # can't mask a role that can't even see the field.
-    mask_roles: list[str] = Field(default_factory=list)
+    mask_roles: Sequence[str] = Field(default_factory=list)
     mask_value: _Raw | None = None
 
     @model_validator(mode="after")
@@ -444,7 +575,7 @@ class Dimension(BaseField):
     # repetition. An explicit Join with the same ``to`` wins.
     foreign_key: str | None = None
     # Field-level masking. Same shape as Measure.mask_*.
-    mask_roles: list[str] = Field(default_factory=list)
+    mask_roles: Sequence[str] = Field(default_factory=list)
     mask_value: _Raw | None = None
     # Input aliases. An LLM might emit ``territory`` /
     # ``zone`` / ``area`` when the catalog names the dimension
@@ -453,7 +584,7 @@ class Dimension(BaseField):
     # only (no alias listing — the planner learns the canonical).
     # The field-hide / mask gates apply on the canonical
     # field; an alias is a synonym, not a separate auth surface.
-    aliases: list[str] = Field(default_factory=list)
+    aliases: Sequence[str] = Field(default_factory=list)
     # Cross-cube coercion opt-in. A federated bridge join whose two
     # keys have different ``type`` is refused (FederationError) rather
     # than silently coerced. ``coerce_to`` declares an *additional* type
@@ -589,10 +720,10 @@ class Rollup(_HashableModel):
     name: str
     physical_table: str
     alias: str = "r"
-    dimensions: list[str] = []
+    dimensions: Sequence[str] = ()
     time_dimension: str | None = None
     granularity: GranularityLiteral | None = None
-    measures: list[str] = []
+    measures: Sequence[str] = ()
     metadata: Metadata = Field(default_factory=dict)
 
     @model_validator(mode="after")
@@ -624,7 +755,7 @@ class GlossaryEntry(_HashableModel):
     model_config = ConfigDict(frozen=True)
     term: str
     definition: str
-    aliases: list[str] = []
+    aliases: Sequence[str] = ()
 
     @model_validator(mode="after")
     def _check_shape(self) -> GlossaryEntry:
@@ -653,7 +784,7 @@ class Join(_HashableModel):
     metadata: Metadata = Field(default_factory=dict)
 
 
-class PhysicalTable(BaseModel):
+class PhysicalTable(FrozenModel):
     """A plain ``[schema.]table`` reference.
 
     Identical in meaning to the legacy ``Cube.table`` shorthand; goes
@@ -665,7 +796,7 @@ class PhysicalTable(BaseModel):
     table: str
 
 
-class NamedCTE(BaseModel):
+class NamedCTE(FrozenModel):
     """A named CTE the compiler hoists into the outer ``WITH`` clause.
 
     A ``DerivedTable`` whose ``sql`` is a layered preamble can declare
@@ -712,7 +843,7 @@ class DerivedTable(_HashableModel):
 
     model_config = ConfigDict(frozen=True)
     sql: _Raw
-    with_ctes: list[NamedCTE] = []
+    with_ctes: Sequence[NamedCTE] = ()
 
     @model_validator(mode="after")
     def _check_unique_cte_names(self) -> DerivedTable:
@@ -767,7 +898,7 @@ class DerivedTable(_HashableModel):
 CubeSource = PhysicalTable | DerivedTable
 
 
-class TimePartition(BaseModel):
+class TimePartition(FrozenModel):
     """Declares which ``TimeDimension`` on the cube drives source
     selection when the cube has multiple ``TimePartitionedSource``s.
 
@@ -818,7 +949,7 @@ class TimePartitionedSource(_HashableModel):
     alias: str = "s"
     range_start: str | None = None
     range_end: str | None = None
-    column_renames: dict[str, str] = Field(default_factory=dict)
+    column_renames: Mapping[str, str] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def _check_range_ordering(self) -> TimePartitionedSource:
@@ -836,7 +967,7 @@ class TimePartitionedSource(_HashableModel):
         return self
 
 
-class PartitionedScan(BaseModel):
+class PartitionedScan(FrozenModel):
     """The routing metadata for a time-partitioned cube after the
     plan→plan ``apply_partition_to_plan`` transform.
 
@@ -878,7 +1009,7 @@ class PartitionedScan(BaseModel):
         return self
 
 
-class Cube(BaseModel):
+class Cube(FrozenModel):
     # Frozen like every other catalog value type (AGENTS.md): a cube must
     # not be able to drift out of sync with the catalog that validated it.
     model_config = ConfigDict(frozen=True)
@@ -912,18 +1043,18 @@ class Cube(BaseModel):
     source: CubeSource | None = None
     alias: str
     base_predicate: _Raw | None = None
-    measures: list[Measure] = []
-    dimensions: list[Dimension] = []
-    time_dimensions: list[TimeDimension] = []
-    joins: list[Join] = []
+    measures: Sequence[Measure] = ()
+    dimensions: Sequence[Dimension] = ()
+    time_dimensions: Sequence[TimeDimension] = ()
+    joins: Sequence[Join] = ()
     # Named, reusable predicates the planner can reference by name —
     # centralises business definitions instead of having the LLM
     # rederive a status / window / role filter every turn.
-    segments: list[Segment] = []
+    segments: Sequence[Segment] = ()
     # Dimensions on this cube that MUST appear in a query's `filters`
     # (any operator, any value) before the compiler will accept the
     # query.
-    required_filters: list[str] = []
+    required_filters: Sequence[str] = ()
     expose_in_prompt: bool = True
     description: str = ""
     display_name: str | None = None
@@ -946,7 +1077,7 @@ class Cube(BaseModel):
     # resolution context / ``viewer.attrs`` (a single-column cube also
     # accepts the canonical ``tenant`` key, which ``viewer.tenant``
     # populates).
-    tenancy_columns: list[str] = []
+    tenancy_columns: Sequence[str] = ()
     # Caller-attached row-level security predicate. AND-composes with
     # the tenancy filter inside the isolation subquery, so an outer
     # predicate the planner emits cannot bypass it. May contain
@@ -962,7 +1093,7 @@ class Cube(BaseModel):
     # checks the declared keys against the resolution context up front,
     # so a missing context value fails before emission with a clear
     # message instead of mid-query.
-    security_ctx_keys: list[str] = []
+    security_ctx_keys: Sequence[str] = ()
     # Names the dimension on *this* cube that uniquely identifies a row.
     # Used by the Catalog to auto-derive ``many_to_one`` Joins from
     # other cubes' ``Dimension.foreign_key`` declarations.
@@ -972,7 +1103,7 @@ class Cube(BaseModel):
     # rendering a result grouped by ``country`` show a "drill to state"
     # action. Multiple paths are allowed (alternate hierarchies). The
     # compiler ignores this field — it's pure metadata.
-    drill_paths: list[list[str]] = []
+    drill_paths: Sequence[Sequence[str]] = ()
     # Inherit measures / dimensions / time_dimensions / segments by
     # name from another cube in the same catalog. The child can
     # override a parent field by redeclaring with the same name; new
@@ -986,7 +1117,7 @@ class Cube(BaseModel):
     # and the compiler refuses queries that touch a cube the viewer
     # cannot see. Static surface — for dynamic / programmable policy
     # use ``Catalog(policy=...)``.
-    required_roles: list[str] = []
+    required_roles: Sequence[str] = ()
     # Names a ``ScopeFn`` registered on the Catalog. When set and the
     # caller passes a ``viewer``, the compiler calls the function and
     # injects the returned ``ScopePredicate`` inside this cube's
@@ -1001,19 +1132,19 @@ class Cube(BaseModel):
     # ``physical_table`` instead of ``table`` — typically orders of
     # magnitude faster on large fact tables. See :class:`Rollup` for
     # the matching rules and naming convention.
-    rollups: list[Rollup] = []
+    rollups: Sequence[Rollup] = ()
     # LLM-grounding metadata. Concrete NL questions a user might
     # literally ask of this cube — *not* templates, not noun fragments.
     # Spliced into the planner prompt (small catalog) or embedded for
     # top-k retrieval (large catalog). Surface in the MCP per-cube tool
     # description so external agents picking by capability see the
     # canonical phrasings.
-    questions: list[str] = []
+    questions: Sequence[str] = ()
     # Free-text search tokens with acronym-preserving normalisation
     # applied at validation. ``"AOV"`` stays ``"AOV"`` (all-caps tokens
     # are acronyms); other tokens lowercase. Case-insensitive dedupe;
     # first form wins. Not validated against any controlled vocab.
-    keywords: list[str] = []
+    keywords: Sequence[str] = ()
     # Cube-*internal* narrative: cardinality / FK paths, business rules
     # / gotchas ("Orders only count once payment_status='paid'"),
     # anti-patterns, lineage / freshness. Cross-cube relationships go
@@ -1043,7 +1174,7 @@ class Cube(BaseModel):
     # Mutually exclusive with ``table`` / ``source``: a cube has
     # exactly one source declaration. The two single-source variants
     # (``table`` shorthand, ``source=PhysicalTable``) are unaffected.
-    physical_sources: list[TimePartitionedSource] = []
+    physical_sources: Sequence[TimePartitionedSource] = ()
     # Routing time dimension for the partition set. Required when
     # ``physical_sources`` is non-empty; ignored otherwise. Names a
     # ``TimeDimension`` on this cube.
@@ -1206,7 +1337,7 @@ class Cube(BaseModel):
         (validation that the replacement points at a *real* cube
         happens at Catalog construction — Cube doesn't know its
         siblings)."""
-        _grounding_validate_questions("Cube", self.name, self.questions)
+        _grounding_validate_questions("Cube", self.name, list(self.questions))
         # Keyword normalisation/dedupe happens in a ``mode="before"``
         # validator (``_normalise_keywords``) because Cube is frozen and
         # an after-validator can't reassign ``self.keywords``.
@@ -1421,7 +1552,7 @@ class ScopePredicate(_HashableModel):
 
     model_config = ConfigDict(frozen=True)
     sql: _Raw
-    ctx_keys: list[str] = Field(default_factory=list)
+    ctx_keys: Sequence[str] = Field(default_factory=list)
 
 
 class AuthContext(_HashableModel):
@@ -1459,13 +1590,13 @@ class AuthContext(_HashableModel):
     # ``None`` means the identity carries no tenant — a cube that requires
     # tenancy then refuses unless the value is supplied via ``context``.
     tenant: str | None = None
-    roles: list[str] = Field(default_factory=list)
+    roles: Sequence[str] = Field(default_factory=list)
     metadata: Metadata = Field(default_factory=dict)
     # Typed bag for arbitrary JWT claims / auth attributes. Unlike
     # ``metadata`` (str→str), ``attrs`` preserves the original types
     # (list, bool, int) so ScopeFns can branch on structured claim values
     # without decoding them from strings first.
-    attrs: dict[str, Any] = Field(default_factory=dict)
+    attrs: Mapping[str, Any] = Field(default_factory=dict)
 
 
 class ResolutionContext(_HashableModel):
@@ -1479,7 +1610,7 @@ class ResolutionContext(_HashableModel):
 
     model_config = ConfigDict(frozen=True)
     viewer: AuthContext | None = None
-    context: dict[str, str] = Field(default_factory=dict)
+    context: Mapping[str, str] = Field(default_factory=dict)
 
 
 LookupValues = Sequence[str] | Mapping[str, str]
@@ -1593,7 +1724,7 @@ class Lookup(_HashableModel):
     # Optional human label per value. ``("EMEA",)`` + ``{"EMEA": "Europe,
     # Middle East & Africa"}`` renders both the canonical id and the label.
     # Loader-backed lookups can return a Mapping to populate this dynamically.
-    labels: dict[str, str] | None = None
+    labels: Mapping[str, str] | None = None
     # Vocabulary loader (prompt-time). Mutually exclusive with ``values``.
     loader: LookupLoader | None = None
     # Post-query enricher. Orthogonal to vocabulary; never feeds the prompt.
@@ -1648,7 +1779,7 @@ class View(_HashableModel):
 
     model_config = ConfigDict(frozen=True)
     name: str
-    fields: dict[str, str]
+    fields: Mapping[str, str]
     description: str = ""
     display_name: str | None = None
     metadata: Metadata = Field(default_factory=dict)
@@ -1728,23 +1859,23 @@ class Entity(_HashableModel):
         vocabulary.
     """
 
-    model_config = ConfigDict(frozen=True)
+    entity_type: str = Field(default="entity", pattern="^entity$")
     name: str
-    cubes: list[str]
+    cubes: Sequence[str]
     key: str | None = None
     description: str = ""
     display_name: str | None = None
-    questions: list[str] = Field(default_factory=list)
-    keywords: list[str] = Field(default_factory=list)
+    questions: Sequence[str] = Field(default_factory=list)
+    keywords: Sequence[str] = Field(default_factory=list)
     metadata: Metadata = Field(default_factory=dict)
-    fields: dict[str, str] = Field(default_factory=dict)
+    fields: Mapping[str, str] = Field(default_factory=dict)
     # Read surface (row-mode fetch/list). ``list_filters`` allowlists the
     # qualified ``cube.dim`` references an ``EntityList`` may filter on;
     # anything not listed routes to the analytic layer. ``default_order``
     # is the ``"cube.dim [asc|desc]"`` ordering a list falls back to (and
     # the keyset-cursor anchor). Both are format-checked here and
     # resolved against real dimensions by the Catalog.
-    list_filters: list[str] = Field(default_factory=list)
+    list_filters: Sequence[str] = Field(default_factory=list)
     default_order: str | None = None
     # When True, this entity is served by a row-capable adapter (REST/KV/
     # custom store), not by raw-SQL execution. Two consequences (D1/§4):
@@ -1857,8 +1988,8 @@ class Entity(_HashableModel):
         # refuses assignment to a frozen model, so we call the validators
         # only for their side-effects (empty-entry check, length cap) and
         # the caller passes a pre-deduped list.
-        _grounding_validate_questions("Entity", self.name, self.questions)
-        _grounding_validate_keywords("Entity", self.name, self.keywords)
+        _grounding_validate_questions("Entity", self.name, list(self.questions))
+        _grounding_validate_keywords("Entity", self.name, list(self.keywords))
         return self
 
 
@@ -1914,11 +2045,11 @@ class MutableEntity(Entity):
     checked here; field existence on ``target_cube`` is resolved against
     the real cube at Catalog construction."""
 
-    model_config = ConfigDict(frozen=True)
     target_cube: str
+    entity_type: str = Field(default="mutable_entity", pattern="^mutable_entity$")
     operations: frozenset[Op]
-    mutable_fields: dict[str, MutableField] = Field(default_factory=dict)
-    pinned_values: dict[str, CtxRef] = Field(default_factory=dict)
+    mutable_fields: Mapping[str, MutableField] = Field(default_factory=dict)
+    pinned_values: Mapping[str, CtxRef] = Field(default_factory=dict)
     predicate_targeting: bool = False
 
     @model_validator(mode="after")

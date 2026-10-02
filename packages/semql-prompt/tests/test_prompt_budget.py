@@ -295,3 +295,38 @@ def test_prompt_budget_trims_thousand_cube_catalog_to_fit() -> None:
     assert result.was_truncated
     assert any(d.startswith("cube:") for d in result.dropped)
     assert elapsed < 5.0
+
+
+@pytest.mark.parametrize("domain_context", [False, True])
+def test_protected_cube_relations_never_remove_cube_fields_when_unfit(
+    domain_context: bool,
+) -> None:
+    def cube(name: str, alias: str, field: str) -> Cube:
+        return Cube(
+            name=name,
+            dialect=Dialect.POSTGRES,
+            table=name,
+            alias=alias,
+            description=f"{name} " * 60,
+            relations=f"{name} relates to another source.",
+            measures=[Measure(name=field, sql=f"{{{alias}}}.amount", agg="sum")],
+        )
+
+    protected = {"orders", "returns"}
+    rendered = render_catalog_block(
+        _catalog(
+            cube("orders", "o", "revenue"),
+            cube("returns", "r", "refunds"),
+        ),
+        relations="Cross-cube relationship prose." if domain_context else "",
+    )
+    result = PromptBudget(max_tokens=1).apply(
+        rendered,
+        protected_cubes=frozenset(protected),
+    )
+
+    assert not result.fits
+    for cube_name, field_name in (("orders", "revenue"), ("returns", "refunds")):
+        assert f"### {cube_name} (postgres)" in result.text
+        assert f"{cube_name} relates to another source." in result.text
+        assert f"{cube_name}.{field_name}" in result.text

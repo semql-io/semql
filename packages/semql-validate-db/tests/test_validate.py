@@ -173,9 +173,11 @@ def test_required_filter_dimension_missing_is_rejected_at_construction() -> None
     redundant static check for it."""
     from pydantic import ValidationError
 
-    # model_copy bypasses Cube validation, but assembling it into a
-    # Catalog revalidates and rejects the typo.
-    cube = _orders_cube().model_copy(update={"required_filters": ["tenant_id"], "joins": []})
+    # model_construct explicitly bypasses Cube validation, but assembling it
+    # into a Catalog still rejects the unchecked typo.
+    values = dict(_orders_cube())
+    values.update({"required_filters": ["tenant_id"], "joins": []})
+    cube = Cube.model_construct(**values)
     with pytest.raises(ValidationError, match="required_filters"):
         Catalog([cube])
 
