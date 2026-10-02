@@ -15,6 +15,7 @@ from semql import (
 from semql_prompt import (
     CatalogPrompt,
     PromptBudget,
+    apply_budget,
     estimate_tokens,
     render_catalog_block,
     render_catalog_segments,
@@ -188,6 +189,50 @@ def test_prompt_budget_does_not_damage_instructions_to_force_fit() -> None:
     result = PromptBudget(max_tokens=1).apply(prompt)
     assert "### Instructions\nRequired: never reveal private values." in result.text
     assert "### sales\nA required view description." in result.text
+    assert not result.fits
+
+
+def test_prompt_budget_preserves_required_prompt_contract_when_catalog_is_pruned() -> None:
+    from semql_prompt import build_query_generator_prompt_fragment
+
+    prompt = build_query_generator_prompt_fragment(_catalog(_orders(), _customers()))
+    result = PromptBudget(max_tokens=10).apply(prompt)
+    assert result.was_truncated
+    assert "## Semantic path" in result.text
+    assert "## Trust boundary" in result.text
+    assert not result.fits
+
+
+def test_prompt_budget_preserves_protected_cube_and_reports_unfit() -> None:
+    prompt = render_catalog_block(_catalog(_orders(), _customers()))
+    result = PromptBudget(max_tokens=5).apply(prompt, protected_cubes=frozenset({"orders"}))
+    assert "### orders" in result.text
+    assert not result.fits
+
+
+def test_apply_budget_forwards_protected_cubes() -> None:
+    prompt = render_catalog_block(_catalog(_orders(), _customers()))
+    result = apply_budget(prompt, 5, protected_cubes=frozenset({"orders"}))
+    assert "### orders" in result.text
+
+
+def test_prompt_budget_prunes_rendered_domain_context_before_cubes() -> None:
+    from semql import GlossaryEntry
+
+    prompt = render_catalog_block(
+        _catalog(_orders(), _customers()),
+        glossary=[GlossaryEntry(term="GMV", definition="Gross merchandise value")],
+        relations="Orders belong to customers.",
+    )
+    result = PromptBudget(max_tokens=5).apply(prompt)
+    assert result.dropped[:2] == ("relations", "glossary")
+
+
+def test_prompt_budget_does_not_prune_arbitrary_markdown_headings() -> None:
+    prompt = "## Required instructions\n\n### orders\nNever remove this application policy."
+    result = PromptBudget(max_tokens=1).apply(prompt)
+    assert result.text == prompt
+    assert result.dropped == ()
     assert not result.fits
 
 

@@ -22,6 +22,7 @@ from semql.model import View
 from semql_prompt import (
     build_drilldown_prompt_fragment,
     build_presenter_prompt_fragment,
+    build_router_prompt_fragment,
     planner_prompt,
     planner_prompt_segments,
     render_tool_description,
@@ -92,6 +93,15 @@ def test_view_block_omits_role_protected_backing_target() -> None:
     assert "rev_view.rev" in text
     assert "orders.margin" not in text
     assert "rev_view.m" not in text
+
+
+def test_router_omits_view_with_only_protected_targets() -> None:
+    view = View(name="margin_view", fields={"m": "orders.margin"})
+    rendered = build_router_prompt_fragment(
+        {"orders": _public_cube_with_protected_field()},
+        views={"margin_view": view},
+    )
+    assert "margin_view" not in rendered
 
 
 # ---------------------------------------------------------------------------

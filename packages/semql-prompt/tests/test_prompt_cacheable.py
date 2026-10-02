@@ -257,3 +257,12 @@ def test_legacy_prompt_method_still_works() -> None:
     assert "### orders" in out
     assert "### audit_events" in out
     assert "### tickets" not in out
+
+
+def test_catalog_prompt_conveniences_include_trusted_instructions() -> None:
+    cat = Catalog([_public_orders()])
+    full = planner_prompt(cat, instructions="Use concise labels.")
+    segments = planner_prompt_segments(cat, instructions="Use concise labels.")
+    assert "## Additional instructions\nUse concise labels." in full
+    assert "## Additional instructions\nUse concise labels." in segments.static
+    assert segments.overlay == ""

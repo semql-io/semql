@@ -3,10 +3,12 @@
 ``PromptBudget`` trims catalog prompt sections and reports whether the
 remaining text fits. The built-in chars/4 estimate is deliberately labeled as a
 heuristic; callers may supply a model-specific ``count_tokens`` callback.
-Trimming removes only known optional catalog sections. Required instructions
-and other remaining text are preserved even when the result cannot fit.
+Trimming removes only known optional catalog sections. Required instructions,
+protected cubes, and other remaining text survive even when the result cannot
+fit.
 
-Trim order: relations, glossary, descriptions, then cube blocks.
+Trim order: domain relations, glossary, field descriptions, then unprotected
+cube blocks. Callers must check ``BudgetResult.fits`` before sending.
 """
 
 from __future__ import annotations
@@ -23,13 +25,13 @@ from semql.model import Dialect
 # this for model-specific BPE.
 _CHARS_PER_TOKEN = 4
 
-# Trim-pass patterns. Compiled once at import rather than per
-# ``apply()`` call — the trim path can run several passes over a large
-# prompt, and re-compiling these on each pass was pure waste.
-_DESCRIPTION_LINE_RE = re.compile(r"^[ \t]*description:[ \t].*$")
+# Trim-pass patterns. Compiled once at import rather than per ``apply()`` call.
+_FIELD_DESCRIPTION_RE = re.compile(
+    r"^(  - `[^`\n]+`[^\n]*?) — [^\n]*$",
+    re.MULTILINE,
+)
 _DIALECTS = "|".join(re.escape(dialect.value) for dialect in Dialect)
 _CUBE_HEADER_RE = re.compile(rf"\n### ([\w-]+) \(({_DIALECTS})\)")
-_CUBE_LINE_RE = re.compile(rf"^### [\w-]+ \(({_DIALECTS})\)")
 
 
 def _estimate_tokens(text: str) -> int:
@@ -42,77 +44,65 @@ def _estimate_tokens(text: str) -> int:
     return (len(text) + _CHARS_PER_TOKEN - 1) // _CHARS_PER_TOKEN
 
 
-def _slice_section(text: str, start_marker: str, end_marker: str | None) -> tuple[str, str]:
-    """Find a markdown section by its header marker; return
-    ``(kept, dropped)`` where ``kept`` is text without the section
-    and ``dropped`` is the section text (or empty if not found).
-
-    The end marker defaults to the next ``## `` header. If neither
-    is present, the section is taken to extend to the end of the
-    document.
-    """
-    start = text.find(start_marker)
+def _catalog_span(text: str) -> tuple[int, int] | None:
+    """Return semantic-catalog bounds inside a full prompt."""
+    start = text.find("## SEMANTIC CATALOG")
     if start == -1:
-        return text, ""
-    if end_marker is None:
-        # Default: next section header.
-        end = text.find("\n## ", start + len(start_marker))
-        if end == -1:
-            end = len(text)
+        return None
+    end = text.find("\n## ", start + len("## SEMANTIC CATALOG"))
+    return start, len(text) if end == -1 else end
+
+
+def _drop_domain_subsection(text: str, marker: str) -> tuple[str, bool]:
+    """Drop one recognized subsection from ``## DOMAIN CONTEXT`` only."""
+    domain_start = text.find("## DOMAIN CONTEXT")
+    if domain_start == -1:
+        return text, False
+    domain_end = text.find("\n## ", domain_start + len("## DOMAIN CONTEXT"))
+    if domain_end == -1:
+        domain_end = len(text)
+    start = text.find(marker, domain_start, domain_end)
+    if start == -1:
+        return text, False
+    if marker == "**Glossary:**":
+        relations = text.find("**Relations:**", start + len(marker), domain_end)
+        end = relations if relations != -1 else domain_end
     else:
-        end = text.find(end_marker, start + len(start_marker))
-        if end == -1:
-            end = len(text)
-    kept = text[:start] + text[end:]
-    dropped = text[start:end]
-    return kept, dropped
+        end = domain_end
+    return text[:start] + text[end:], True
 
 
-def _drop_descriptions(text: str) -> tuple[str, int]:
-    """Strip optional description lines inside rendered cube blocks only."""
-    lines = text.splitlines(keepends=True)
-    in_cube = False
-    kept: list[str] = []
-    dropped = 0
-    for line in lines:
-        if line.startswith(("## ", "### ")):
-            in_cube = False
-        if _CUBE_LINE_RE.match(line.rstrip("\r\n")):
-            in_cube = True
-        if in_cube and _DESCRIPTION_LINE_RE.match(line.rstrip("\r\n")):
-            dropped += 1
-            continue
-        kept.append(line)
-    return "".join(kept), dropped
+def _drop_field_descriptions(text: str) -> tuple[str, int]:
+    """Remove field prose inside the catalog while preserving metadata."""
+    span = _catalog_span(text)
+    if span is None:
+        return text, 0
+    start, end = span
+    catalog = text[start:end]
+    trimmed, count = _FIELD_DESCRIPTION_RE.subn(r"\1", catalog)
+    return text[:start] + trimmed + text[end:], count
 
 
-def _drop_lowest_priority_cube(text: str) -> tuple[str, str | None]:
-    """Drop the lowest-priority cube block.
-
-    The rendered prompt's cube blocks use ``### <name> (<dialect>)`` headers.
-    Other Markdown headings are not treated as removable catalog content.
-    The priority metadata is not rendered, so the last listed cube is the
-    last-written = least-cached = best candidate for pruning. Returns
-    ``(trimmed, dropped_cube_name)``.
-
-    This is intentionally crude: a smarter implementation would
-    plumb the priority order through. For the budget guardrail
-    use-case, "drop the last cube" is correct enough — it's the
-    one the prompt builder appended last, so the rest of the
-    ordering is preserved.
-    """
-    matches = list(_CUBE_HEADER_RE.finditer(text))
-    if not matches:
+def _drop_lowest_priority_cube(
+    text: str, protected_cubes: frozenset[str]
+) -> tuple[str, str | None]:
+    """Drop the last unprotected cube within the semantic catalog."""
+    span = _catalog_span(text)
+    if span is None:
         return text, None
-    # Take the last cube block.
-    last_match = matches[-1]
-    name = last_match.group(1)
-    end = text.find("\n### ", last_match.end())
-    if end == -1:
-        end = text.find("\n## ", last_match.end())
-    if end == -1:
-        end = len(text)
-    return text[: last_match.start()] + text[end:], name
+    catalog_start, catalog_end = span
+    catalog = text[catalog_start:catalog_end]
+    matches = list(_CUBE_HEADER_RE.finditer(catalog))
+    for match in reversed(matches):
+        name = match.group(1)
+        if name in protected_cubes:
+            continue
+        end = catalog.find("\n### ", match.end())
+        if end == -1:
+            end = len(catalog)
+        trimmed = catalog[: match.start()] + catalog[end:]
+        return text[:catalog_start] + trimmed + text[catalog_end:], name
+    return text, None
 
 
 class PromptBudget(BaseModel):
@@ -127,12 +117,14 @@ class PromptBudget(BaseModel):
         text: str,
         *,
         count_tokens: Callable[[str], int] | None = None,
+        protected_cubes: frozenset[str] = frozenset(),
     ) -> BudgetResult:
-        """Trim optional prompt content, preserving all remaining required text.
+        """Trim optional prompt content, preserving required text and cubes.
 
         ``count_tokens`` may supply a model-specific counter. Without it, the
-        built-in chars/4 heuristic is used. A result can remain over budget
-        when no further catalog content can be safely removed.
+        built-in chars/4 heuristic is used. ``protected_cubes`` names catalog
+        blocks that must survive. A result can remain over budget when no
+        further catalog content can be safely removed.
         """
         counter = _estimate_tokens if count_tokens is None else count_tokens
 
@@ -147,30 +139,24 @@ class PromptBudget(BaseModel):
 
         dropped: list[str] = []
         current = text
-        if "## Cross-cube relations" in current or "## Relations" in current:
-            current, removed = _slice_section(current, "## Cross-cube relations", None)
-            if not removed and "## Relations" in current:
-                current, removed = _slice_section(current, "## Relations", None)
+        for marker, label in (
+            ("**Relations:**", "relations"),
+            ("**Glossary:**", "glossary"),
+        ):
+            current, removed = _drop_domain_subsection(current, marker)
             if removed:
-                dropped.append("relations")
+                dropped.append(label)
                 if count(current) <= self.max_tokens:
                     return self._result(current, dropped, count, count_tokens is not None)
 
-        if "## Glossary" in current:
-            current, removed = _slice_section(current, "## Glossary", None)
-            if removed:
-                dropped.append("glossary")
-                if count(current) <= self.max_tokens:
-                    return self._result(current, dropped, count, count_tokens is not None)
-
-        current, n = _drop_descriptions(current)
+        current, n = _drop_field_descriptions(current)
         if n > 0:
             dropped.append(f"descriptions({n})")
             if count(current) <= self.max_tokens:
                 return self._result(current, dropped, count, count_tokens is not None)
 
         while count(current) > self.max_tokens:
-            new_text, name = _drop_lowest_priority_cube(current)
+            new_text, name = _drop_lowest_priority_cube(current, protected_cubes)
             if name is None:
                 break
             dropped.append(f"cube:{name}")
@@ -197,7 +183,12 @@ class PromptBudget(BaseModel):
 
 
 class BudgetResult(BaseModel):
-    """Output of :meth:`PromptBudget.apply` with explicit fit status."""
+    """Output of :meth:`PromptBudget.apply` with explicit fit status.
+
+    ``fits`` may be false when protected or non-catalog content alone is too
+    large to trim safely. ``count_source`` identifies whether ``token_count``
+    came from the built-in heuristic or a caller-supplied counter.
+    """
 
     model_config = ConfigDict(frozen=True)
 
@@ -214,9 +205,14 @@ def apply_budget(
     max_tokens: int,
     *,
     count_tokens: Callable[[str], int] | None = None,
+    protected_cubes: frozenset[str] = frozenset(),
 ) -> BudgetResult:
-    """Convenience wrapper for :meth:`PromptBudget.apply`."""
-    return PromptBudget(max_tokens=max_tokens).apply(text, count_tokens=count_tokens)
+    """Apply a one-shot prompt budget with optional protected cubes."""
+    return PromptBudget(max_tokens=max_tokens).apply(
+        text,
+        count_tokens=count_tokens,
+        protected_cubes=protected_cubes,
+    )
 
 
 __all__ = [
