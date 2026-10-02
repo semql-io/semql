@@ -134,14 +134,14 @@ def test_prompt_budget_custom_counter_controls_fit_and_is_labeled() -> None:
 
 
 def test_prompt_budget_custom_counter_used_after_trimming() -> None:
-    prompt = "required instructions\n\n## Glossary\noptional vocabulary"
+    prompt = "required instructions\n\n## DOMAIN CONTEXT\n\n**Glossary:**\noptional vocabulary"
 
     def count(text: str) -> int:
         return 10 if "Glossary" in text else 2
 
     result = PromptBudget(max_tokens=2).apply(prompt, count_tokens=count)
     assert "required instructions" in result.text
-    assert "## Glossary" not in result.text
+    assert "**Glossary:**" not in result.text
     assert result.token_count == 2
     assert result.count_source == "callback"
     assert result.fits

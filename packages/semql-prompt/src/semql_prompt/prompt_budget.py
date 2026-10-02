@@ -54,21 +54,28 @@ def _catalog_span(text: str) -> tuple[int, int] | None:
 
 
 def _drop_domain_subsection(text: str, marker: str) -> tuple[str, bool]:
-    """Drop one recognized subsection from ``## DOMAIN CONTEXT`` only."""
+    """Drop one recognized subsection from ``## DOMAIN CONTEXT`` (or a
+    bare ``## <name>`` heading, for callers that synthesize their own).
+    """
     domain_start = text.find("## DOMAIN CONTEXT")
-    if domain_start == -1:
-        return text, False
-    domain_end = text.find("\n## ", domain_start + len("## DOMAIN CONTEXT"))
-    if domain_end == -1:
-        domain_end = len(text)
-    start = text.find(marker, domain_start, domain_end)
+    if domain_start != -1:
+        domain_end = text.find("\n## ", domain_start + len("## DOMAIN CONTEXT"))
+        if domain_end == -1:
+            domain_end = len(text)
+        search_lo = domain_start
+        search_hi = domain_end
+    else:
+        search_lo = 0
+        search_hi = len(text)
+    start = text.find(marker, search_lo, search_hi)
     if start == -1:
         return text, False
     if marker == "**Glossary:**":
-        relations = text.find("**Relations:**", start + len(marker), domain_end)
-        end = relations if relations != -1 else domain_end
+        relations = text.find("**Relations:**", start + len(marker), search_hi)
+        end = relations if relations != -1 else search_hi
     else:
-        end = domain_end
+        end = text.find("\n## ", start + len(marker))
+        end = end if end != -1 else search_hi
     return text[:start] + text[end:], True
 
 
