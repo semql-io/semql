@@ -509,6 +509,26 @@ from the introspection CLI; driver loading remains lazy. Regenerating the lockfi
 aligned its existing workspace package versions with the 0.7.0 manifests;
 no package manifest version was bumped.
 
+### Version 0.8.0 release preparation
+
+The separately authorized release advances all eight package versions to 0.8.0,
+pins every sibling requirement to `>=0.8.0,<0.9`, regenerates `uv.lock`, and
+dates the changelog entry. The minor bump communicates the intentional pre-v1
+API and behavioral changes above. Historical version references and executable
+schema versions are not package versions and remain unchanged.
+
+The release sequence is a verified fast-forward to `main`, followed by the
+`v0.8.0` tag. The existing tag-triggered workflow builds artifacts and publishes
+through PyPI OIDC Trusted Publishing; no local credential fallback is needed.
+Publication is verified against all eight PyPI projects and a fresh installation.
+
+Release-candidate verification passed: the container-enabled `just check` ran
+3,077 passing tests, 3 skips, 1 expected failure, and 83 snapshots. All eight
+wheels and eight source distributions built and passed `twine check`. An isolated
+installation of the wheels verified every version and sibling range, imported
+all packages, and executed compilation, alias-equivalence comparison, artifact
+serialization, and DuckDB results (A=30, B=7) outside the workspace.
+
 ## Appendix A — Spike evidence
 
 The following records retain the observed behavior before implementation. They explain the decisions above but do not override the target release matrix or claim that fixes have landed.

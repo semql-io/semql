@@ -7,6 +7,8 @@ packages version in lockstep. Format loosely follows
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-10-02
+
 ### Added
 
 - Artifact-local semantic analysis on compiled and federated artifacts, with
