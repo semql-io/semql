@@ -7,6 +7,37 @@ packages version in lockstep. Format loosely follows
 
 ## [Unreleased]
 
+### Added
+
+- `render_analysis` safely explains existing compiled semantic graphs without
+  catalog access or another resolver; unknowns and declared assumptions remain explicit.
+- Bounded diagnostic categories, repair hints, and optional structural query locations.
+- Caller-supplied token counting and explicit prompt-budget fit status.
+- Offline integration recipes and migration guides for 0.7→0.8 and 0.8→0.9.
+- Isolated installed-wheel execution verification before release artifact upload.
+- Real-backend result coverage for empty groups, decimal sums, and half-open
+  time boundaries; async DB-API execution failure closes its cursor.
+
+### Changed
+
+- All eight package versions advance to 0.9.0 with sibling ranges `>=0.9.0,<0.10`.
+  This is a release candidate; no release tag or PyPI publication is implied.
+- Query row budgets reject unknown-size references by default. Callers can explicitly
+  allow uncertainty, but known size-hint subtotals must still satisfy the ceiling.
+- Cost estimates retain unknown cube identities and reject incomplete boolean-only
+  unknown estimates; shared reference resolution includes indirect query dependencies.
+- `BudgetResult.estimated_tokens` becomes `token_count`, with `count_source` and `fits`.
+  Untrimmable content, including at a zero budget, remains intact and reports inability
+  to fit rather than becoming an empty prompt.
+
+### Fixed
+
+- Cube budgets count every known and unknown referenced cube rather than collapsing
+  all unknown-size cubes into one.
+- Prompt trimming preserves unrecognized instruction and view headings.
+- Explanation rendering cannot mistake catalog descriptor strings for runtime evidence
+  or attach a join declaration by list position.
+
 ## [0.8.0] - 2026-10-02
 
 ### Added

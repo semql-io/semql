@@ -1,42 +1,22 @@
 """Prompt-budget enforcement.
 
-The four-role prompt pipeline (Router / Generator / Presenter /
-Drilldown) builds catalog fragments that can grow large as the
-catalog grows. ``PromptBudget.apply(text)`` enforces a token ceiling
-on a rendered prompt string by progressively trimming the cheapest-
-to-prune content first.
+``PromptBudget`` trims catalog prompt sections and reports whether the
+remaining text fits. The built-in chars/4 estimate is deliberately labeled as a
+heuristic; callers may supply a model-specific ``count_tokens`` callback.
+Trimming removes only known optional catalog sections. Required instructions
+and other remaining text are preserved even when the result cannot fit.
 
-The token estimate uses the chars/4 heuristic. It's intentionally
-rough — guardrail use, not a token-by-token count. A more elaborate
-estimate (tiktoken, a model-specific BPE) is out of scope: callers
-who need that level of fidelity should bypass the budget and pass
-the raw prompt to their model, or set ``max_tokens`` to a high
-enough value that the budget becomes a no-op.
-
-Trim order (cheapest to most-destructive):
-
-1. **relations** — the cross-cube narrative block. The LLM can
-   still resolve cube names; it just loses the connective prose.
-2. **glossary** — the ``## Glossary`` block. Vocabulary is helpful
-   but not load-bearing.
-3. **descriptions** — ``Cube.description`` and
-   ``Measure/Dimension.description`` lines. The LLM can still
-   resolve names and types.
-4. **low-priority cubes** — the cube with the lowest ``priority``
-   score (default 0) is dropped. Iterated until the prompt fits
-   or no cubes remain.
-
-The result is a frozen Pydantic value type carrying the trimmed
-text, an ``estimated_tokens`` count, a ``was_truncated`` flag, and
-a ``dropped`` list of what was pruned (in order). Callers can
-log/report the drops; we don't silently drop without record.
+Trim order: relations, glossary, descriptions, then cube blocks.
 """
 
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
+from semql.model import Dialect
 
 # Rough heuristic. Matches OpenAI's "1 token ~ 4 chars of English
 # text" rule of thumb. Good enough for guardrail use; do not rely on
@@ -46,8 +26,10 @@ _CHARS_PER_TOKEN = 4
 # Trim-pass patterns. Compiled once at import rather than per
 # ``apply()`` call — the trim path can run several passes over a large
 # prompt, and re-compiling these on each pass was pure waste.
-_DESCRIPTION_LINE_RE = re.compile(r"^[ \t]*description:[ \t].*$", re.MULTILINE)
-_CUBE_HEADER_RE = re.compile(r"\n### (\w+)\b")
+_DESCRIPTION_LINE_RE = re.compile(r"^[ \t]*description:[ \t].*$")
+_DIALECTS = "|".join(re.escape(dialect.value) for dialect in Dialect)
+_CUBE_HEADER_RE = re.compile(rf"\n### ([\w-]+) \(({_DIALECTS})\)")
+_CUBE_LINE_RE = re.compile(rf"^### [\w-]+ \(({_DIALECTS})\)")
 
 
 def _estimate_tokens(text: str) -> int:
@@ -87,25 +69,31 @@ def _slice_section(text: str, start_marker: str, end_marker: str | None) -> tupl
 
 
 def _drop_descriptions(text: str) -> tuple[str, int]:
-    """Strip ``description: ...`` lines from the rendered prompt.
-
-    The prompt builder emits descriptions on lines like
-    ``  description: Sum of all order amounts in the period``. We
-    drop everything after the colon to the end of the line, but
-    only inside the catalog block (not inside ``## Glossary`` etc.).
-    Returns ``(trimmed, count)``."""
-    matches = _DESCRIPTION_LINE_RE.findall(text)
-    return _DESCRIPTION_LINE_RE.sub("", text), len(matches)
+    """Strip optional description lines inside rendered cube blocks only."""
+    lines = text.splitlines(keepends=True)
+    in_cube = False
+    kept: list[str] = []
+    dropped = 0
+    for line in lines:
+        if line.startswith(("## ", "### ")):
+            in_cube = False
+        if _CUBE_LINE_RE.match(line.rstrip("\r\n")):
+            in_cube = True
+        if in_cube and _DESCRIPTION_LINE_RE.match(line.rstrip("\r\n")):
+            dropped += 1
+            continue
+        kept.append(line)
+    return "".join(kept), dropped
 
 
 def _drop_lowest_priority_cube(text: str) -> tuple[str, str | None]:
     """Drop the lowest-priority cube block.
 
-    The rendered prompt's cube block is a sequence of ``### <name>``
-    headers followed by the cube's content. We don't have access to
-    the priority metadata in the rendered text, so we fall back to
-    the last cube in the document (last-written = least-cached = best
-    candidate for pruning). Returns ``(trimmed, dropped_cube_name)``.
+    The rendered prompt's cube blocks use ``### <name> (<dialect>)`` headers.
+    Other Markdown headings are not treated as removable catalog content.
+    The priority metadata is not rendered, so the last listed cube is the
+    last-written = least-cached = best candidate for pruning. Returns
+    ``(trimmed, dropped_cube_name)``.
 
     This is intentionally crude: a smarter implementation would
     plumb the priority order through. For the budget guardrail
@@ -128,131 +116,107 @@ def _drop_lowest_priority_cube(text: str) -> tuple[str, str | None]:
 
 
 class PromptBudget(BaseModel):
-    """A guardrail that trims a prompt string to fit a token budget.
-
-    The trim is *progressive*: it applies the cheapest pruning
-    strategies first, then moves to the more destructive ones,
-    stopping as soon as the prompt fits. Callers that need a
-    deterministic drop order can read ``result.dropped``."""
+    """Trim optional catalog prompt content and report whether it fits."""
 
     model_config = ConfigDict(frozen=True)
 
-    max_tokens: int = Field(
-        ge=0,
-        description=(
-            "Maximum allowed token count. Texts already at or below this pass through unchanged."
-        ),
-    )
+    max_tokens: int = Field(ge=0, description="Maximum count accepted by the active counter.")
 
-    def apply(self, text: str) -> BudgetResult:
-        """Trim ``text`` until it fits within ``max_tokens``.
+    def apply(
+        self,
+        text: str,
+        *,
+        count_tokens: Callable[[str], int] | None = None,
+    ) -> BudgetResult:
+        """Trim optional prompt content, preserving all remaining required text.
 
-        Returns a :class:`BudgetResult` with the trimmed text and a
-        record of what was dropped. If the text is already within
-        budget, returns it unchanged with ``was_truncated=False``.
-
-        ``max_tokens=0`` is a special case: any non-empty text is
-        over-budget and the result is the empty string. (Without
-        this special case, ``apply("")`` and ``apply("any text at
-        all")`` would both be over-budget, but only the empty
-        string actually fits.)
+        ``count_tokens`` may supply a model-specific counter. Without it, the
+        built-in chars/4 heuristic is used. A result can remain over budget
+        when no further catalog content can be safely removed.
         """
-        if _estimate_tokens(text) <= self.max_tokens:
-            return BudgetResult(
-                text=text,
-                estimated_tokens=_estimate_tokens(text),
-                was_truncated=False,
-                dropped=(),
-            )
+        counter = _estimate_tokens if count_tokens is None else count_tokens
 
-        # max_tokens=0 with non-empty text: trim to empty.
-        if self.max_tokens == 0:
-            return BudgetResult(
-                text="",
-                estimated_tokens=0,
-                was_truncated=True,
-                dropped=("everything",),
-            )
+        def count(value: str) -> int:
+            result = counter(value)
+            if result < 0:
+                raise ValueError("count_tokens must return a non-negative integer")
+            return result
+
+        if count(text) <= self.max_tokens:
+            return self._result(text, [], count, count_tokens is not None)
 
         dropped: list[str] = []
         current = text
-
-        # 1. Drop relations block.
         if "## Cross-cube relations" in current or "## Relations" in current:
             current, removed = _slice_section(current, "## Cross-cube relations", None)
             if not removed and "## Relations" in current:
                 current, removed = _slice_section(current, "## Relations", None)
             if removed:
                 dropped.append("relations")
-                if _estimate_tokens(current) <= self.max_tokens:
-                    return self._result(current, dropped)
+                if count(current) <= self.max_tokens:
+                    return self._result(current, dropped, count, count_tokens is not None)
 
-        # 2. Drop glossary block.
         if "## Glossary" in current:
             current, removed = _slice_section(current, "## Glossary", None)
             if removed:
                 dropped.append("glossary")
-                if _estimate_tokens(current) <= self.max_tokens:
-                    return self._result(current, dropped)
+                if count(current) <= self.max_tokens:
+                    return self._result(current, dropped, count, count_tokens is not None)
 
-        # 3. Drop descriptions line-by-line.
         current, n = _drop_descriptions(current)
         if n > 0:
             dropped.append(f"descriptions({n})")
-            if _estimate_tokens(current) <= self.max_tokens:
-                return self._result(current, dropped)
+            if count(current) <= self.max_tokens:
+                return self._result(current, dropped, count, count_tokens is not None)
 
-        # 4. Drop the lowest-priority cube, iterated.
-        while _estimate_tokens(current) > self.max_tokens:
+        while count(current) > self.max_tokens:
             new_text, name = _drop_lowest_priority_cube(current)
             if name is None:
-                # No more cubes to drop; we have to accept the
-                # over-budget text.
                 break
             dropped.append(f"cube:{name}")
             current = new_text
 
-        return self._result(current, dropped)
+        return self._result(current, dropped, count, count_tokens is not None)
 
-    def _result(self, text: str, dropped: list[str]) -> BudgetResult:
+    def _result(
+        self,
+        text: str,
+        dropped: list[str],
+        count: Callable[[str], int],
+        custom_counter: bool,
+    ) -> BudgetResult:
+        token_count = count(text)
         return BudgetResult(
             text=text,
-            estimated_tokens=_estimate_tokens(text),
+            token_count=token_count,
+            count_source="callback" if custom_counter else "heuristic",
+            fits=token_count <= self.max_tokens,
             was_truncated=len(dropped) > 0,
             dropped=tuple(dropped),
         )
 
 
 class BudgetResult(BaseModel):
-    """The output of :meth:`PromptBudget.apply`.
-
-    ``text`` is the trimmed prompt. ``estimated_tokens`` is the
-    post-trim token count (heuristic). ``was_truncated`` is True if
-    any drop happened. ``dropped`` is the ordered list of what was
-    pruned — a list of stable strings the caller can log or
-    report.
-    """
+    """Output of :meth:`PromptBudget.apply` with explicit fit status."""
 
     model_config = ConfigDict(frozen=True)
 
     text: str
-    estimated_tokens: int = Field(ge=0)
+    token_count: int = Field(ge=0, description="Count from the labeled active counter.")
+    count_source: Literal["heuristic", "callback"]
+    fits: bool
     was_truncated: bool
-    dropped: tuple[str, ...] = Field(
-        default_factory=lambda: tuple[str, ...](),
-        description=(
-            "Ordered list of what was dropped (e.g. ['relations', 'glossary', 'cube:orders'])."
-        ),
-    )
+    dropped: tuple[str, ...] = Field(default_factory=tuple)
 
 
-def apply_budget(text: str, max_tokens: int) -> BudgetResult:
-    """Convenience: ``PromptBudget(max_tokens=max_tokens).apply(text)``.
-
-    Equivalent to constructing a one-shot budget; lets callers that
-    only need a single trim avoid the Pydantic value-type
-    ceremony."""
-    return PromptBudget(max_tokens=max_tokens).apply(text)
+def apply_budget(
+    text: str,
+    max_tokens: int,
+    *,
+    count_tokens: Callable[[str], int] | None = None,
+) -> BudgetResult:
+    """Convenience wrapper for :meth:`PromptBudget.apply`."""
+    return PromptBudget(max_tokens=max_tokens).apply(text, count_tokens=count_tokens)
 
 
 __all__ = [

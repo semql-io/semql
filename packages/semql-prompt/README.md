@@ -41,6 +41,26 @@ tools = to_openai_tools(catalog, viewer=viewer)
 For the lower-level per-role fragment builders, see
 [API reference](../../docs/api/semql_prompt.md).
 
+### Prompt-budget results
+
+`PromptBudget.apply(text)` reports `token_count`, `count_source`
+(`"heuristic"` by default), and explicit `fits` status alongside
+`was_truncated` and `dropped`. The default count is only the package's
+chars/4 heuristic. Supply a model-specific counter without adding a dependency:
+
+```python
+from semql_prompt import PromptBudget
+
+result = PromptBudget(max_tokens=8_000).apply(
+    prompt,
+    count_tokens=model_tokenizer.count,
+)
+```
+
+The same `count_tokens` callback is accepted by `apply_budget`. Trimming
+removes known optional catalog sections; if required or otherwise untrimmable
+text remains over budget, it is preserved and `fits` is `False`.
+
 ## License
 
 BSD-3-Clause.

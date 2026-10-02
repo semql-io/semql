@@ -224,3 +224,32 @@ def test_async_dbapi_adapter_empty_params_executes_without_dict() -> None:
     adapter = AsyncDBAPIAdapter(conn)
     result = _run(adapter.execute("SELECT COUNT(*) AS n FROM t", {}))
     assert list(result.rows) == [(2,)]
+
+
+def test_async_dbapi_adapter_closes_cursor_after_execute_failure() -> None:
+    error = RuntimeError("driver execute failed")
+
+    class _FailingCursor:
+        closed = False
+
+        def execute(self, _sql: str, _params: Mapping[str, object] | None = None) -> None:
+            raise error
+
+        def close(self) -> None:
+            self.closed = True
+
+    class _FailingConnection:
+        def __init__(self, cursor: _FailingCursor) -> None:
+            self._cursor = cursor
+
+        def cursor(self) -> _FailingCursor:
+            return self._cursor
+
+    cursor = _FailingCursor()
+    adapter = AsyncDBAPIAdapter(_FailingConnection(cursor))
+
+    with pytest.raises(RuntimeError) as raised:
+        _run(adapter.execute("SELECT 1", {}))
+
+    assert raised.value is error
+    assert cursor.closed

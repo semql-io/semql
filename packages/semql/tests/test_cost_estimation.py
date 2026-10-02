@@ -1,30 +1,18 @@
-"""Tests for cost estimation + budget enforcement.
-
-The compiler emits SQL but the planner has no idea whether a query
-costs 100ms or 30 minutes. ``estimate_cost`` derives a rough
-``CostEstimate`` from cube ``size_hint`` (declared on ``Cube``) +
-the query's touched dims/measures. ``QueryBudget`` pairs with it:
-pre-compile, the caller attaches a ceiling; post-execute, the
-``Engine`` raises ``BudgetExceededError`` if the estimate (or the
-observed row count) exceeded the ceiling.
-
-The estimate is intentionally rough — it's a guardrail, not a
-planner. We use ``rows_scanned = cube.size_hint`` (a single-table
-scan cost) and ``rows_returned = rows_scanned / distinct_values``
-where distinct_values is the product of touched dim cardinalities.
-This is good enough to catch "you forgot a filter on a billion-row
-table" mistakes; it's not a substitute for actual EXPLAIN.
-"""
+"""Tests for referenced-cube size-hint accounting and admission budgets."""
 
 from __future__ import annotations
 
 import pytest
 from semql import (
+    BoolExpr,
     Cube,
     Dialect,
     Dimension,
+    Filter,
+    InlineDerived,
     Measure,
     SemanticQuery,
+    View,
     estimate_cost,
 )
 from semql.cost import CostEstimate, QueryBudget
@@ -56,6 +44,7 @@ def test_estimate_cost_no_cube_size_hint_returns_unknown() -> None:
     est = estimate_cost(q, cat)
     assert est.rows_scanned_unknown
     assert est.cubes_estimated == {}
+    assert est.cubes_unknown == ("orders",)
 
 
 def test_estimate_cost_uses_size_hint_for_rows_scanned() -> None:
@@ -69,7 +58,6 @@ def test_estimate_cost_uses_size_hint_for_rows_scanned() -> None:
 
 
 def test_estimate_cost_aggregates_across_cubes() -> None:
-    """A federated plan scans each fragment's full size."""
     cube1 = _orders(size_hint=10_000)
     cube2 = Cube(
         name="customers",
@@ -118,14 +106,99 @@ def test_query_budget_passes_when_within_ceiling() -> None:
     budget.check(estimate_cost(q, cat))  # should not raise
 
 
-def test_query_budget_unknown_cost_passes() -> None:
-    """If we don't know the cost, we can't enforce a budget. The
-    budget is a guardrail, not a hard stop on unknown data."""
+def test_query_budget_unknown_cost_rejects_by_default() -> None:
     cube = _orders(size_hint=None)
-    cat = {"orders": cube}
-    q = SemanticQuery(measures=["orders.revenue"])
-    budget = QueryBudget(max_rows_scanned=5_000)
-    budget.check(estimate_cost(q, cat))  # should not raise
+    query = SemanticQuery(measures=["orders.revenue"])
+    with pytest.raises(Exception, match="unknown-cost policy"):
+        QueryBudget(max_rows_scanned=5_000).check(estimate_cost(query, {"orders": cube}))
+
+
+def test_query_budget_can_explicitly_allow_unknown_cost() -> None:
+    cube = _orders(size_hint=None)
+    query = SemanticQuery(measures=["orders.revenue"])
+    QueryBudget(max_rows_scanned=5_000, unknown_cost_policy="allow").check(
+        estimate_cost(query, {"orders": cube})
+    )
+
+
+def test_query_budget_known_subtotal_exceeded_even_with_unknown_cube() -> None:
+    known = _orders(size_hint=1_000)
+    unknown = Cube(
+        name="customers",
+        dialect=Dialect.BIGQUERY,
+        table="customers",
+        alias="c",
+        primary_key="id",
+        size_hint=None,
+        dimensions=[Dimension(name="id", sql="{c}.id", type="number")],
+    )
+    query = SemanticQuery(measures=["orders.revenue"], dimensions=["customers.id"])
+    estimate = estimate_cost(query, {"orders": known, "customers": unknown})
+    with pytest.raises(Exception, match="1000"):
+        QueryBudget(max_rows_scanned=10, unknown_cost_policy="allow").check(estimate)
+
+
+def test_query_budget_counts_each_unknown_cube() -> None:
+    first = _orders(size_hint=None)
+    second = Cube(
+        name="customers",
+        dialect=Dialect.BIGQUERY,
+        table="customers",
+        alias="c",
+        primary_key="id",
+        size_hint=None,
+        dimensions=[Dimension(name="id", sql="{c}.id", type="number")],
+    )
+    query = SemanticQuery(measures=["orders.revenue"], dimensions=["customers.id"])
+    estimate = estimate_cost(query, {"orders": first, "customers": second})
+    assert estimate.cubes_unknown == ("customers", "orders")
+    with pytest.raises(Exception, match="2 cube"):
+        QueryBudget(max_cubes=1).check(estimate)
+
+
+def test_estimate_cost_resolves_views_derived_operands_where_and_having() -> None:
+    orders = _orders(size_hint=100)
+    customers = Cube(
+        name="customers",
+        dialect=Dialect.BIGQUERY,
+        table="customers",
+        alias="c",
+        primary_key="id",
+        size_hint=300,
+        dimensions=[Dimension(name="id", sql="{c}.id", type="number")],
+        measures=[Measure(name="spend", sql="{c}.spend", agg="sum", unit="currency")],
+    )
+    query = SemanticQuery(
+        measures=["sales.revenue", "customers.spend"],
+        derived_measures=[
+            InlineDerived(name="combined", op="sum", operands=["customers.spend", "orders.revenue"])
+        ],
+        where=BoolExpr(
+            op="or",
+            children=[
+                Filter(dimension="customers.id", op="gt", values=[1]),
+                Filter(dimension="orders.id", op="gt", values=[1]),
+            ],
+        ),
+        having=[Filter(dimension="orders.revenue", op="gt", values=[1])],
+    )
+    estimate = estimate_cost(
+        query,
+        {"orders": orders, "customers": customers},
+        views={"sales": View(name="sales", fields={"revenue": "orders.revenue"})},
+    )
+    assert estimate.cubes_estimated == {"customers": 300, "orders": 100}
+
+
+def test_query_budget_known_subtotal_checked_before_unknown_policy() -> None:
+    estimate = CostEstimate(
+        total_rows_scanned=1_000,
+        cubes_estimated={"orders": 1_000},
+        cubes_unknown=("customers",),
+        rows_scanned_unknown=True,
+    )
+    with pytest.raises(Exception, match="1000"):
+        QueryBudget(max_rows_scanned=10).check(estimate)
 
 
 def test_query_budget_max_cubes_ceiling() -> None:
@@ -149,15 +222,27 @@ def test_query_budget_max_cubes_ceiling() -> None:
 
 
 def test_cost_estimate_is_pydantic_value_type() -> None:
-    """CostEstimate is a frozen Pydantic model."""
+    """CostEstimate is a frozen Pydantic model including unknown identities."""
     est = CostEstimate(
         total_rows_scanned=100,
         cubes_estimated={"orders": 100},
-        rows_scanned_unknown=False,
+        cubes_unknown=("customers",),
+        rows_scanned_unknown=True,
     )
     restored = CostEstimate.model_validate(est.model_dump())
     assert restored.total_rows_scanned == 100
     assert restored.cubes_estimated == {"orders": 100}
+    assert restored.cubes_unknown == ("customers",)
+
+
+def test_cost_estimate_rejects_unknown_summary_without_identity() -> None:
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError, match="requires unknown cube identities"):
+        CostEstimate(rows_scanned_unknown=True)
+
+    estimate = CostEstimate(cubes_unknown=("customers",))
+    assert estimate.rows_scanned_unknown
 
 
 def test_size_hint_must_be_non_negative() -> None:
@@ -168,11 +253,9 @@ def test_size_hint_must_be_non_negative() -> None:
         _orders(size_hint=-1)
 
 
-def test_estimate_cost_ignores_dimensions_on_unscanned_cubes() -> None:
-    """A dimension on a cube that wasn't touched doesn't contribute
-    to the scan estimate."""
+def test_estimate_cost_counts_each_referenced_cube_once() -> None:
     cube = _orders(size_hint=1_000)
-    cat = {"orders": cube}
-    q = SemanticQuery(measures=["orders.revenue"], dimensions=["orders.status"])
-    est = estimate_cost(q, cat)
-    assert est.cubes_estimated == {"orders": 1_000}
+    query = SemanticQuery(measures=["orders.revenue"], dimensions=["orders.status"])
+    estimate = estimate_cost(query, {"orders": cube})
+    assert estimate.cubes_estimated == {"orders": 1_000}
+    assert estimate.total_rows_scanned == 1_000

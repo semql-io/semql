@@ -24,6 +24,7 @@ from semql.errors import (
     CompileError,
     Diagnostic,
     FilterTypeError,
+    QueryLocation,
     ResolveError,
     UnknownIdentifierError,
     closest_match,
@@ -117,15 +118,17 @@ class ResolutionDiagnostic:
     hint: str | None = None
     extra: dict[str, Any] = dc_field(default_factory=dict[str, Any])
     source: Exception | None = None
+    location: QueryLocation | None = None
 
     def to_diagnostic(self) -> Diagnostic:
         """Expose bounded structured fields without serializing raw message/value data."""
         return Diagnostic(
             code=self.code,
             reason=self.code,
-            references=tuple(ref for ref in (self.cube, self.field) if ref is not None),
+            references=(),
             operation=self.op,
             stage="resolution",
+            location=self.location,
         )
 
 
@@ -215,8 +218,11 @@ def _make_view_resolver(
     return _resolve
 
 
-def _diagnostic_from_resolve_exc(ref: str, exc: Exception) -> ResolutionDiagnostic:
-    """Turn a resolve-time exception into a typed diagnostic."""
+def _diagnostic_from_resolve_exc(
+    ref: str, exc: Exception, location: QueryLocation | None = None
+) -> ResolutionDiagnostic:
+    if location is not None and isinstance(exc, (UnknownIdentifierError, FilterTypeError)):
+        exc.location = location
     if isinstance(exc, UnknownIdentifierError):
         code = "unknown_cube" if exc.kind == "cube" else "unknown_field"
         return ResolutionDiagnostic(
@@ -226,6 +232,7 @@ def _diagnostic_from_resolve_exc(ref: str, exc: Exception) -> ResolutionDiagnost
             field=exc.name if exc.kind == "field" else None,
             hint=exc.hint,
             source=exc,
+            location=location,
         )
     if isinstance(exc, CompileError):
         # View-missing-field case from `_make_view_resolver`.
@@ -264,11 +271,15 @@ def walk_query_fields(
     diagnostics: list[ResolutionDiagnostic] = []
 
     measure_fields: list[tuple[Cube, Measure]] = []
-    for ref in q.measures:
+    for index, ref in enumerate(q.measures):
         try:
             cube, fld = resolve_with_views(ref)
         except Exception as exc:
-            diagnostics.append(_diagnostic_from_resolve_exc(ref, exc))
+            diagnostics.append(
+                _diagnostic_from_resolve_exc(
+                    ref, exc, QueryLocation(section="measures", index=index)
+                )
+            )
             continue
         if not isinstance(fld, Measure):
             diagnostics.append(
@@ -283,11 +294,15 @@ def walk_query_fields(
         measure_fields.append((cube, fld))
 
     dim_fields: list[tuple[Cube, Dimension]] = []
-    for ref in q.dimensions:
+    for index, ref in enumerate(q.dimensions):
         try:
             cube, fld = resolve_with_views(ref)
         except Exception as exc:
-            diagnostics.append(_diagnostic_from_resolve_exc(ref, exc))
+            diagnostics.append(
+                _diagnostic_from_resolve_exc(
+                    ref, exc, QueryLocation(section="dimensions", index=index)
+                )
+            )
             continue
         if not isinstance(fld, Dimension):
             diagnostics.append(
@@ -348,17 +363,19 @@ def walk_query_fields(
     filter_resolutions: list[
         tuple[Filter, Cube, Dimension | Measure | TimeDimension | Segment]
     ] = []
-    for f in q.filters:
+    for index, f in enumerate(q.filters):
         try:
             c, fld = resolve_with_views(f.dimension)
         except Exception as exc:
-            diagnostics.append(_diagnostic_from_resolve_exc(f.dimension, exc))
+            location = QueryLocation(section="filters", index=index)
+            diagnostics.append(_diagnostic_from_resolve_exc(f.dimension, exc, location))
             continue
         field_type = _filter_field_type(fld)
         if field_type is not None:
             try:
                 f.validate_for_type(field_type)
             except ValueError as exc:
+                location = QueryLocation(section="filters", index=index)
                 diagnostics.append(
                     ResolutionDiagnostic(
                         code="filter_type_mismatch",
@@ -367,11 +384,13 @@ def walk_query_fields(
                         field=fld.name,
                         op=f.op,
                         value=f.values[0] if f.values else None,
+                        location=location,
                         source=FilterTypeError(
                             str(exc),
                             dimension=f.dimension,
                             op=f.op,
                             value=f.values[0] if f.values else None,
+                            location=location,
                         ),
                     )
                 )
@@ -384,11 +403,15 @@ def walk_query_fields(
     where_leaf_resolutions: dict[
         str, tuple[Cube, Dimension | Measure | TimeDimension | Segment]
     ] = {}
-    for leaf in where_leaves:
+    for index, leaf in enumerate(where_leaves):
         try:
             c, fld = resolve_with_views(leaf.dimension)
         except Exception as exc:
-            diagnostics.append(_diagnostic_from_resolve_exc(leaf.dimension, exc))
+            diagnostics.append(
+                _diagnostic_from_resolve_exc(
+                    leaf.dimension, exc, QueryLocation(section="where", index=index)
+                )
+            )
             continue
         field_type = _filter_field_type(fld)
         if field_type is not None:
@@ -401,13 +424,13 @@ def walk_query_fields(
                         message=str(exc),
                         cube=c.name,
                         field=fld.name,
-                        op=leaf.op,
+                        location=QueryLocation(section="where", index=index),
                         value=leaf.values[0] if leaf.values else None,
                         source=FilterTypeError(
                             str(exc),
                             dimension=leaf.dimension,
                             op=leaf.op,
-                            value=leaf.values[0] if leaf.values else None,
+                            location=QueryLocation(section="where", index=index),
                         ),
                     )
                 )
@@ -466,7 +489,7 @@ def walk_query_fields(
     # emitter to report precisely; here we just collect what resolves.
     # Declared ``dependencies`` (bridge cubes) are pulled in too.
     derived_operand_fields: list[tuple[Cube, Measure]] = []
-    for ir in q.derived_measures:
+    for derived_index, ir in enumerate(q.derived_measures):
         for operand_ref in ir.operands:
             try:
                 c, fld = resolve_with_views(operand_ref)
@@ -487,6 +510,7 @@ def walk_query_fields(
                             f"is not a cube in the catalog."
                         ),
                         cube=dep,
+                        location=QueryLocation(section="derived_measures", index=derived_index),
                     )
                 )
                 continue

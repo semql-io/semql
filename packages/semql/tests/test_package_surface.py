@@ -38,6 +38,9 @@ def test_public_surface_includes_core_types() -> None:
         "PlaceholderError",
         "CrossDialectError",
         "PhaseDeferredError",
+        "render_analysis",
+        "QueryLocation",
+        "DiagnosticCategory",
         # introspect
         "META_CUBES",
         "CATALOG_CUBES",
