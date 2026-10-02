@@ -145,3 +145,9 @@ def test_sql_planner_prompt_examples_toggle(include_examples: bool) -> None:
     catalog = Catalog([_orders()])
     rendered = sql_planner_prompt(catalog, include_examples=include_examples)
     assert ("## SQL examples" in rendered) is include_examples
+
+
+def test_sql_planner_prompt_accepts_trusted_instructions() -> None:
+    catalog = Catalog([_orders()])
+    rendered = sql_planner_prompt(catalog, instructions="Use stable aliases.")
+    assert "## Additional instructions\nUse stable aliases." in rendered

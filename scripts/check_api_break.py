@@ -17,6 +17,7 @@ manually before publishing a release is enough for now.
 from __future__ import annotations
 
 import argparse
+import ast
 import re
 import sys
 from pathlib import Path
@@ -29,6 +30,27 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 # both a ``Literal['a', 'b']`` alias and a ``Union[Foo, Literal['x']]`` alias
 # into a comparable set of "things this type can be".
 _TOKEN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*|'[^']*'")
+
+
+def _is_field_description_change(breakage: griffe.Breakage) -> bool:
+    """Ignore documentation-only Field changes, retaining all executable arguments."""
+    if not isinstance(breakage, griffe.AttributeChangedValueBreakage):
+        return False
+    values: list[ast.Call] = []
+    for value in (breakage.old_value, breakage.new_value):
+        try:
+            expression = ast.parse(str(value), mode="eval").body
+        except SyntaxError:
+            return False
+        if not isinstance(expression, ast.Call):
+            return False
+        if not isinstance(expression.func, ast.Name) or expression.func.id != "Field":
+            return False
+        expression.keywords = [
+            keyword for keyword in expression.keywords if keyword.arg != "description"
+        ]
+        values.append(expression)
+    return ast.dump(values[0]) == ast.dump(values[1])
 
 
 def _is_pure_widening(breakage: griffe.Breakage) -> bool:
@@ -85,7 +107,11 @@ def check(base: str, head: str | None) -> int:
             print(f"# {module_name}: skipped — could not load at {base!r}: {exc}", file=sys.stderr)
             continue
         new = _load(module_name, head)
-        breakages = [b for b in griffe.find_breaking_changes(old, new) if not _is_pure_widening(b)]
+        breakages = [
+            b
+            for b in griffe.find_breaking_changes(old, new)
+            if not _is_pure_widening(b) and not _is_field_description_change(b)
+        ]
         if not breakages:
             print(f"# {module_name}: no breaking changes vs {base}")
             continue

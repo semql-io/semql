@@ -15,6 +15,7 @@ import os
 import urllib.parse
 import urllib.request
 import uuid
+from decimal import Decimal
 from typing import Any, LiteralString, cast
 
 import duckdb
@@ -90,6 +91,7 @@ class _Backend:
     dialect: Dialect
     adapter: Adapter
     prefix: str
+    setup: collections.abc.Callable[[str], object]
 
     def compile(
         self, query: SemanticQuery, *, rollup: bool = False, table: str = "events"
@@ -303,7 +305,7 @@ def backend(request: pytest.FixtureRequest) -> collections.abc.Iterator[_Backend
             "('C','Other'),('Absent','Absent'),('Hidden','Hidden')"
         )
         execute(f"INSERT INTO {prefix}worklog VALUES ('A',8),('C',5),('Hidden',99)")
-        yield _Backend(dialect=dialect, adapter=adapter, prefix=prefix)
+        yield _Backend(dialect=dialect, adapter=adapter, prefix=prefix, setup=execute)
     finally:
         try:
             if cleanup is not None:
@@ -335,6 +337,9 @@ def test_aggregate_numeric_membership_and_hidden_operands(backend: _Backend) -> 
     assert float(rows["A"]["maximum"]) == 30
     assert float(rows["A"]["rate"]) == pytest.approx(0.2)
     assert rows["Z"]["amount"] is None
+    assert rows["Z"]["mean"] is None
+    assert rows["Z"]["minimum"] is None
+    assert rows["Z"]["maximum"] is None
     assert rows["Z"]["rate"] is None
     assert int(rows["Z"]["n"]) == 1
     assert any(node.catalog_ref == "events.views" for node in compiled.analysis.nodes)
@@ -634,3 +639,58 @@ def test_real_ratio_zero_denominator_is_null(backend: _Backend) -> None:
     assert rows["zero"]["share"] is None
     assert float(rows["negative"]["share"]) == pytest.approx(-0.05)
     assert float(rows["positive"]["share"]) == pytest.approx(0.25)
+
+
+def test_real_empty_filtered_aggregate_returns_no_groups(backend: _Backend) -> None:
+    compiled = backend.compile(
+        SemanticQuery(
+            dimensions=["events.region"],
+            measures=["events.amount", "events.n"],
+            filters=[Filter(dimension="events.region", op="eq", values=["not-present"])],
+        )
+    )
+
+    assert backend.rows(compiled) == []
+
+
+def test_real_decimal_sum_preserves_numeric_value(backend: _Backend) -> None:
+    table = f"{backend.prefix}decimal_events"
+    if backend.dialect == Dialect.CLICKHOUSE:
+        backend.setup(f"CREATE TABLE {table} (amount Decimal(12, 4)) ENGINE=Memory")
+    else:
+        backend.setup(f"CREATE TABLE {table} (amount DECIMAL(12, 4))")
+    backend.setup(f"INSERT INTO {table} VALUES (0.1001), (0.2002)")
+    cube = Cube(
+        name="decimal_events",
+        table=table,
+        alias="d",
+        dialect=backend.dialect,
+        measures=[Measure(name="amount", sql="{d}.amount", agg="sum")],
+    )
+    compiled = Catalog([cube]).compile(SemanticQuery(measures=["decimal_events.amount"]))
+
+    rows = backend.rows(compiled)
+
+    assert len(rows) == 1
+    assert Decimal(str(rows[0]["amount"])) == Decimal("0.3003")
+
+
+def test_real_time_range_excludes_its_half_open_end(backend: _Backend) -> None:
+    compiled = backend.compile(
+        SemanticQuery(
+            measures=["events.amount"],
+            time_dimension=TimeWindow(
+                dimension="events.at",
+                granularity="day",
+                range=("2023-12-01", "2024-01-01"),
+            ),
+        ),
+        table="comparisons",
+    )
+
+    rows = backend.rows(compiled)
+
+    assert len(rows) == 1
+    time_column = compiled.columns[0]
+    assert str(rows[0][time_column])[:10] == "2023-12-01"
+    assert float(rows[0]["amount"]) == 0

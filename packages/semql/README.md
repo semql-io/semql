@@ -116,6 +116,25 @@ Duplicate semantic projections reject. To display a metric twice, reuse its
 output in presentation. `compile_plan()` is a privileged host/optimizer entry
 point, not a client-facing alternative to `SemanticQuery`.
 
+### Query cost budgets
+
+`estimate_cost(query, catalog.as_dict(), views=catalog.views)` sums the declared
+`size_hint` values for resolvable referenced cubes. It is a known
+subtotal/lower-bound guardrail, not a whole-plan scan estimate: it does not model
+selectivity, join multiplication, or actual runtime scans. `CostEstimate.cubes_unknown` preserves
+the names of referenced cubes without a size hint; `rows_scanned_unknown`
+remains a boolean summary.
+
+When `max_rows_scanned` is configured, the known subtotal always must fit and
+unknown-size references reject by default. If your admission policy explicitly
+allows unknown portions, opt in with
+`QueryBudget(max_rows_scanned=..., unknown_cost_policy="allow")`. Cube ceilings
+count each known and unknown referenced cube individually.
+
+View mapping is optional when references are cube-qualified. Known lower bounds
+and unknown identities remain separate so an explicit unknown-cost opt-in
+cannot mask a known subtotal over the ceiling.
+
 ### Alias-aware enrichment
 
 `enrich_all` now requires the result's analysis and returns `EnrichedResult`:

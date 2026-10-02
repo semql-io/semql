@@ -45,6 +45,7 @@ def planner_prompt(
     retrieved_snippets: list[str] | None = None,
     extra: str | None = None,
     cube_prompt_hooks: list[CubePromptHook] | None = None,
+    instructions: str | None = None,
 ) -> str:
     """Render the planner prompt fragment for ``catalog``.
 
@@ -70,6 +71,7 @@ def planner_prompt(
         retrieval_threshold=retrieval_threshold,
         saved_queries=list(catalog.saved_queries.values()),
         cube_prompt_hooks=cube_prompt_hooks,
+        instructions=instructions,
     )
     return segments.full(
         current_date=current_date,
@@ -90,6 +92,7 @@ def sql_planner_prompt(
     retriever: Retriever | None = None,
     top_k: int = 10,
     retrieval_threshold: int = 50,
+    instructions: str | None = None,
 ) -> str:
     """Render the **SQL-path** planner prompt fragment for ``catalog``.
 
@@ -115,6 +118,7 @@ def sql_planner_prompt(
         top_k=top_k,
         retrieval_threshold=retrieval_threshold,
         saved_queries=list(catalog.saved_queries.values()),
+        instructions=instructions,
     )
 
 
@@ -129,6 +133,7 @@ def planner_prompt_segments(
     retriever: Retriever | None = None,
     top_k: int = 10,
     retrieval_threshold: int = 50,
+    instructions: str | None = None,
 ) -> CatalogPrompt:
     """Render the planner prompt as a cacheable two-segment object — a
     viewer-invariant ``static`` segment plus a per-viewer ``overlay``."""
@@ -148,6 +153,7 @@ def planner_prompt_segments(
         top_k=top_k,
         retrieval_threshold=retrieval_threshold,
         saved_queries=list(catalog.saved_queries.values()),
+        instructions=instructions,
     )
 
 

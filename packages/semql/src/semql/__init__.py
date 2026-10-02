@@ -42,15 +42,18 @@ from semql.errors import (
     ContractError,
     CrossDialectError,
     Diagnostic,
+    DiagnosticCategory,
     FederationError,
     FilterTypeError,
     JoinPathError,
     PhaseDeferredError,
     PlaceholderError,
+    QueryLocation,
     ResolveError,
     SemQLError,
     UnknownIdentifierError,
 )
+from semql.explain import render_analysis
 from semql.federate import (
     BridgeJoin,
     DimensionOutput,
@@ -257,6 +260,9 @@ __all__ = [
     "SemanticResult",
     "SemanticTimePolicy",
     "compare_analysis",
+    "DiagnosticCategory",
+    "QueryLocation",
+    "render_analysis",
     "AggLiteral",
     "AutoPlan",
     "CrossSourceDecision",

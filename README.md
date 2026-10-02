@@ -142,6 +142,14 @@ result.rows     # [('EMEA', 150), ('US', 30)]
 single-backend query and a multi-fragment plan (per-backend SQL + a
 merge spec) when cubes span dialects — `engine.run` executes either.
 
+For offline, end-to-end recipes covering trusted request scope, semantic
+comparison, alias-aware enrichment, explicit federation, cache partitioning,
+and stream cleanup, see [`demos/integration_recipes.py`](demos/integration_recipes.py).
+Run it against installed packages (not editable workspace imports) using the
+steps in the [0.7-to-0.8 migration guide](docs/migrations/0.7-to-0.8.md).
+For the next release's budget-admission and prompt-result changes, see the
+[0.8-to-0.9 migration guide](docs/migrations/0.8-to-0.9.md).
+
 ## The four-role prompt pipeline
 
 Bring your own LLM. Each role pairs a **prompt-fragment builder**

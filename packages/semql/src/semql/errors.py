@@ -29,9 +29,72 @@ from __future__ import annotations
 import difflib
 import re
 from collections.abc import Iterable, Mapping
+from enum import StrEnum
 from typing import Any, ClassVar, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, field_validator
+
+
+class QueryLocation(BaseModel):
+    """Optional structural provenance into the caller's SemanticQuery."""
+
+    model_config = ConfigDict(frozen=True)
+
+    section: Literal[
+        "aliases",
+        "derived_measures",
+        "dimensions",
+        "filters",
+        "having",
+        "measures",
+        "segments",
+        "time_dimension",
+        "where",
+    ]
+    index: int | None = None
+    operand_index: int | None = None
+
+    @field_validator("index", "operand_index")
+    @classmethod
+    def _nonnegative_location_index(cls, value: int | None) -> int | None:
+        if value is not None and value < 0:
+            raise ValueError("query location indexes must be nonnegative")
+        return value
+
+    def to_payload(self) -> dict[str, Any]:
+        return self.model_dump(exclude_none=True)
+
+
+class DiagnosticCategory(StrEnum):
+    """Bounded, safe repair category for consumer guidance."""
+
+    AUTHORIZATION = "authorization"
+    CAPABILITY = "capability"
+    INVALID_INPUT = "invalid_input"
+    REFERENCE = "reference"
+    SEMANTIC_CONTRACT = "semantic_contract"
+
+
+_REPAIR_HINTS = {
+    DiagnosticCategory.AUTHORIZATION: "Check access through the authorized query path.",
+    DiagnosticCategory.CAPABILITY: "Adjust the query to a supported shape.",
+    DiagnosticCategory.INVALID_INPUT: "Correct the indicated query structure or type.",
+    DiagnosticCategory.REFERENCE: "Check the referenced field and its query section.",
+    DiagnosticCategory.SEMANTIC_CONTRACT: "Review the semantic contract for this query shape.",
+}
+
+
+def _diagnostic_category(code: str, reason: str) -> DiagnosticCategory:
+    if code == "AuthError" or reason in {"forbidden", "unauthenticated", "unauthorized"}:
+        return DiagnosticCategory.AUTHORIZATION
+    if code in {"FederationError", "PhaseDeferredError", "capability_unsupported"}:
+        return DiagnosticCategory.CAPABILITY
+    if code == "UnknownIdentifierError" or "unknown" in reason or "reference" in reason:
+        return DiagnosticCategory.REFERENCE
+    if code in {"ContractError", "FilterTypeError"}:
+        return DiagnosticCategory.SEMANTIC_CONTRACT
+    return DiagnosticCategory.INVALID_INPUT
+
 
 _ErrorPayload = dict[str, Any]
 
@@ -47,6 +110,9 @@ class Diagnostic(BaseModel):
     references: tuple[str, ...] = ()
     operation: str | None = None
     stage: str | None = None
+    location: QueryLocation | None = None
+    category: DiagnosticCategory | None = None
+    repair_hint: str | None = None
 
     @field_validator("code", "operation", "stage")
     @classmethod
@@ -54,6 +120,11 @@ class Diagnostic(BaseModel):
         if value is not None and not re.fullmatch(r"[A-Za-z0-9_.:-]{1,80}", value):
             return "contract_violation"
         return value
+
+    @field_validator("repair_hint")
+    @classmethod
+    def _bounded_repair_hint(cls, value: str | None) -> str | None:
+        return value if value in _REPAIR_HINTS.values() else None
 
     @field_validator("references")
     @classmethod
@@ -88,6 +159,11 @@ class Diagnostic(BaseModel):
             payload["operation"] = self.operation
         if self.stage is not None:
             payload["stage"] = self.stage
+        category = self.category or _diagnostic_category(self.code, self.reason)
+        payload["category"] = category.value
+        payload["repair_hint"] = self.repair_hint or _REPAIR_HINTS[category]
+        if self.location is not None:
+            payload["location"] = self.location.to_payload()
         return payload
 
 
@@ -109,7 +185,11 @@ class SemQLError(Exception):
             isinstance(self, ResolveError) and not isinstance(self, CompileError)
         ):
             reason = "invalid_reference"
-        return Diagnostic(code=self.code, reason=reason).to_public_payload()
+        return Diagnostic(
+            code=self.code,
+            reason=reason,
+            location=getattr(self, "location", None),
+        ).to_public_payload()
 
     @property
     def code(self) -> str:
@@ -222,18 +302,14 @@ class UnknownIdentifierError(CompileError):
         cube: str | None = None,
         hint: str | None = None,
         valid_alternatives: list[str] | None = None,
+        location: QueryLocation | None = None,
     ) -> None:
         super().__init__(message)
         self.kind = kind
         self.name = name
         self.cube = cube
         self.hint = hint
-        # Pre-computed alternative list (the LLM-friendly spelling of
-        # ``hint``). When ``None`` we look up alternatives at
-        # ``to_payload`` time from the message-context; the
-        # constructor accepts a precomputed list so the compiler can
-        # feed in the full set of cube/field names without re-running
-        # ``closest_match`` (we already did so in the walker).
+        self.location = location
         self.valid_alternatives: list[str] = list(valid_alternatives) if valid_alternatives else []
 
     def to_payload(self) -> _ErrorPayload:
@@ -243,6 +319,8 @@ class UnknownIdentifierError(CompileError):
             "kind": self.kind,
             "name": self.name,
         }
+        if self.location is not None:
+            payload["location"] = self.location.to_payload()
         if self.cube is not None:
             payload["cube"] = self.cube
         if self.hint is not None:
@@ -262,6 +340,11 @@ class UnknownIdentifierError(CompileError):
             hint=payload.get("hint"),
             valid_alternatives=(
                 [str(a) for a in cast("list[object]", alts)] if isinstance(alts, list) else None
+            ),
+            location=(
+                QueryLocation.model_validate(payload["location"])
+                if isinstance(payload.get("location"), Mapping)
+                else None
             ),
         )
 
@@ -311,6 +394,7 @@ class FilterTypeError(CompileError):
         next_tool: str | None = None,
         next_tool_args: dict[str, Any] | None = None,
         did_you_mean: list[str] | None = None,
+        location: QueryLocation | None = None,
     ) -> None:
         super().__init__(message)
         self.dimension = dimension
@@ -322,6 +406,7 @@ class FilterTypeError(CompileError):
         self.next_tool = next_tool
         self.next_tool_args = dict(next_tool_args) if next_tool_args else None
         self.did_you_mean: list[str] = list(did_you_mean) if did_you_mean else []
+        self.location = location
 
     def to_payload(self) -> _ErrorPayload:
         payload: _ErrorPayload = {
@@ -332,6 +417,8 @@ class FilterTypeError(CompileError):
         }
         if self.value is not None:
             payload["value"] = self.value
+        if self.location is not None:
+            payload["location"] = self.location.to_payload()
         if self.next_tool is not None:
             payload["next_tool"] = self.next_tool
             if self.next_tool_args is not None:
@@ -350,6 +437,11 @@ class FilterTypeError(CompileError):
             next_tool=payload.get("next_tool"),
             next_tool_args=payload.get("next_tool_args"),
             did_you_mean=payload.get("did_you_mean"),
+            location=(
+                QueryLocation.model_validate(payload["location"])
+                if isinstance(payload.get("location"), Mapping)
+                else None
+            ),
         )
 
 
@@ -538,7 +630,7 @@ __all__ = [
     "AuthError",
     "ContractError",
     "CrossDialectError",
-    "Diagnostic",
+    "DiagnosticCategory",
     "FederationError",
     "FilterTypeError",
     "JoinPathError",
@@ -548,4 +640,5 @@ __all__ = [
     "SemQLError",
     "UnknownIdentifierError",
     "closest_match",
+    "QueryLocation",
 ]

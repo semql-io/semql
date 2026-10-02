@@ -28,7 +28,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from semql._resolve import ResolutionDiagnostic, walk_query_fields
 from semql.capabilities import check_query_capabilities
-from semql.errors import Diagnostic, closest_match
+from semql.errors import Diagnostic, QueryLocation, closest_match
 from semql.introspect import PolicyFn, viewer_sees
 from semql.model import AuthContext, Cube
 from semql.refs import local_name
@@ -67,13 +67,12 @@ class ValidationError:
     references: tuple[str, ...] = ()
     operation: str | None = None
     stage: str | None = None
+    location: QueryLocation | None = None
 
     def to_diagnostic(
         self, *, severity: Literal["error", "warning", "advisory"] = "error"
     ) -> Diagnostic:
-        references = self.references or tuple(
-            ref for ref in (self.cube, self.field) if ref is not None
-        )
+        references = self.references
         return Diagnostic(
             code=self.code,
             severity=severity,
@@ -81,6 +80,7 @@ class ValidationError:
             references=references,
             operation=self.operation,
             stage=self.stage,
+            location=self.location,
         )
 
     def to_public_payload(
@@ -120,6 +120,7 @@ def _to_validation_error(d: ResolutionDiagnostic) -> ValidationError:
         references=diagnostic.references,
         operation=diagnostic.operation,
         stage=diagnostic.stage,
+        location=d.location,
     )
 
 

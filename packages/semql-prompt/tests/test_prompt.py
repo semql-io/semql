@@ -185,12 +185,16 @@ def test_planner_fragment_contains_spec_contract() -> None:
     rendered = build_planner_prompt_fragment({"orders": _orders()})
     assert "## Semantic path" in rendered
     assert "`SemanticQuery`" in rendered
-    assert "measures:" in rendered
-    assert "dimensions:" in rendered
-    assert "time_dimension:" in rendered
-    assert "filters:" in rendered
-    assert "having:" in rendered
-    assert "order:" in rendered
+    for field in (
+        "measures",
+        "dimensions",
+        "time_dimension",
+        "segments",
+        "filters",
+        "having",
+        "compare",
+    ):
+        assert f"`{field}`" in rendered
 
 
 def test_planner_fragment_contains_catalog() -> None:
@@ -201,7 +205,7 @@ def test_planner_fragment_contains_catalog() -> None:
 
 def test_planner_fragment_contains_raw_fallback() -> None:
     rendered = build_planner_prompt_fragment({"orders": _orders()})
-    assert "## When to fall back to raw SQL" in rendered
+    assert "## When raw SQL may be needed" in rendered
 
 
 def test_planner_fragment_omits_introspection_by_default() -> None:
@@ -345,8 +349,7 @@ def test_router_fragment_view_without_description_renders_cleanly() -> None:
 def test_planner_fragment_with_empty_catalog_still_renders_contract() -> None:
     rendered = build_planner_prompt_fragment({})
     assert "## Semantic path" in rendered
-    # Catalog block is empty but the surrounding sections remain.
-    assert "## When to fall back to raw SQL" in rendered
+    assert "## When raw SQL may be needed" in rendered
 
 
 def test_router_fragment_with_empty_catalog_has_no_topic_lines() -> None:

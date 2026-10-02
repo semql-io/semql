@@ -7,6 +7,28 @@ packages version in lockstep. Format loosely follows
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-10-02
+
+### Added
+
+- Trusted additive instructions on prompt builders and catalog conveniences,
+  query-aware retrieval for the Query Generator, and authorized current-query
+  context for runnable drilldown suggestions.
+
+### Changed
+
+- Prompt role contracts now track current `SemanticQuery` capabilities and
+  typed outputs. Presenter and drilldown guidance preserves evidence, units,
+  null semantics, authorization, and untrusted-data boundaries.
+- `PromptBudget` honors `protected_cubes` and surfaces an explicit
+  `fits`/`token_count`/`count_source` summary. Untrimmable content, including
+  at a zero budget, remains intact and reports inability to fit rather than
+  becoming an empty prompt. The existing `apply_budget` helper now forwards
+  the same options.
+- Field-description trimming uses a Markdown line regex; cube headers are
+  detected via the rendered dialect label, and protected cubes are never
+  removed.
+
 ## [0.8.0] - 2026-10-02
 
 ### Added
