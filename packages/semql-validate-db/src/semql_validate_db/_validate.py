@@ -39,13 +39,10 @@ DbValidationCode = Literal[
 @dataclass(frozen=True)
 class DbValidationError:
     """One drift finding.
-
-    ``cube`` always names the cube the probe ran against. ``field`` is
-    the measure / dimension / join target the probe was checking, or
-    ``None`` for cube-level findings (``missing_table``,
-    ``base_predicate_invalid``). ``detail`` carries the database's
-    own error message so the caller can route the message at the user
-    without re-parsing.
+    ``cube`` names the cube the probe ran against. ``field`` names the
+    measure / dimension / join target, or is ``None`` for cube-level
+    findings. ``detail`` preserves the raw driver exception for trusted
+    callers; public messages omit exception text and SQL fragments.
     """
 
     code: DbValidationCode
@@ -161,11 +158,6 @@ def _validate_cube(
     errors: list[DbValidationError] = []
     lookup = _cube_lookup(cube, context)
     from_clause = _from_clause(cube, lookup)
-    source_label = (
-        "(derived)"
-        if isinstance(cube.resolved_source, DerivedTable)
-        else from_clause.split(" AS ", 1)[0]
-    )
 
     ok, detail = _probe(connection, f"SELECT * FROM {from_clause} LIMIT 0")
     if not ok:
@@ -174,11 +166,7 @@ def _validate_cube(
                 code="missing_table",
                 cube=cube.name,
                 field=None,
-                message=(
-                    f"Cube {cube.name!r}: source {source_label!r} did not "
-                    "respond to a trivial SELECT — likely missing, renamed, "
-                    "or inaccessible to the connection's role."
-                ),
+                message=f"Cube {cube.name!r}: source validation probe failed.",
                 detail=detail,
             )
         )
@@ -215,8 +203,7 @@ def _validate_cube(
                     cube=cube.name,
                     field=field.name,
                     message=(
-                        f"Cube {cube.name!r}, {kind} {field.name!r}: SQL "
-                        f"fragment {field.sql!r} did not execute against the table."
+                        f"Cube {cube.name!r}, {kind} {field.name!r}: field validation probe failed."
                     ),
                     detail=detail,
                 )
@@ -234,10 +221,7 @@ def _validate_cube(
                     code="base_predicate_invalid",
                     cube=cube.name,
                     field=None,
-                    message=(
-                        f"Cube {cube.name!r}: base_predicate {cube.base_predicate!r} "
-                        "did not execute against the table."
-                    ),
+                    message=f"Cube {cube.name!r}: base predicate validation probe failed.",
                     detail=detail,
                 )
             )
@@ -272,10 +256,7 @@ def _validate_join(
             code="join_predicate_invalid",
             cube=source.name,
             field=join.to,
-            message=(
-                f"Cube {source.name!r} → {join.to!r}: join predicate "
-                f"{join.on!r} did not execute against the joined tables."
-            ),
+            message=f"Cube {source.name!r} → {join.to!r}: join validation probe failed.",
             detail=detail,
         )
     ]

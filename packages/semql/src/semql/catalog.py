@@ -40,6 +40,7 @@ from typing import TYPE_CHECKING, Any, TypeVar, cast
 from pydantic import BaseModel, ConfigDict, Field
 
 from semql._grounding import validate_relations
+from semql.analysis import CatalogContext
 from semql.compile import CompiledQuery, compile_query, explain_plan
 from semql.errors import FilterTypeError, SemQLError
 from semql.hooks import CompileHook, SqlRewriteHook
@@ -1025,6 +1026,7 @@ class Catalog:
         context: dict[str, str] | None = None,
         viewer: AuthContext | None = None,
         query_defaults: object | None = None,
+        catalog_context: CatalogContext | None = None,
     ) -> CompiledQuery:
         """Compile a ``SemanticQuery`` against this catalog. Thin wrapper
         around ``semql.compile.compile_query``.
@@ -1060,16 +1062,17 @@ class Catalog:
                 viewer=viewer,
                 policy=self._policy,
                 scope_fns=self._scope_fns,
+                catalog_context=catalog_context,
             )
 
             for compile_hook in self.compile_hooks:
                 try:
                     compile_hook.post_compile(query, compiled, viewer=viewer, context=context)
-                except Exception as e:
+                except Exception:
                     import warnings
 
                     warnings.warn(
-                        f"Compile hook {compile_hook} raised exception in post_compile: {e}",
+                        "Compile hook failed during post_compile.",
                         stacklevel=2,
                     )
 
@@ -1085,9 +1088,11 @@ class Catalog:
             for compile_hook in self.compile_hooks:
                 try:
                     compile_hook.on_compile_error(query, exc, viewer=viewer, context=context)
-                except Exception as e:
+                except Exception:
+                    import warnings
+
                     warnings.warn(
-                        f"Compile hook {compile_hook} raised exception in on_compile_error: {e}",
+                        "Compile hook failed during on_compile_error.",
                         stacklevel=2,
                     )
 
@@ -1239,8 +1244,7 @@ class Catalog:
         unauthorised-cube path it returns a synthetic
         ``ValidationError`` with code ``"unauthorised_cube"`` and the
         cube name attached. Permission-related errors that don't have
-        a structured ``ValidationError`` analogue fall through as
-        ``ValidationError(code="compile_error", message=str(exc))``.
+        exception details are returned using safe public rendering.
         """
         if isinstance(query_defaults, SemanticQueryDefaults):
             query = _apply_query_defaults(query, query_defaults)
@@ -1256,11 +1260,15 @@ class Catalog:
             # a backend dialect issue, a non-resolution compile bug).
             # Wrap it as a single ValidationError so the LLM still
             # gets an envelope.
+            public = exc.to_public_payload()
             return [
                 ValidationError(
-                    code="compile_error",
-                    message=str(exc),
-                    extra={"error_class": type(exc).__name__},
+                    code=public["code"],
+                    message=public["message"],
+                    reason=public["reason"],
+                    references=tuple(public.get("references", ())),
+                    operation=public.get("operation"),
+                    stage=public.get("stage"),
                 )
             ]
 

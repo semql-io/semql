@@ -20,6 +20,10 @@ boundaries:
 test *args:
     uv run pytest {{args}}
 
+# Real backend conformance, with disposable PostgreSQL/ClickHouse containers.
+test-conformance *args:
+    SEMQL_CONFORMANCE_TESTCONTAINERS=1 uv run pytest packages/semql-engine/tests/test_semantic_backend_conformance.py {{args}}
+
 check: fmt lint typecheck boundaries test
 
 # Mutation testing on semql core. Results saved to .mutmut-cache.

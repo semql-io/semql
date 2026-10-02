@@ -135,15 +135,19 @@ def _measure_expr(m: MeasureOutput) -> exp.Expression:
 
 
 def _dimension_expr(d: DimensionOutput) -> exp.Expression:
-    """A dimension's merge-side value: a ``date_trunc`` bucket when the
-    merge buckets it (``time_grain`` set), else a straight passthrough of
-    its single fragment source."""
-    src = d.sources[0]
-    if d.time_grain is not None:
-        return exp.Anonymous(
-            this="date_trunc", expressions=[exp.Literal.string(d.time_grain), _frag_col(src)]
+    """Render bucketed, passthrough, or multi-source dimension values."""
+    sources = [_frag_col(source) for source in d.sources]
+    value: exp.Expression = (
+        exp.Anonymous(
+            this="date_trunc",
+            expressions=[exp.Literal.string(d.time_grain), sources[0]],
         )
-    return _frag_col(src)
+        if d.time_grain is not None
+        else sources[0]
+    )
+    if d.time_grain is None and len(sources) > 1:
+        value = exp.Coalesce(this=sources[0], expressions=sources[1:])
+    return value
 
 
 def _filter_predicate(
@@ -225,6 +229,19 @@ def render_merge_sql(spec: MergeSpec) -> tuple[str, dict[str, object]]:
 
     for clause in spec.cross_partition_clauses:
         select = select.where(_cross_clause(clause, binder))
+
+    # Symmetric fact aggregation retains only groups observed in a fact;
+    # bridge-only rows are not part of the query's population.
+    presence_sources = getattr(spec, "observed_fact_sources", ())
+    if presence_sources:
+        predicates = [
+            exp.Not(this=exp.Is(this=_frag_col(source), expression=exp.Null()))
+            for source in presence_sources
+        ]
+        present: exp.Expression = predicates[0]
+        for predicate in predicates[1:]:
+            present = exp.Or(this=present, expression=predicate)
+        select = select.where(present)
 
     # Aggregate only when a measure actually re-aggregates; an
     # all-passthrough spec is a plain projection (no GROUP BY).

@@ -877,7 +877,7 @@ def test_materialize_ignores_enricher() -> None:
 
 def test_enrich_all_applies_matching_lookups() -> None:
     """enrich_all walks catalog.lookups and enriches columns present in rows."""
-    from semql import Catalog, Cube, Dialect, Dimension, Measure
+    from semql import Catalog, Cube, Dialect, Dimension, Measure, SemanticQuery
     from semql.lookups import enrich_all, sql_enricher
     from semql.model import Lookup, ResolutionContext
 
@@ -901,14 +901,20 @@ def test_enrich_all_applies_matching_lookups() -> None:
             )
         ],
     )
+    compiled = catalog.compile(
+        SemanticQuery(measures=["orders.revenue"], dimensions=["orders.region_id"])
+    )
     rows: list[dict[str, object]] = [{"region_id": "r1", "revenue": 100}]
-    out = enrich_all(rows, catalog, ResolutionContext())
-    assert out[0]["region_id__name"] == "EMEA"
+    out = enrich_all(rows, catalog, ResolutionContext(), analysis=compiled.analysis)
+    assert out.rows[0]["region_id__name"] == "EMEA"
+    assert out.analysis.nodes == compiled.analysis.nodes
+    assert out.analysis.outputs == compiled.analysis.outputs
+    assert out.analysis.enrichments[0].lookup_ref == "orders.region_id"
 
 
 def test_enrich_all_skips_lookups_not_in_result() -> None:
     """A lookup whose dimension column isn't in the rows is a no-op."""
-    from semql import Catalog, Cube, Dialect, Dimension, Measure
+    from semql import Catalog, Cube, Dialect, Dimension, Measure, SemanticQuery
     from semql.lookups import enrich_all, sql_enricher
     from semql.model import Lookup, ResolutionContext
 
@@ -932,6 +938,112 @@ def test_enrich_all_skips_lookups_not_in_result() -> None:
             )
         ],
     )
-    rows: list[dict[str, object]] = [{"revenue": 100}]  # no region_id column
-    out = enrich_all(rows, catalog, ResolutionContext())
-    assert out == rows
+    compiled = catalog.compile(SemanticQuery(measures=["orders.revenue"]))
+    rows: list[dict[str, object]] = [{"revenue": 100}]
+    out = enrich_all(rows, catalog, ResolutionContext(), analysis=compiled.analysis)
+    assert out.rows == rows
+    assert out.analysis == compiled.analysis
+
+
+def test_enrich_all_matches_aliased_identity_without_collapsing_equal_labels() -> None:
+    from semql import Catalog, Cube, Dialect, Dimension, Measure, SemanticQuery
+    from semql.lookups import enrich_all
+    from semql.model import Lookup, ResolutionContext
+
+    class Labels:
+        def enrich(self, ids: list[str], ctx: ResolutionContext) -> dict[str, str]:
+            return dict.fromkeys(ids, "Shared label")
+
+    cube = Cube(
+        name="events",
+        dialect=Dialect.DUCKDB,
+        table="events",
+        alias="e",
+        dimensions=[Dimension(name="region", sql="{e}.region", type="string")],
+        measures=[Measure(name="amount", sql="{e}.amount", agg="sum")],
+    )
+    catalog = Catalog([cube], lookups=[Lookup(dimension="events.region", enricher=Labels())])
+    compiled = catalog.compile(
+        SemanticQuery(
+            dimensions=["events.region"],
+            measures=["events.amount"],
+            aliases={"area": "events.region"},
+        )
+    )
+    rows: list[dict[str, object]] = [
+        {"area": "A", "amount": 30},
+        {"area": "B", "amount": 7},
+    ]
+    result = enrich_all(rows, catalog, ResolutionContext(), analysis=compiled.analysis)
+    assert result.rows == [
+        {"area": "A", "amount": 30, "area__label": "Shared label"},
+        {"area": "B", "amount": 7, "area__label": "Shared label"},
+    ]
+    assert rows == [{"area": "A", "amount": 30}, {"area": "B", "amount": 7}]
+    assert result.analysis.nodes == compiled.analysis.nodes
+    assert result.analysis.outputs == compiled.analysis.outputs
+    assert result.analysis.result == compiled.analysis.result
+    provenance = result.analysis.enrichments[0]
+    output = next(item for item in compiled.analysis.outputs if item.sql_alias == "area")
+    assert provenance.output_id == output.output_id
+    assert provenance.sql_alias == "area__label"
+
+
+def test_enrich_all_does_not_look_up_masked_keys() -> None:
+    from semql import AuthContext, Catalog, Cube, Dialect, Dimension, SemanticQuery
+    from semql.lookups import enrich_all
+    from semql.model import Lookup, ResolutionContext
+
+    class Labels:
+        def enrich(self, ids: list[str], ctx: ResolutionContext) -> dict[str, str]:
+            raise AssertionError("a masked semantic output must not be enriched")
+
+    cube = Cube(
+        name="events",
+        dialect=Dialect.DUCKDB,
+        table="events",
+        alias="e",
+        dimensions=[
+            Dimension(
+                name="region",
+                sql="{e}.region",
+                type="string",
+                required_roles=["reader"],
+                mask_roles=["reader"],
+            )
+        ],
+    )
+    catalog = Catalog([cube], lookups=[Lookup(dimension="events.region", enricher=Labels())])
+    compiled = catalog.compile(
+        SemanticQuery(dimensions=["events.region"]),
+        viewer=AuthContext(viewer_id="viewer", roles=["reader"]),
+    )
+    rows: list[dict[str, object]] = [{"region": None}]
+    result = enrich_all(rows, catalog, ResolutionContext(), analysis=compiled.analysis)
+    assert result.rows == [{"region": None}]
+    assert result.analysis.enrichments == ()
+
+
+def test_enrich_all_rejects_label_collision_without_mutating_source() -> None:
+    from semql import Catalog, ContractError, Cube, Dialect, Dimension, SemanticQuery
+    from semql.lookups import enrich_all
+    from semql.model import Lookup, ResolutionContext
+
+    class Labels:
+        def enrich(self, ids: list[str], ctx: ResolutionContext) -> dict[str, str]:
+            return dict.fromkeys(ids, "New label")
+
+    cube = Cube(
+        name="events",
+        dialect=Dialect.DUCKDB,
+        table="events",
+        alias="e",
+        dimensions=[Dimension(name="region", sql="{e}.region", type="string")],
+    )
+    catalog = Catalog([cube], lookups=[Lookup(dimension="events.region", enricher=Labels())])
+    compiled = catalog.compile(SemanticQuery(dimensions=["events.region"]))
+    rows: list[dict[str, object]] = [{"region": "A", "region__label": "Existing output"}]
+    with pytest.raises(ContractError) as exc:
+        enrich_all(rows, catalog, ResolutionContext(), analysis=compiled.analysis)
+    assert exc.value.reason == "duplicate_output"
+    assert rows == [{"region": "A", "region__label": "Existing output"}]

@@ -64,6 +64,10 @@ A clean run returns an empty list. Drift (a missing column, a renamed
 table) yields one `DbValidationError` per finding so a single run
 gives the full picture instead of bailing on the first failure.
 
+`DbValidationError.detail` retains raw driver text for trusted internal
+troubleshooting and can contain SQL or database details. Do not include it
+in ordinary CLI output or send it to external consumers.
+
 ## What it catches
 
 - `missing_table` — `cube.table` doesn't exist or the connection's

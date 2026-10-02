@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Any
 
 from semql.errors import (
     CompileError,
+    Diagnostic,
     FilterTypeError,
     ResolveError,
     UnknownIdentifierError,
@@ -116,6 +117,16 @@ class ResolutionDiagnostic:
     hint: str | None = None
     extra: dict[str, Any] = dc_field(default_factory=dict[str, Any])
     source: Exception | None = None
+
+    def to_diagnostic(self) -> Diagnostic:
+        """Expose bounded structured fields without serializing raw message/value data."""
+        return Diagnostic(
+            code=self.code,
+            reason=self.code,
+            references=tuple(ref for ref in (self.cube, self.field) if ref is not None),
+            operation=self.op,
+            stage="resolution",
+        )
 
 
 @dataclass
@@ -496,12 +507,47 @@ def walk_query_fields(
     return resolved, diagnostics
 
 
+def resolve_query_fields(
+    q: SemanticQuery,
+    catalog: dict[str, Cube],
+    views_map: dict[str, View],
+) -> _ResolvedFields:
+    """Resolve every ``cube.field`` reference in ``q`` to its catalog
+    entry and collect the ordered set of touched cubes.
+
+    Thin wrapper over :func:`semql._resolve.walk_query_fields`. The
+    shared walker accumulates per-reference diagnostics without
+    raising; this wrapper translates them into the compile-time error
+    contract: a single combined ``CompileError`` listing every
+    problem, or — when exactly one diagnostic carries a typed source
+    (``FilterTypeError`` / ``UnknownIdentifierError``) — that typed
+    exception standalone so UIs branching on the leaf class still
+    receive it."""
+    resolved, diagnostics = walk_query_fields(q, catalog, views_map=views_map)
+    if diagnostics:
+        if len(diagnostics) == 1:
+            src = diagnostics[0].source
+            if isinstance(src, CompileError):
+                raise src
+            raise CompileError(diagnostics[0].message)
+        lines = [f"  - {d.message}" for d in diagnostics]
+        raise CompileError(
+            f"SemanticQuery has {len(diagnostics)} resolution errors:\n" + "\n".join(lines)
+        )
+
+    if not resolved.touched:
+        raise CompileError("Could not determine any cubes from the query.")
+
+    return resolved
+
+
 __all__ = [
     "ResolutionDiagnostic",
     "ResolveError",
     "UnknownIdentifierError",
     "_ResolvedFields",
     "resolve_field",
+    "resolve_query_fields",
     "split",
     "walk_query_fields",
     "walk_where_leaves",

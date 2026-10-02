@@ -62,3 +62,29 @@ def test_federated_plan_replace_round_trips_version() -> None:
     plan = _single_backend_plan()
     tweaked = dataclasses.replace(plan, columns=[*plan.columns])
     assert tweaked.version == FEDERATED_PLAN_VERSION
+
+
+def test_federated_analysis_context_and_spec_survive_serialization() -> None:
+    from semql.analysis import CatalogContext
+
+    catalog = {
+        "orders": Cube(
+            name="orders",
+            alias="o",
+            table="orders",
+            dialect=Dialect.POSTGRES,
+            measures=[Measure(name="revenue", sql="{o}.amount", agg="sum")],
+            dimensions=[Dimension(name="region", sql="{o}.region", type="string")],
+        )
+    }
+    plan = compile_federated_query(
+        SemanticQuery(measures=["orders.revenue"], dimensions=["orders.region"]),
+        catalog,
+        catalog_context=CatalogContext(namespace="tenant_a", semantic_revision="r7"),
+    )
+    restored = FederatedPlan.model_validate(plan.model_dump())
+    assert restored == plan
+    assert restored.analysis.catalog_context == CatalogContext(
+        namespace="tenant_a", semantic_revision="r7"
+    )
+    assert restored.merge_spec.analysis == restored.analysis

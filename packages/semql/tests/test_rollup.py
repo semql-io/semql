@@ -16,6 +16,7 @@ table = fastest read). The applied rollup name is surfaced on
 
 from __future__ import annotations
 
+import duckdb
 import pytest
 from pydantic import ValidationError
 from semql import (
@@ -218,29 +219,6 @@ def test_exact_grain_match_routes_to_rollup_table() -> None:
     # The measure SQL points at the stored column ``revenue``, not amount.
     assert "revenue" in out.sql
     assert "amount" not in out.sql
-
-
-def test_match_aggregates_over_rollup_columns() -> None:
-    """SUM(stored_revenue) over the rollup gives the same total as
-    SUM(amount) over the base table — that's the whole point. The
-    emitted SQL must address the stored column, not the base column."""
-    cat = _cat_with_daily_rollup()
-    q = SemanticQuery(
-        measures=["orders.revenue", "orders.count"],
-        dimensions=["orders.region"],
-        time_dimension=TimeWindow(
-            dimension="orders.placed_at",
-            granularity="day",
-            range=("2026-01-01", "2026-02-01"),
-        ),
-    )
-    out = cat.compile(q)
-    upper = out.sql.upper()
-    assert "SUM(" in upper
-    assert "COUNT(" in upper
-    # Stored count column is named ``count`` — the rollup's measures
-    # share names with the base catalog measures.
-    assert "count" in out.sql.lower()
 
 
 def test_filter_on_stored_dimension_routes_to_rollup() -> None:
@@ -460,6 +438,52 @@ def test_time_dim_only_rollup_serves_query_without_time() -> None:
     )
     out = cat.compile(q)
     assert out.applied_rollup == "daily_region"
+
+
+def test_count_rollup_sums_stored_partial_counts() -> None:
+    cube = _orders_cube(
+        rollups=[
+            Rollup(
+                name="region_count",
+                physical_table="orders_region_count",
+                dimensions=["region"],
+                measures=["count"],
+            )
+        ]
+    )
+    query = SemanticQuery(measures=["orders.count"], dimensions=["orders.region"])
+    compiled = Catalog([cube]).compile(query)
+    assert compiled.applied_rollup == "region_count"
+    assert "SUM(o.count)" in compiled.sql
+    assert "COUNT(o.count)" not in compiled.sql
+
+
+def test_count_rollup_execution_sums_partial_counts_not_rows() -> None:
+    cube = _orders_cube(
+        rollups=[
+            Rollup(
+                name="region_count",
+                physical_table="orders_region_count",
+                dimensions=["region"],
+                measures=["count"],
+            )
+        ]
+    ).model_copy(update={"dialect": Dialect.DUCKDB})
+    compiled = Catalog([cube]).compile(
+        SemanticQuery(measures=["orders.count"], dimensions=["orders.region"])
+    )
+    con = duckdb.connect(":memory:")
+    try:
+        con.execute("CREATE TABLE orders_region_count (region VARCHAR, count BIGINT)")
+        con.execute(
+            "INSERT INTO orders_region_count VALUES ('north', 2), ('north', 3), ('south', 7)"
+        )
+        actual = {
+            region: count for region, count in con.execute(compiled.sql, compiled.params).fetchall()
+        }
+    finally:
+        con.close()
+    assert actual == {"north": 5, "south": 7}
 
 
 # ---------------------------------------------------------------------------

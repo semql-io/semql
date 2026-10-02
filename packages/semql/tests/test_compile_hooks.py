@@ -144,7 +144,7 @@ def test_post_compile_fires_after_success() -> None:
     assert received[0] is result
 
 
-def test_post_compile_exception_swallowed_and_warned() -> None:
+def test_post_compile_hook_failure_keeps_result_and_redacts_exception() -> None:
     from semql.hooks import BaseCompileHook
 
     class Crasher(BaseCompileHook):
@@ -155,8 +155,9 @@ def test_post_compile_exception_swallowed_and_warned() -> None:
     with warnings.catch_warnings(record=True) as w:
         warnings.simplefilter("always")
         result = cat.compile(SemanticQuery(measures=["orders.revenue"]))
-    assert result is not None
-    assert any("post hook crash" in str(warning.message) for warning in w)
+    assert result.columns == ["revenue"]
+    assert len(w) == 1
+    assert "post hook crash" not in str(w[0].message)
 
 
 def test_post_compile_not_called_on_error() -> None:
@@ -195,7 +196,7 @@ def test_on_compile_error_fires_on_failure() -> None:
     assert isinstance(errors[0], CompileError)
 
 
-def test_on_compile_error_hook_exception_swallowed() -> None:
+def test_on_compile_error_hook_failure_preserves_original_error_and_redacts_exception() -> None:
     from semql.hooks import BaseCompileHook
 
     class CrashOnError(BaseCompileHook):
@@ -208,7 +209,8 @@ def test_on_compile_error_hook_exception_swallowed() -> None:
         with pytest.raises(CompileError):
             # Original CompileError still propagates; RuntimeError is swallowed.
             cat.compile(SemanticQuery(measures=["orders.bad_field"]))
-    assert any("error hook crash" in str(warning.message) for warning in w)
+    assert len(w) == 1
+    assert "error hook crash" not in str(w[0].message)
 
 
 def test_on_compile_error_not_called_on_success() -> None:

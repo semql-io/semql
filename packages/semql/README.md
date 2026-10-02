@@ -61,6 +61,79 @@ The `{o}` placeholder in a cube's `sql` is its alias; the compiler
 resolves it (along with `{schema}`-style context placeholders and
 `{ctx.X}` row-level-security placeholders) at compile time.
 
+## Semantic and executable contracts
+
+Every successful compilation attaches `compiled.analysis`, including explicit
+coverage. Its frozen descriptors distinguish logical metrics and hidden operands,
+result grain/population, predicates, selection, time/null policies, declared
+catalog assumptions, and physical execution recipes. Complete **semantic
+coverage** does not certify source freshness, completeness, or key uniqueness.
+
+`node_id`, `output_id`, population IDs, and binding slots are artifact-local
+references. Serialization preserves them; independent compilations need not use
+the same strings. Compare definitions with `compare_analysis`, not IDs, SQL,
+aliases, or output positions:
+
+```python
+from semql import CatalogContext, compare_analysis, compile_query
+
+revision = CatalogContext(namespace="reporting", semantic_revision="r17")
+first = compile_query(query, catalog.as_dict(), catalog_context=revision)
+second = compile_query(aliased_query, catalog.as_dict(), catalog_context=revision)
+comparison = compare_analysis(first.analysis, second.analysis, scope="expression")
+# comparison.outcome: "equivalent", "different", or "not_established"
+```
+
+The host owns the immutable catalog revision, including changes to catalog SQL,
+policies, and scope-function behavior. Without a revision, local analysis still
+works, but persisted/cross-process equivalence is not established. An explicit
+`shared_catalog_snapshot=True` attests a shared immutable snapshot in-process.
+
+Expression comparison is not a promise of equal cohorts or result rows.
+`scope="result"` also compares grain, population, joins, selection, and time
+policy. Supply `left_context` and `right_context` as private mappings keyed by
+each artifact's **semantic binding slots**, or provide `bound_context_equal`
+after independently establishing that equality. Missing context yields
+`not_established`; values never appear in comparison diagnostics. Neither scope
+proves identical live data. Invalid/dangling/cyclic graphs raise `ContractError`;
+unknown required semantics or versions are never certified.
+
+Policy-context slots cover catalog predicates, tenancy, security context, and
+evaluated scopes. Supply each slot's complete private request context, or attest
+that context equality explicitly; the same catalog revision alone does not prove
+equal authorized populations. Value-free predicates require no private binding.
+Logical assumptions constrain result comparison; physical merge-key obligations
+remain separate execution checks.
+
+`CompiledQuery.model_dump()` / `model_validate()` preserve analysis, executable
+version, diagnostics, and binding requirements. Older payloads without analysis
+remain unavailable; recompile unsupported executable versions before execution.
+Artifact dumps include private `params` and are **not** safe diagnostic payloads.
+Use `SemQLError.to_public_payload()` for external errors; `to_payload()` remains
+lossless and potentially sensitive for trusted repair consumers.
+
+Duplicate semantic projections reject. To display a metric twice, reuse its
+output in presentation. `compile_plan()` is a privileged host/optimizer entry
+point, not a client-facing alternative to `SemanticQuery`.
+
+### Alias-aware enrichment
+
+`enrich_all` now requires the result's analysis and returns `EnrichedResult`:
+
+```python
+from semql import ResolutionContext, enrich_all
+
+enriched = enrich_all(rows, catalog, ResolutionContext(), analysis=compiled.analysis)
+rows = enriched.rows
+analysis = enriched.analysis
+```
+
+Lookup inputs are matched by qualified semantic identity, so aliases work and
+equal labels never collapse distinct keys. Original rows are not mutated;
+original semantic references and grain remain intact. Attached fields carry
+lookup provenance in `analysis.enrichments`. Masked keys are not enriched, and
+attachments cannot overwrite an existing output.
+
 ## What lives in the box
 
 | Surface | Module |

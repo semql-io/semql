@@ -5,6 +5,54 @@ packages version in lockstep. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); this file starts at 0.6.0
 (0.5.0 and earlier predate it — see the git history).
 
+## [Unreleased]
+
+### Added
+
+- Artifact-local semantic analysis on compiled and federated artifacts, with
+  typed logical lineage, result population/grain, binding dependencies, time
+  policies, declared assumptions, and separate physical recipes.
+- `compare_analysis` for structured expression/result comparison with
+  `equivalent`, `different`, and `not_established` outcomes. Host-supplied catalog
+  namespace/revision and private context attestations govern equivalence;
+  local ID strings are not persistent metric identities.
+- Executable binding manifests and version checks before cache/adapter access,
+  exact output correspondence, and materialized one-side merge-key validation.
+  Runtime analysis follows the current artifact through sync/async execution,
+  iterators, and synchronous cache hits.
+- Safe public diagnostic rendering, separate from lossless sensitive internal
+  error payloads. Typed execution failures remain catchable as `EngineError`.
+- Opt-in Testcontainers provisioning for PostgreSQL/ClickHouse conformance via
+  `just test-conformance`, also enabled in the full-suite CI job.
+
+### Changed
+
+- Symmetric federation now uses observed qualifying facts. Dimension-only
+  entities absent from every fact are excluded; one-sided and present-all-null
+  facts retain membership.
+- `enrich_all` requires semantic analysis and returns `EnrichedResult`, matching
+  lookup inputs by qualified identity rather than unaliased field names.
+  Original references/grain are preserved and attached fields carry provenance.
+- Federated executable format is version 3. Unsupported stored executable
+  versions must be recompiled. Legacy analysis is unavailable, not certified.
+- Duplicate semantic projections reject; presentation may display an existing
+  output more than once. Logical plans are documented as privileged
+  host/optimizer inputs.
+
+### Fixed
+
+- Multi-backend inline-derived requests reject explicitly instead of dropping
+  outputs; final federation aliases and requested output order are preserved.
+- Rollups sum stored partial counts instead of counting rollup rows.
+- Dense time-spine endpoints are typed for executable temporal expressions.
+- Static validation shares known unsupported-shape decisions with compilation.
+- Built-in MCP/logging errors no longer expose raw SQL, parameter values, or
+  arbitrary exception messages through diagnostic payloads.
+- Authorization-scoped result comparisons require private context evidence;
+  predicate lineage remains acyclic and describes only executed filter values.
+- Cache hits preserve merge-key validation evidence from the execution that
+  produced the cached rows, while returning the current artifact's analysis.
+
 ## [0.7.0]
 
 ### Added

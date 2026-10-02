@@ -44,14 +44,26 @@ from __future__ import annotations
 
 import re
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from dataclasses import replace as dc_replace
 from typing import TYPE_CHECKING, Literal, Protocol, cast
 
+from semql._resolve import _ResolvedFields, resolve_query_fields
+from semql.analysis import (
+    CatalogContext,
+    SemanticAnalysis,
+    SemanticAssumption,
+    SemanticDerivation,
+    build_analysis,
+)
 from semql.cnf import to_cnf as core_to_cnf
-from semql.compile import ColumnMeta, CompiledQuery, compile_query
+from semql.compile import (
+    ColumnMeta,
+    CompiledQuery,
+    compile_query,
+)
 from semql.errors import FederationError
-from semql.introspect import resolve_query
+from semql.logical import output_alias, output_column_collisions, to_logical_plan
 from semql.model import Cube, Dialect, Dimension, Join, Measure
 from semql.refs import cube_of, field_of, is_qualified, parse_qualified_ref
 from semql.spec import BoolExpr, Filter, SemanticQuery, TimeWindow
@@ -193,13 +205,17 @@ class MergeSpec:
     limit: int | None
     offset: int | None
     mode: Literal["distributive", "raw_rows"]
-    # CNF clauses that touch more than one partition, resolved to
-    # fragment coordinates: each literal is
-    # ``(negated, fragment_index, column_name, op, values)``. The merge
-    # applies them as a post-join WHERE — AND across clauses, OR within a
-    # clause. Self-contained: a renderer needs no catalog or cube→index
-    # map. ``op`` / ``values`` mirror :class:`semql.spec.Filter`.
     cross_partition_clauses: tuple[_ResolvedCrossClause, ...] = ()
+    merge_key_requirements: tuple[MergeKeyRequirement, ...] = ()
+    observed_fact_sources: tuple[FragmentColumn, ...] = ()
+    analysis: SemanticAnalysis = field(default_factory=SemanticAnalysis.unavailable)
+
+
+@dataclass(frozen=True)
+class MergeKeyRequirement:
+    fragment_index: int
+    columns: tuple[str, ...]
+    nulls_equal: bool = False
 
 
 # Format version of the federation plan IR.  Bumped when the
@@ -210,11 +226,10 @@ class MergeSpec:
 # skew instead of mis-reading a changed shape.
 #
 # v2: ``FederatedPlan.merge`` (the rendered DuckDB ``MergePlan``) was
-# removed — the plan now carries only the structured ``merge_spec``, and
-# the spec gained ``DimensionOutput.time_grain``, the widened
-# ``MeasureOutput.merge_agg`` (+ ``numerator_agg`` / ``denominator_agg``
-# for ratios), and fragment-resolved ``cross_partition_clauses``.
-FEDERATED_PLAN_VERSION = 2
+#
+# v3 adds exact materialized merge-key requirements, observed-fact
+# membership sources, and shared semantic analysis on federation artifacts.
+FEDERATED_PLAN_VERSION = 3
 
 
 @dataclass(frozen=True)
@@ -243,6 +258,36 @@ class FederatedPlan:
     columns: list[str]
     column_meta: list[ColumnMeta]
     version: int = FEDERATED_PLAN_VERSION
+    analysis: SemanticAnalysis = field(default_factory=SemanticAnalysis.unavailable)
+
+    def model_dump(self) -> dict[str, object]:
+        return {
+            "version": self.version,
+            "fragments": [fragment.model_dump() for fragment in self.fragments],
+            "merge_spec": _merge_spec_dump(self.merge_spec),
+            "columns": list(self.columns),
+            "column_meta": [meta.model_dump() for meta in self.column_meta],
+            "analysis": self.analysis.model_dump(mode="json"),
+        }
+
+    @classmethod
+    def model_validate(cls, data: dict[str, object]) -> FederatedPlan:
+        return cls(
+            fragments=[
+                CompiledQuery.model_validate(item)
+                for item in cast(list[dict[str, object]], data["fragments"])
+            ],
+            merge_spec=_merge_spec_validate(cast(dict[str, object], data["merge_spec"])),
+            columns=list(cast(list[str], data.get("columns", []))),
+            column_meta=[
+                ColumnMeta.model_validate(item)
+                for item in cast(list[dict[str, object]], data.get("column_meta", []))
+            ],
+            analysis=SemanticAnalysis.model_validate(cast(dict[str, object], data["analysis"]))
+            if "analysis" in data
+            else SemanticAnalysis.unavailable(),
+            version=_wire_int(data.get("version", 0), field="FederatedPlan.version"),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -273,6 +318,7 @@ class _Bridge:
     right_col: str
     left_dim: str
     right_dim: str
+    relationship: Literal["one_to_one", "one_to_many", "many_to_one"]
 
 
 def _find_dim_for_column(cube: Cube, alias: str, column: str) -> str:
@@ -336,6 +382,7 @@ def _parse_bridge(left_cube: Cube, right_cube: Cube, join: Join) -> _Bridge:
         right_col=rc,
         left_dim=left_dim,
         right_dim=right_dim,
+        relationship=join.relationship,
     )
 
 
@@ -392,41 +439,6 @@ def _dim_by_name(cube: Cube, name: str) -> Dimension:
 # ---------------------------------------------------------------------------
 # Partitioning + sub-query synthesis
 # ---------------------------------------------------------------------------
-
-
-def _touched(q: SemanticQuery, catalog: dict[str, Cube]) -> list[Cube]:
-    resolved = resolve_query(q, catalog)
-    touched = list(resolved.touched_cubes)
-
-    # ``resolve_query`` reports the cubes named by measures / dimensions,
-    # but a cube can also enter a query through a *filter* alone — e.g.
-    # "count orders, filtered to a customer tier" where the tier lives in
-    # another backend and there is no grouping dimension on it. Such a
-    # cube must count toward the touched set, or the federation entry gate
-    # sees a single backend, declines to federate, and the single-backend
-    # compiler then pulls the foreign cube onto the join path as a bridge
-    # (invalid cross-dialect SQL). Add any filter- / where-referenced cube
-    # that resolve_query didn't already surface, preserving order.
-    seen = {c.name for c in touched}
-    for cube_name in _filter_where_cube_names(q):
-        if cube_name not in seen and cube_name in catalog:
-            touched.append(catalog[cube_name])
-            seen.add(cube_name)
-    return touched
-
-
-def _filter_where_cube_names(q: SemanticQuery) -> list[str]:
-    """Cube names referenced by ``q.filters`` and the ``q.where`` tree.
-
-    Filter dimensions are qualified ``cube.field`` refs; the where-tree is
-    flattened to its ``Filter`` leaves. Order-preserving, may contain
-    duplicates (the caller de-dups)."""
-    names: list[str] = [cube_of(f.dimension) for f in q.filters]
-    if q.where is not None:
-        for clause in _to_cnf(q.where):
-            for _negated, lit in clause:
-                names.append(cube_of(lit.dimension))
-    return names
 
 
 def _find_bridges(
@@ -808,6 +820,15 @@ def _validate_having_targets(
             )
 
 
+def _output_name(q: SemanticQuery, ref: str) -> str:
+    """Return the selected output alias for a qualified projection."""
+    return next((name for name, target in q.aliases.items() if target == ref), field_of(ref))
+
+
+def _output_meta(meta: ColumnMeta, name: str) -> ColumnMeta:
+    return meta if meta.name == name else dc_replace(meta, name=name)
+
+
 def _build_merge_spec(
     q: SemanticQuery,
     catalog: dict[str, Cube],
@@ -839,8 +860,8 @@ def _build_merge_spec(
     for ref in q.dimensions:
         idx = cube_to_idx[_resolve_field_to_cube(ref, catalog).name]
         col = partitions[idx].dim_columns[ref]
-        alias = field_of(ref)
-        meta = next(m for m in output_column_meta if m.name == alias)
+        alias = _output_name(q, ref)
+        meta = _output_meta(next(m for m in output_column_meta if m.name == alias), alias)
         dimension_outputs.append(
             DimensionOutput(output_name=alias, sources=[FragmentColumn(idx, col)], column_meta=meta)
         )
@@ -864,6 +885,19 @@ def _build_merge_spec(
     restricting_cubes = frozenset(f.dimension.split(".", 1)[0] for f in q.filters)
     bridge_joins = _build_merge_joins(partitions, bridges, primary_idx, restricting_cubes)
     resolved_cross = _resolve_cross_clauses(cross_partition_clauses or [], cube_to_idx)
+    key_requirements: list[MergeKeyRequirement] = []
+    for bridge in bridges:
+        unique_sides: list[tuple[Cube, str]] = []
+        if bridge.relationship in ("one_to_one", "one_to_many"):
+            unique_sides.append((bridge.left_cube, bridge.left_dim))
+        if bridge.relationship in ("one_to_one", "many_to_one"):
+            unique_sides.append((bridge.right_cube, bridge.right_dim))
+        for cube, dim in unique_sides:
+            fragment_index = cube_to_idx[cube.name]
+            key_column = partitions[fragment_index].bridge_columns[f"{cube.name}.{dim}"]
+            requirement = MergeKeyRequirement(fragment_index, (key_column,))
+            if requirement not in key_requirements:
+                key_requirements.append(requirement)
 
     _validate_having_targets(q.having, measure_outputs)
 
@@ -878,6 +912,7 @@ def _build_merge_spec(
         offset=q.offset,
         mode=mode,
         cross_partition_clauses=resolved_cross,
+        merge_key_requirements=tuple(key_requirements),
     )
 
 
@@ -909,13 +944,15 @@ def _build_distributive_spec(
     for ref in q.measures:
         idx = cube_to_idx[_resolve_field_to_cube(ref, catalog).name]
         plan = partitions[idx]
-        m_name = field_of(ref)
-        meta = next(m for m in output_column_meta if m.name == m_name)
+        output_name = _output_name(q, ref)
+        meta = _output_meta(
+            next(m for m in output_column_meta if m.name == output_name), output_name
+        )
         if ref in plan.avg_columns:
             sum_col, count_col = plan.avg_columns[ref]
             measure_outputs.append(
                 MeasureOutput(
-                    output_name=m_name,
+                    output_name=output_name,
                     merge_agg="avg_recomposed",
                     sum_source=FragmentColumn(idx, sum_col),
                     count_source=FragmentColumn(idx, count_col),
@@ -926,8 +963,8 @@ def _build_distributive_spec(
             col = plan.measure_columns[ref]
             measure_outputs.append(
                 MeasureOutput(
-                    output_name=m_name,
-                    merge_agg="sum",  # both sum and count reduce to SUM at merge
+                    output_name=output_name,
+                    merge_agg="sum",
                     source=FragmentColumn(idx, col),
                     column_meta=meta,
                 )
@@ -1407,20 +1444,24 @@ def _build_raw_rows_spec(
         td_name = field_of(q.time_dimension.dimension)
         # The merge buckets raw timestamps; the output alias carries the
         # grain (e.g. ``created_at_day``) when one is set.
-        time_alias = f"{td_name}_{plan.time_grain}" if plan.time_grain else td_name
+        time_alias = _output_name(q, q.time_dimension.dimension)
+        if plan.time_grain and time_alias == td_name:
+            time_alias = f"{td_name}_{plan.time_grain}"
         time_output = (time_alias, FragmentColumn(idx, plan.time_col), plan.time_grain)
 
     measure_outputs: list[MeasureOutput] = []
     for ref in q.measures:
         idx = cube_to_idx[_resolve_field_to_cube(ref, catalog).name]
         plan = partitions[idx]
-        m_name = field_of(ref)
-        meta = next(m for m in output_column_meta if m.name == m_name)
+        output_name = _output_name(q, ref)
+        meta = _output_meta(
+            next(m for m in output_column_meta if m.name == output_name), output_name
+        )
         if ref in plan.ratio_measure_columns:
             num_col, num_agg, den_col, den_agg = plan.ratio_measure_columns[ref]
             measure_outputs.append(
                 MeasureOutput(
-                    output_name=m_name,
+                    output_name=output_name,
                     merge_agg="ratio",
                     numerator=FragmentColumn(idx, num_col),
                     denominator=FragmentColumn(idx, den_col),
@@ -1433,7 +1474,7 @@ def _build_raw_rows_spec(
             col, agg = plan.raw_measure_columns[ref]
             measure_outputs.append(
                 MeasureOutput(
-                    output_name=m_name,
+                    output_name=output_name,
                     merge_agg=_as_merge_agg(agg),
                     source=FragmentColumn(idx, col),
                     column_meta=meta,
@@ -1505,15 +1546,19 @@ def _merge_output_columns(
     the (mode-specific) time column, then measures. Shared by both
     pipelines — only ``time_output`` differs (raw-rows buckets the name)."""
     cube_to_idx = {c.name: i for i, p in enumerate(partitions) for c in p.cubes}
-    columns = [field_of(r) for r in q.dimensions]
-    meta = [_merge_meta_for_dim(r, partitions, fragments, cube_to_idx) for r in q.dimensions]
+    columns = [_output_name(q, r) for r in q.dimensions]
+    meta = [
+        _output_meta(_merge_meta_for_dim(r, partitions, fragments, cube_to_idx), _output_name(q, r))
+        for r in q.dimensions
+    ]
     if time_output is not None:
         col, cm = time_output
         columns.append(col)
         meta.append(cm)
     for r in q.measures:
-        columns.append(field_of(r))
-        meta.append(_merge_meta_for_measure(r, catalog))
+        output_name = _output_name(q, r)
+        columns.append(output_name)
+        meta.append(_output_meta(_merge_meta_for_measure(r, catalog), output_name))
     return columns, meta
 
 
@@ -1532,6 +1577,7 @@ def _compile_raw_rows(
     viewer: AuthContext | None,
     policy: PolicyFn | None,
     scope_fns: dict[str, ScopeFn] | None,
+    catalog_context: CatalogContext | None,
 ) -> FederatedPlan:
     partitions = [
         _build_partition_sub_query_raw_rows(
@@ -1555,6 +1601,7 @@ def _compile_raw_rows(
             policy=policy,
             scope_fns=scope_fns,
             _allow_unbounded_ungrouped=True,
+            catalog_context=catalog_context,
         )
         for p in partitions
     ]
@@ -1566,7 +1613,13 @@ def _compile_raw_rows(
         plan = partitions[cube_to_idx[cube_of(q.time_dimension.dimension)]]
         # Raw-rows buckets at merge, so the output column carries the grain.
         td_col = f"{td_name}_{plan.time_grain}" if plan.time_grain else td_name
-        time_output = (td_col, ColumnMeta(name=td_col, kind="time", display_name=td_col))
+        time_name = _output_name(q, q.time_dimension.dimension)
+        if time_name == td_name:
+            time_name = td_col
+        time_output = (
+            time_name,
+            ColumnMeta(name=time_name, kind="time", display_name=time_name),
+        )
     output_columns, output_column_meta = _merge_output_columns(
         q, catalog, partitions, fragments, time_output=time_output
     )
@@ -1594,13 +1647,12 @@ def _compile_raw_rows(
 # The federated twin of :func:`semql.logical._detect_symmetric_agg`. Two or
 # more additive-measure facts that conform to one shared bridge cube, but live
 # on *different* backends, can still be combined safely: pre-aggregate each
-# fact to the conformed key on its own backend, then LEFT-join the per-fact
-# results onto the bridge (the entity universe) at the merge. Because each
-# fact aggregates to the grouping grain *before* the cross-fragment join, there
-# is no fan-out — this is categorically different from the join-before-aggregate
-# chasm trap. Making the bridge the primary fragment keeps the merge to plain
-# LEFT joins with single-source dimensions, the shapes the renderer already
-# emits.
+# fact to the conformed key on its own backend, then LEFT-join per-fact
+# aggregates onto the bridge. The executor applies observed-fact membership
+# using each fact key, excluding bridge-only entities without dropping
+# one-sided or all-null fact rows. Each fact is aggregated before the merge,
+# so the cross-fragment join cannot multiply measures. The bridge remains
+# primary to preserve its declared join semantics and dimensions.
 # ---------------------------------------------------------------------------
 
 
@@ -1750,10 +1802,13 @@ def _compile_cross_backend_symmetric(
     viewer: AuthContext | None,
     policy: PolicyFn | None,
     scope_fns: dict[str, ScopeFn] | None,
+    catalog_context: CatalogContext | None,
 ) -> FederatedPlan:
-    """Emit the cross-backend symmetric plan: a bridge fragment (the entity
-    universe + the requested dimensions) plus one pre-aggregated fragment per
-    fact, LEFT-joined to the bridge on the conformed key at the merge."""
+    """Emit bridge-primary fact aggregates with observed-fact membership.
+
+    The merge applies the existing bridge joins, then excludes bridge-only
+    rows using the non-null fact-key sources recorded on its MergeSpec.
+    """
 
     def _compile(sub: SemanticQuery, cubes: list[Cube]) -> CompiledQuery:
         return compile_query(
@@ -1767,6 +1822,7 @@ def _compile_cross_backend_symmetric(
             viewer=viewer,
             policy=policy,
             scope_fns=scope_fns,
+            catalog_context=catalog_context,
         )
 
     # Fragment 0 (primary): the bridge, projecting requested dims + the
@@ -1775,15 +1831,24 @@ def _compile_cross_backend_symmetric(
     bridge_dims = list(q.dimensions)
     if bridge_key_ref not in bridge_dims:
         bridge_dims.append(bridge_key_ref)
-    bridge_frag = _compile(SemanticQuery(measures=[], dimensions=bridge_dims), [sym.bridge])
+    bridge_filters = [f for f in q.filters if cube_of(f.dimension) == sym.bridge.name]
+    bridge_frag = _compile(
+        SemanticQuery(measures=[], dimensions=bridge_dims, filters=bridge_filters),
+        [sym.bridge],
+    )
     fragments: list[CompiledQuery] = [bridge_frag]
 
     bridges: list[BridgeJoin] = []
     measure_outputs: list[MeasureOutput] = []
     for idx, fact in enumerate(sym.facts, start=1):
         fact_key_ref = f"{fact.cube.name}.{fact.key_dim}"
+        fact_filters = [f for f in q.filters if cube_of(f.dimension) == fact.cube.name]
         frag = _compile(
-            SemanticQuery(measures=list(fact.measure_refs), dimensions=[fact_key_ref]),
+            SemanticQuery(
+                measures=list(fact.measure_refs),
+                dimensions=[fact_key_ref],
+                filters=fact_filters,
+            ),
             [fact.cube],
         )
         fragments.append(frag)
@@ -1795,14 +1860,15 @@ def _compile_cross_backend_symmetric(
         )
         for ref in fact.measure_refs:
             m_name = field_of(ref)
-            meta = next(m for m in frag.column_meta if m.name == m_name)
+            output_name = _output_name(q, ref)
+            meta = _output_meta(next(m for m in frag.column_meta if m.name == m_name), output_name)
             # Each fragment already aggregated to the conformed key; the merge
             # sums per group (identity when grouping by the key, a real fold
             # when grouping by a coarser bridge dimension). ``count`` reduces
             # to a sum-of-counts, exactly as the distributive path does.
             measure_outputs.append(
                 MeasureOutput(
-                    output_name=m_name,
+                    output_name=output_name,
                     merge_agg="sum",
                     source=FragmentColumn(idx, m_name),
                     column_meta=meta,
@@ -1811,10 +1877,17 @@ def _compile_cross_backend_symmetric(
 
     dimension_outputs: list[DimensionOutput] = []
     for ref in q.dimensions:
-        alias = field_of(ref)
-        meta = next(m for m in bridge_frag.column_meta if m.name == alias)
+        alias = _output_name(q, ref)
+        source_name = field_of(ref)
+        meta = _output_meta(
+            next(m for m in bridge_frag.column_meta if m.name == source_name), alias
+        )
         dimension_outputs.append(
-            DimensionOutput(output_name=alias, sources=[FragmentColumn(0, alias)], column_meta=meta)
+            DimensionOutput(
+                output_name=alias,
+                sources=[FragmentColumn(0, source_name)],
+                column_meta=meta,
+            )
         )
 
     _validate_having_targets(q.having, measure_outputs)
@@ -1830,7 +1903,14 @@ def _compile_cross_backend_symmetric(
         offset=q.offset,
         mode="distributive",
         cross_partition_clauses=(),
+        merge_key_requirements=(
+            MergeKeyRequirement(fragment_index=0, columns=(sym.bridge_key_dim,)),
+        ),
+        observed_fact_sources=tuple(
+            FragmentColumn(i, fact.key_dim) for i, fact in enumerate(sym.facts, start=1)
+        ),
     )
+
     output_columns = [d.output_name for d in dimension_outputs]
     output_columns += [m.output_name for m in measure_outputs]
     output_column_meta = [d.column_meta for d in dimension_outputs]
@@ -1841,6 +1921,220 @@ def _compile_cross_backend_symmetric(
         columns=output_columns,
         column_meta=output_column_meta,
     )
+
+
+def _merge_spec_dump(spec: MergeSpec) -> dict[str, object]:
+    return {
+        "primary_index": spec.primary_index,
+        "bridges": [
+            {
+                "left": {
+                    "fragment_index": b.left.fragment_index,
+                    "column_name": b.left.column_name,
+                },
+                "right": {
+                    "fragment_index": b.right.fragment_index,
+                    "column_name": b.right.column_name,
+                },
+                "join_kind": b.join_kind,
+            }
+            for b in spec.bridges
+        ],
+        "dimensions": [
+            {
+                "output_name": d.output_name,
+                "sources": [
+                    {"fragment_index": s.fragment_index, "column_name": s.column_name}
+                    for s in d.sources
+                ],
+                "column_meta": d.column_meta.model_dump(),
+                "time_grain": d.time_grain,
+            }
+            for d in spec.dimensions
+        ],
+        "measures": [
+            {
+                "output_name": m.output_name,
+                "merge_agg": m.merge_agg,
+                "column_meta": m.column_meta.model_dump(),
+                "source": _fragment_column_dump(m.source),
+                "sum_source": _fragment_column_dump(m.sum_source),
+                "count_source": _fragment_column_dump(m.count_source),
+                "numerator": _fragment_column_dump(m.numerator),
+                "denominator": _fragment_column_dump(m.denominator),
+                "numerator_agg": m.numerator_agg,
+                "denominator_agg": m.denominator_agg,
+            }
+            for m in spec.measures
+        ],
+        "having": [f.model_dump(mode="json") for f in spec.having],
+        "order_by": [list(item) for item in spec.order_by],
+        "limit": spec.limit,
+        "offset": spec.offset,
+        "mode": spec.mode,
+        "cross_partition_clauses": [
+            [list(literal) for literal in clause] for clause in spec.cross_partition_clauses
+        ],
+        "merge_key_requirements": [
+            {
+                "fragment_index": r.fragment_index,
+                "columns": list(r.columns),
+                "nulls_equal": r.nulls_equal,
+            }
+            for r in spec.merge_key_requirements
+        ],
+        "observed_fact_sources": [
+            {"fragment_index": s.fragment_index, "column_name": s.column_name}
+            for s in spec.observed_fact_sources
+        ],
+        "analysis": spec.analysis.model_dump(mode="json"),
+    }
+
+
+def _fragment_column_dump(source: FragmentColumn | None) -> dict[str, object] | None:
+    if source is None:
+        return None
+    return {"fragment_index": source.fragment_index, "column_name": source.column_name}
+
+
+def _wire_int(value: object, *, field: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ValueError(f"{field} must be an integer.")
+    return value
+
+
+def _fragment_column_validate(data: object) -> FragmentColumn | None:
+    if data is None:
+        return None
+    if not isinstance(data, dict):
+        raise ValueError("FragmentColumn must be an object.")
+    payload = cast(dict[str, object], data)
+    fragment_index = payload.get("fragment_index")
+    column_name = payload.get("column_name")
+    if not isinstance(column_name, str):
+        raise ValueError("FragmentColumn.column_name must be a string.")
+    return FragmentColumn(
+        fragment_index=_wire_int(fragment_index, field="FragmentColumn.fragment_index"),
+        column_name=column_name,
+    )
+
+
+def _merge_spec_validate(data: dict[str, object]) -> MergeSpec:
+    return MergeSpec(
+        primary_index=_wire_int(data["primary_index"], field="MergeSpec.primary_index"),
+        bridges=[
+            BridgeJoin(
+                left=cast(FragmentColumn, _fragment_column_validate(item["left"])),
+                right=cast(FragmentColumn, _fragment_column_validate(item["right"])),
+                join_kind=cast(
+                    Literal["left", "inner", "full_outer"], item.get("join_kind", "left")
+                ),
+            )
+            for item in cast(list[dict[str, object]], data.get("bridges", []))
+        ],
+        dimensions=[
+            DimensionOutput(
+                output_name=str(item["output_name"]),
+                sources=[
+                    cast(FragmentColumn, _fragment_column_validate(source))
+                    for source in cast(list[dict[str, object]], item["sources"])
+                ],
+                column_meta=ColumnMeta.model_validate(cast(dict[str, object], item["column_meta"])),
+                time_grain=cast(str | None, item.get("time_grain")),
+            )
+            for item in cast(list[dict[str, object]], data.get("dimensions", []))
+        ],
+        measures=[
+            MeasureOutput(
+                output_name=str(item["output_name"]),
+                merge_agg=cast(MergeAgg, item["merge_agg"]),
+                column_meta=ColumnMeta.model_validate(cast(dict[str, object], item["column_meta"])),
+                source=_fragment_column_validate(item.get("source")),
+                sum_source=_fragment_column_validate(item.get("sum_source")),
+                count_source=_fragment_column_validate(item.get("count_source")),
+                numerator=_fragment_column_validate(item.get("numerator")),
+                denominator=_fragment_column_validate(item.get("denominator")),
+                numerator_agg=cast(MergeAgg | None, item.get("numerator_agg")),
+                denominator_agg=cast(MergeAgg | None, item.get("denominator_agg")),
+            )
+            for item in cast(list[dict[str, object]], data.get("measures", []))
+        ],
+        having=[
+            Filter.model_validate(item)
+            for item in cast(list[dict[str, object]], data.get("having", []))
+        ],
+        order_by=[
+            (str(item[0]), cast(Literal["asc", "desc"], item[1]))
+            for item in cast(list[list[object]], data.get("order_by", []))
+        ],
+        limit=cast(int | None, data.get("limit")),
+        offset=cast(int | None, data.get("offset")),
+        mode=cast(Literal["distributive", "raw_rows"], data["mode"]),
+        cross_partition_clauses=tuple(
+            tuple(
+                (
+                    bool(literal[0]),
+                    _wire_int(
+                        literal[1],
+                        field="MergeSpec.cross_partition_clauses[].fragment_index",
+                    ),
+                    str(literal[2]),
+                    str(literal[3]),
+                    tuple(cast(list[object], literal[4])),
+                )
+                for literal in clause
+            )
+            for clause in cast(list[list[list[object]]], data.get("cross_partition_clauses", []))
+        ),
+        merge_key_requirements=tuple(
+            MergeKeyRequirement(
+                fragment_index=_wire_int(
+                    item["fragment_index"],
+                    field="MergeSpec.merge_key_requirements[].fragment_index",
+                ),
+                columns=tuple(cast(list[str], item["columns"])),
+                nulls_equal=bool(item.get("nulls_equal", False)),
+            )
+            for item in cast(list[dict[str, object]], data.get("merge_key_requirements", []))
+        ),
+        observed_fact_sources=tuple(
+            cast(FragmentColumn, _fragment_column_validate(item))
+            for item in cast(list[dict[str, object]], data.get("observed_fact_sources", []))
+        ),
+        analysis=SemanticAnalysis.model_validate(cast(dict[str, object], data["analysis"]))
+        if "analysis" in data
+        else SemanticAnalysis.unavailable(),
+    )
+
+
+def _validate_federated_aliases(q: SemanticQuery, resolved: _ResolvedFields) -> None:
+    selected = set(q.dimensions) | set(q.measures)
+    if q.time_dimension is not None:
+        selected.add(q.time_dimension.dimension)
+    collisions = output_column_collisions(
+        [dim.name for _, dim in resolved.dim_fields],
+        [measure.name for _, measure in resolved.measure_fields],
+    )
+    base_names = {
+        output_alias(cube.name, field.name, collisions)
+        for cube, field in [*resolved.dim_fields, *resolved.measure_fields]
+    }
+    if q.time_dimension is not None and resolved.time_dim is not None:
+        time_name = resolved.time_dim.name
+        if q.time_dimension.granularity is not None:
+            time_name += f"_{q.time_dimension.granularity}"
+        base_names.add(time_name)
+    for alias, ref in q.aliases.items():
+        if ref not in selected:
+            raise FederationError(
+                f"Alias {alias!r} targets a field that is not selected.",
+                reason="alias_target_not_selected",
+            )
+        if alias in base_names:
+            raise FederationError(
+                f"Alias {alias!r} collides with a selected output name.",
+                reason="alias_output_collision",
+            )
 
 
 def compile_federated_query(
@@ -1856,6 +2150,7 @@ def compile_federated_query(
     policy: PolicyFn | None = None,
     scope_fns: dict[str, ScopeFn] | None = None,
     mode: FederationMode = "distributive",
+    catalog_context: CatalogContext | None = None,
 ) -> FederatedPlan:
     if q.semi_joins:
         raise FederationError(
@@ -1869,10 +2164,203 @@ def compile_federated_query(
             "Federated compare-mode is not supported in v1.",
             reason="compare_in_federated",
         )
-    touched = _touched(q, catalog)
+    resolved = resolve_query_fields(q, catalog, views or {})
+    touched = list(resolved.touched)
     if not touched:
         raise FederationError("Empty query.", reason="empty")
     backends_seen = {c.dialect for c in touched}
+    if len(backends_seen) > 1 and q.derived_measures:
+        raise FederationError(
+            "Inline-derived measures are not supported across multiple backends.",
+            reason="inline_derived_multibackend",
+        )
+    if len(backends_seen) > 1:
+        _validate_federated_aliases(q, resolved)
+
+    def build_query_analysis(
+        fragments: Sequence[CompiledQuery],
+        merge_spec: MergeSpec | None = None,
+        *,
+        observed_facts: bool = False,
+    ) -> SemanticAnalysis:
+        logical = to_logical_plan(q, catalog, views=views, resolved=resolved)
+        population_evidence = [
+            population for fragment in fragments for population in fragment.analysis.populations
+        ]
+        policy_refs = tuple(
+            dict.fromkeys(
+                ref for population in population_evidence for ref in population.policy_refs
+            )
+        )
+        required_scopes = {
+            (cube.name, cube.scope)
+            for cube in resolved.touched
+            if viewer is not None
+            and cube.scope is not None
+            and scope_fns is not None
+            and cube.scope in scope_fns
+        }
+        evaluated_scopes = tuple(
+            dict.fromkeys(
+                scope for population in population_evidence for scope in population.evaluated_scopes
+            )
+        )
+        evidenced_scopes = {
+            (source, scope)
+            for population in population_evidence
+            for source in population.source_refs
+            for scope in population.evaluated_scopes
+        }
+        scope_coverage: Literal["complete", "not_established"] = (
+            "complete" if required_scopes.issubset(evidenced_scopes) else "not_established"
+        )
+        analysis = build_analysis(
+            q,
+            logical,
+            resolved,
+            catalog_context,
+            viewer_roles=frozenset(viewer.roles) if viewer is not None else frozenset(),
+            effective_scope_refs=policy_refs,
+            evaluated_scopes=evaluated_scopes,
+            scope_coverage=scope_coverage,
+            population_inclusion="observed_facts" if observed_facts else None,
+            applied_rollup=fragments[0].applied_rollup
+            if len(fragments) == 1 and merge_spec is None
+            else None,
+            physical_sources_hit=(
+                fragments[0].physical_sources_hit
+                if len(fragments) == 1 and merge_spec is None
+                else ()
+            ),
+        )
+        output_nodes = {output.sql_alias: output.node_id for output in analysis.outputs}
+        derivations: list[SemanticDerivation] = []
+        assumptions: list[SemanticAssumption] = []
+        if merge_spec is not None:
+
+            def physical_ref(source: FragmentColumn | None) -> str | None:
+                if source is None:
+                    return None
+                return f"fragment:{source.fragment_index}.{source.column_name}"
+
+            for dimension in merge_spec.dimensions:
+                node_id = output_nodes.get(dimension.output_name)
+                if node_id is None:
+                    continue
+                sources = tuple(
+                    coord
+                    for source in dimension.sources
+                    if (coord := physical_ref(source)) is not None
+                )
+                derivations.append(
+                    SemanticDerivation(
+                        operation="dimension",
+                        recipe="federated_projection",
+                        logical_node_ids=(node_id,),
+                        physical_refs=sources,
+                    )
+                )
+            for bridge in merge_spec.bridges:
+                left = physical_ref(bridge.left)
+                right = physical_ref(bridge.right)
+                if left is None or right is None:
+                    continue
+                derivations.append(
+                    SemanticDerivation(
+                        operation="join",
+                        recipe=bridge.join_kind,
+                        physical_refs=(f"left={left}", f"right={right}"),
+                    )
+                )
+            selected_measures = {_output_name(q, ref): ref for ref in q.measures}
+            for output in merge_spec.measures:
+                node_id = output_nodes.get(output.output_name)
+                ref = selected_measures.get(output.output_name)
+                if node_id is None or ref is None:
+                    continue
+                owner = _resolve_field_to_cube(ref, catalog)
+                logical_measure = next(
+                    (measure for measure in owner.measures if measure.name == field_of(ref)),
+                    None,
+                )
+                operation = logical_measure.agg if logical_measure is not None else "measure"
+                if output.merge_agg == "avg_recomposed":
+                    operation = "avg"
+                    recipe = "sum_count_recomposition"
+                    refs = tuple(
+                        f"{label}={coord}"
+                        for label, source in (
+                            ("sum", output.sum_source),
+                            ("count", output.count_source),
+                        )
+                        if (coord := physical_ref(source)) is not None
+                    )
+                elif output.merge_agg == "ratio":
+                    operation = "ratio"
+                    recipe = "merged_numerator_denominator"
+                    refs = tuple(
+                        f"{label}={aggregate}:{coord}"
+                        for label, aggregate, source in (
+                            ("numerator", output.numerator_agg, output.numerator),
+                            ("denominator", output.denominator_agg, output.denominator),
+                        )
+                        if (coord := physical_ref(source)) is not None
+                    )
+                else:
+                    source = physical_ref(output.source)
+                    refs = (source,) if source is not None else ()
+                    if output.merge_agg == "sum" and operation == "count":
+                        recipe = "sum_stored_partial_counts"
+                    elif output.merge_agg == "sum":
+                        recipe = "sum_partial_aggregates"
+                    elif merge_spec.mode == "raw_rows":
+                        recipe = f"raw_rows_{output.merge_agg}"
+                    else:
+                        recipe = f"fragment_{output.merge_agg}"
+                source_columns = (
+                    output.source,
+                    output.sum_source,
+                    output.count_source,
+                    output.numerator,
+                    output.denominator,
+                )
+                source_indices = {
+                    source.fragment_index for source in source_columns if source is not None
+                }
+                source_derivation_refs: list[str] = []
+                for index in source_indices:
+                    fragment = fragments[index]
+                    if fragment.applied_rollup is not None:
+                        source_derivation_refs.append(f"rollup:{fragment.applied_rollup}")
+                    source_derivation_refs.extend(
+                        f"physical_source:{name}" for name in fragment.physical_sources_hit
+                    )
+                refs += tuple(source_derivation_refs)
+                derivations.append(
+                    SemanticDerivation(
+                        operation=operation,
+                        recipe=recipe,
+                        logical_node_ids=(node_id,),
+                        physical_refs=refs,
+                    )
+                )
+            for requirement in merge_spec.merge_key_requirements:
+                assumptions.append(
+                    SemanticAssumption(
+                        reference=(
+                            f"fragment:{requirement.fragment_index}.{','.join(requirement.columns)}"
+                        ),
+                        kind="unique_merge_key",
+                        declared_value="unique",
+                        verification="catalog_trust",
+                    )
+                )
+        return analysis.model_copy(
+            update={
+                "assumptions": (*analysis.assumptions, *assumptions),
+                "derivations": (*analysis.derivations, *derivations),
+            }
+        )
 
     if len(backends_seen) == 1:
         c = compile_query(
@@ -1886,7 +2374,9 @@ def compile_federated_query(
             viewer=viewer,
             policy=policy,
             scope_fns=scope_fns,
+            catalog_context=catalog_context,
         )
+        analysis = build_query_analysis([c])
         return FederatedPlan(
             fragments=[c],
             merge_spec=MergeSpec(
@@ -1894,7 +2384,9 @@ def compile_federated_query(
                 bridges=[],
                 dimensions=[
                     DimensionOutput(
-                        output_name=cm.name, sources=[FragmentColumn(0, cm.name)], column_meta=cm
+                        output_name=cm.name,
+                        sources=[FragmentColumn(0, cm.name)],
+                        column_meta=cm,
                     )
                     for cm in c.column_meta
                     if cm.kind in ("dimension", "time")
@@ -1915,9 +2407,11 @@ def compile_federated_query(
                 offset=None,
                 mode="distributive",
                 cross_partition_clauses=(),
+                analysis=analysis,
             ),
             columns=c.columns,
             column_meta=c.column_meta,
+            analysis=analysis,
         )
 
     if q.measures:
@@ -1931,8 +2425,9 @@ def compile_federated_query(
             # are fan-safe — pre-aggregate per fact, then LEFT-join onto the
             # bridge. Anything else still refuses.
             sym = _detect_cross_backend_symmetric(q, catalog, touched)
+
             if sym is not None:
-                return _compile_cross_backend_symmetric(
+                plan = _compile_cross_backend_symmetric(
                     q,
                     sym,
                     context=context,
@@ -1943,6 +2438,15 @@ def compile_federated_query(
                     viewer=viewer,
                     policy=policy,
                     scope_fns=scope_fns,
+                    catalog_context=catalog_context,
+                )
+                analysis = build_query_analysis(
+                    plan.fragments, plan.merge_spec, observed_facts=True
+                )
+                return dc_replace(
+                    plan,
+                    analysis=analysis,
+                    merge_spec=dc_replace(plan.merge_spec, analysis=analysis),
                 )
             raise FederationError("Measures span backends.", reason="measures_span_backends")
     else:
@@ -1958,7 +2462,7 @@ def compile_federated_query(
     backend_order = [primary_partition] + [b for b in grouped if b is not primary_partition]
 
     if mode == "raw_rows":
-        return _compile_raw_rows(
+        plan = _compile_raw_rows(
             q,
             catalog,
             grouped,
@@ -1972,6 +2476,13 @@ def compile_federated_query(
             viewer=viewer,
             policy=policy,
             scope_fns=scope_fns,
+            catalog_context=catalog_context,
+        )
+        analysis = build_query_analysis(plan.fragments, plan.merge_spec)
+        return dc_replace(
+            plan,
+            analysis=analysis,
+            merge_spec=dc_replace(plan.merge_spec, analysis=analysis),
         )
 
     partitions = [
@@ -1994,6 +2505,7 @@ def compile_federated_query(
             viewer=viewer,
             policy=policy,
             scope_fns=scope_fns,
+            catalog_context=catalog_context,
         )
         for p in partitions
     ]
@@ -2009,11 +2521,13 @@ def compile_federated_query(
         # and the assembler can't find the meta (granularity != None).
         td_col = partitions[cube_to_idx[cube_of(ref)]].dim_columns[ref]
         td_meta = _merge_meta_for_dim(ref, partitions, fragments, cube_to_idx)
-        time_output = (td_col, dc_replace(td_meta, name=td_col))
+        td_alias = _output_name(q, ref)
+        if td_alias == field_of(ref):
+            td_alias = td_col
+        time_output = (td_alias, dc_replace(td_meta, name=td_alias))
     output_columns, output_column_meta = _merge_output_columns(
         q, catalog, partitions, fragments, time_output=time_output
     )
-
     merge_spec = _build_distributive_spec(
         q,
         catalog,
@@ -2023,17 +2537,22 @@ def compile_federated_query(
         output_column_meta,
         cross_partition_clauses=cross_partition_clauses,
     )
+    analysis = build_query_analysis(fragments, merge_spec)
+    merge_spec = dc_replace(merge_spec, analysis=analysis)
     return FederatedPlan(
         fragments=fragments,
         merge_spec=merge_spec,
         columns=output_columns,
         column_meta=output_column_meta,
+        analysis=analysis,
     )
 
 
 __all__ = [
     "FEDERATED_PLAN_VERSION",
     "FederatedPlan",
+    "MergeKeyRequirement",
+    "MergeSpec",
     "FederationError",
     "FederationMode",
     "compile_federated_query",

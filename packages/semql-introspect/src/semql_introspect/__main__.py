@@ -26,10 +26,9 @@ def _connect(backend_name: str, conn_string: str) -> Any:  # noqa: ANN401
     one backend's driver is installed. Connection-string syntax is
     driver-native (DSNs for psycopg, file paths for DuckDB)."""
     if backend_name == "postgres":
-        # psycopg lacks py.typed; cast the module so attribute access yields Any.
-        import psycopg  # type: ignore[import-not-found]
+        import psycopg
 
-        return cast(Any, psycopg).connect(conn_string)
+        return psycopg.connect(conn_string)
     if backend_name == "duckdb":
         import duckdb
 

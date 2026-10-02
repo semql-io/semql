@@ -12,6 +12,7 @@ from semql import (
     Cube,
     Dimension,
     Filter,
+    InlineDerived,
     Measure,
     SemanticQuery,
     TimeDimension,
@@ -225,3 +226,61 @@ def test_segment_unqualified_reported() -> None:
     errors = validate(q, _cat())
     codes = {e.code for e in errors}
     assert "segment_unqualified" in codes
+
+
+def test_validation_uses_shared_capability_decisions() -> None:
+    from semql.capabilities import check_query_capabilities
+    from semql.errors import ContractError
+
+    query = SemanticQuery(
+        measures=["orders.revenue"],
+        dimensions=["orders.region"],
+        time_dimension=TimeWindow(
+            dimension="orders.created_at",
+            granularity="day",
+            range=("2026-01-01", "2026-01-03"),
+            fill_nulls_with=0,
+        ),
+    )
+    expected = check_query_capabilities(query)
+    errors = validate(query, _cat())
+    capability = next(error for error in errors if error.code == "capability_unsupported")
+    assert capability.reason == expected[0].reason == "entity_time_fill_unsupported"
+    assert capability.references == expected[0].references
+    from semql.capabilities import require_query_capabilities
+
+    try:
+        require_query_capabilities(query)
+    except ContractError as error:
+        assert error.reason == capability.reason
+        assert error.references == capability.references
+    else:
+        raise AssertionError("lowering capability check should reject entity-time fill")
+
+
+def test_scalar_derived_only_has_own_capability_reason() -> None:
+    query = SemanticQuery(
+        derived_measures=[
+            InlineDerived(name="ratio", op="ratio", operands=["orders.revenue", "orders.count"])
+        ]
+    )
+    errors = validate(query, _cat())
+    assert any(
+        error.reason == "scalar_derived_only_unsupported" and error.code == "capability_unsupported"
+        for error in errors
+    )
+    assert not any(error.code == "empty_query" for error in errors)
+
+
+def test_grouped_derived_only_is_not_the_scalar_shape() -> None:
+    from semql.capabilities import check_query_capabilities
+
+    query = SemanticQuery(
+        dimensions=["orders.region"],
+        derived_measures=[
+            InlineDerived(name="ratio", op="ratio", operands=["orders.revenue", "orders.count"])
+        ],
+    )
+    assert "scalar_derived_only_unsupported" not in {
+        diagnostic.reason for diagnostic in check_query_capabilities(query)
+    }

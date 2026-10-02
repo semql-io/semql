@@ -228,6 +228,8 @@ jobs:
         run: uv sync --all-extras --frozen
 
       - name: pytest (full)
+        env:
+          SEMQL_CONFORMANCE_TESTCONTAINERS: "1"
         run: uv run pytest packages -p no:tach --no-cov
 
   # --- Build smoke (PRs + merge to main) -----------------------------------

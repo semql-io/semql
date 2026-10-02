@@ -201,3 +201,36 @@ def test_cross_backend_symmetric_having_rejects_unknown_measure() -> None:
             catalog,
         )
     assert exc.value.reason == "having_unknown_measure"
+
+
+def test_symmetric_population_uses_fact_presence_not_nullable_measures() -> None:
+    """Null-valued fact rows count as observed; bridge-only entity 4 does not."""
+    pg = duckdb.connect(":memory:")
+    bq = duckdb.connect(":memory:")
+    try:
+        pg.execute("CREATE TABLE employees (id INTEGER, name TEXT)")
+        pg.execute("INSERT INTO employees VALUES (1, 'Ana'), (2, 'Bob'), (3, 'Cay'), (4, 'Dee')")
+        pg.execute("CREATE TABLE worklog (id INTEGER, employee_id INTEGER, hours DOUBLE)")
+        pg.execute("INSERT INTO worklog VALUES (1, 1, 8.0), (2, 3, NULL)")
+        bq.execute("CREATE TABLE activity (id INTEGER, employee_id INTEGER, secs DOUBLE)")
+        bq.execute("INSERT INTO activity VALUES (1, 1, 300.0), (2, 2, 50.0), (3, 3, NULL)")
+
+        catalog = {c.name: c for c in (_activity_cube(), _worklog_cube(), _employees_cube())}
+        plan = compile_federated_query(
+            SemanticQuery(
+                measures=["activity.active_secs", "worklog.hours"],
+                dimensions=["employees.name"],
+            ),
+            catalog,
+        )
+        result = _engine(pg, bq).run(plan)
+
+        assert {row[0]: (row[1], row[2]) for row in result.rows} == {
+            "Ana": (300.0, 8.0),
+            "Bob": (50.0, None),
+            "Cay": (None, None),
+        }
+        assert "Dee" not in {row[0] for row in result.rows}
+    finally:
+        pg.close()
+        bq.close()

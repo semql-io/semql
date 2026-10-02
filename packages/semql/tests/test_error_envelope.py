@@ -35,7 +35,9 @@ from semql.catalog import Catalog
 from semql.compile import compile_query
 from semql.errors import (
     AuthError,
+    ContractError,
     CrossDialectError,
+    Diagnostic,
     FederationError,
     FilterTypeError,
     JoinPathError,
@@ -498,3 +500,65 @@ def test_collect_all_returns_empty_list_on_success() -> None:
 def test_closest_match_still_callable() -> None:
     assert closest_match("regin", ["region", "status"]) == "region"
     assert closest_match("zzz", ["region"]) is None
+
+
+def test_contract_error_safe_payload_and_lossless_internal_round_trip() -> None:
+    error = ContractError(
+        "SQL SECRET_SQL and bound SECRET_BIND repair SECRET_REPAIR",
+        reason="binding_missing",
+        artifact="fragment-2",
+        names=("expected", "actual"),
+        references=("orders.revenue",),
+        operation="execute",
+        stage="binding",
+    )
+    rebuilt = SemQLError.from_payload(error.to_payload())
+    assert isinstance(rebuilt, ContractError)
+    assert rebuilt.to_payload() == error.to_payload()
+    public = error.to_public_payload()
+    rendered = str(public)
+    for secret in ("SECRET_SQL", "SECRET_BIND", "SECRET_REPAIR", "fragment-2", "expected"):
+        assert secret not in rendered
+    assert public["reason"] == "binding_missing"
+    assert public["references"] == ["orders.revenue"]
+
+
+def test_diagnostic_rejects_unbounded_reason_and_keeps_advisory_severity() -> None:
+    diagnostic = Diagnostic(
+        code="unsafe_fanout",
+        severity="advisory",
+        reason="private sql fragment!",
+    )
+    public = diagnostic.to_public_payload()
+    assert public["reason"] == "contract_violation"
+    assert public["severity"] == "advisory"
+
+
+def test_filter_repair_payload_remains_lossless_but_public_rendering_is_safe() -> None:
+    error = FilterTypeError(
+        "bad SECRET_MESSAGE SQL SECRET_SQL",
+        dimension="orders.region",
+        op="eq",
+        value="SECRET_BOUND",
+        next_tool="resolve_lookup",
+        next_tool_args={"query": "SECRET_REPAIR"},
+    )
+    rebuilt = SemQLError.from_payload(error.to_payload())
+    assert isinstance(rebuilt, FilterTypeError)
+    assert rebuilt.to_payload() == error.to_payload()
+    public = str(error.to_public_payload())
+    for secret in ("SECRET_MESSAGE", "SECRET_SQL", "SECRET_BOUND", "SECRET_REPAIR"):
+        assert secret not in public
+
+
+def test_public_diagnostics_distinguish_compile_resolution_and_federation() -> None:
+    from semql.errors import CompileError, FederationError, UnknownIdentifierError
+
+    assert CompileError("private SQL").to_public_payload()["reason"] == "invalid_query"
+    unknown = UnknownIdentifierError("private query", kind="field", name="missing")
+    assert unknown.to_public_payload()["reason"] == "invalid_reference"
+    unsupported = FederationError("private SQL", reason="inline_derived_federation_unsupported")
+    public = unsupported.to_public_payload()
+    assert public["reason"] == "inline_derived_federation_unsupported"
+    assert public["stage"] == "lowering"
+    assert "private" not in str(public)

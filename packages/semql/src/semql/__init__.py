@@ -10,7 +10,27 @@ prompt rendering, etc.).
 from __future__ import annotations
 
 from semql._schema import flatten_root_ref
+from semql.analysis import (
+    CatalogContext,
+    Comparison,
+    ComparisonResult,
+    ComparisonScope,
+    Coverage,
+    EnrichmentProvenance,
+    SemanticAnalysis,
+    SemanticAssumption,
+    SemanticBinding,
+    SemanticDerivation,
+    SemanticJoin,
+    SemanticNode,
+    SemanticOutput,
+    SemanticPopulation,
+    SemanticResult,
+    SemanticTimePolicy,
+    compare_analysis,
+)
 from semql.autoplan import AutoPlan, CrossSourceDecision, autoplan
+from semql.bindings import BindingRequirement
 from semql.catalog import Catalog
 from semql.compile import MAX_UNGROUPED_ROWS, ColumnMeta, CompiledQuery, compile_query
 from semql.cost import BudgetExceededError, CostEstimate, QueryBudget, estimate_cost
@@ -19,7 +39,9 @@ from semql.docs import render_catalog_markdown
 from semql.errors import (
     AuthError,
     CompileError,
+    ContractError,
     CrossDialectError,
+    Diagnostic,
     FederationError,
     FilterTypeError,
     JoinPathError,
@@ -35,20 +57,15 @@ from semql.federate import (
     FederatedPlan,
     FragmentColumn,
     MeasureOutput,
+    MergeKeyRequirement,
     MergeSpec,
     compile_federated_query,
 )
 from semql.hooks import CubePromptHook, ErrorTransformHook
 
-# Note: ``LogicalPlan`` is intentionally NOT re-exported at the top
-# level. The IR is load-bearing for the compiler but isn't yet
-# serialisable (no model_dump / model_validate / schema_version).
-# Callers that need the IR — for debugging, snapshot tests, or
-# federation routing — import via the explicit module path
-# (``from semql.logical import LogicalPlan``). The naming review
-# 2026-06 calls for removing it from ``__all__`` until the wire
-# format is stable; this is the corresponding narrowing of the
-# top-level surface.
+# Logical plans are privileged host/optimizer inputs, not client request
+# payloads. Import that IR explicitly from semql.logical; external adapters
+# accept SemanticQuery instead.
 from semql.instant import parse_instant
 from semql.introspect import (
     CATALOG_CUBES,
@@ -78,6 +95,7 @@ from semql.logical import (
     to_logical_plan,
 )
 from semql.lookups import (
+    EnrichedResult,
     QueryResolution,
     ResolutionOutcome,
     enrich_all,
@@ -217,6 +235,28 @@ from semql.visualize import (
 )
 
 __all__ = [
+    "BindingRequirement",
+    "CatalogContext",
+    "Comparison",
+    "ComparisonResult",
+    "ComparisonScope",
+    "ContractError",
+    "Coverage",
+    "Diagnostic",
+    "EnrichedResult",
+    "EnrichmentProvenance",
+    "MergeKeyRequirement",
+    "SemanticAnalysis",
+    "SemanticAssumption",
+    "SemanticBinding",
+    "SemanticDerivation",
+    "SemanticJoin",
+    "SemanticNode",
+    "SemanticOutput",
+    "SemanticPopulation",
+    "SemanticResult",
+    "SemanticTimePolicy",
+    "compare_analysis",
     "AggLiteral",
     "AutoPlan",
     "CrossSourceDecision",

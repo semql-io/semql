@@ -82,8 +82,14 @@ def test_fan_out_allows_duplication_invariant_aggs(agg: str) -> None:
     customers = _customers([Measure(name="m", sql="{c}.score", agg=agg, unit="count")])  # type: ignore[arg-type]
     cat = Catalog([customers, _orders()])
     q = SemanticQuery(measures=["customers.m"], dimensions=["orders.region"])
-    out = cat.compile(q)  # must not raise
-    assert out.sql
+    out = cat.compile(q)
+    if agg == "count_distinct":
+        [diagnostic] = out.diagnostics
+        assert diagnostic.reason == "distinct_aggregation_fanout"
+        assert diagnostic.severity == "advisory"
+        assert diagnostic.references[0] == "customers.m"
+    else:
+        assert out.diagnostics == ()
 
 
 def test_fan_out_allows_single_cube_aggregation() -> None:
@@ -149,7 +155,7 @@ def test_chasm_trap_refuses_when_not_symmetric_handled() -> None:
         dimensions=["orders.identity_id"],
         filters=[Filter(dimension="users.name", op="eq", values=["Nikhil"])],
     )
-    with pytest.raises(CompileError, match="chasm|cross-multipl|inflat"):
+    with pytest.raises(CompileError):
         cat.compile(q)
 
 

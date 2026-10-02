@@ -40,6 +40,22 @@ path = "semql._schema"
 layer = "app"
 
 [[modules]]
+path = "semql.analysis"
+layer = "app"
+
+[[modules]]
+path = "semql._compare"
+layer = "app"
+
+[[modules]]
+path = "semql.bindings"
+layer = "foundation"
+
+[[modules]]
+path = "semql.capabilities"
+layer = "app"
+
+[[modules]]
 path = "semql.backend"
 layer = "app"
 

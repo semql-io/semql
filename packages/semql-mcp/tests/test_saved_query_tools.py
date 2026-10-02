@@ -221,29 +221,24 @@ def test_saved_query_tool_executes_when_executor_set() -> None:
     assert out["rows"][0]["region"] == "EU"
 
 
-def test_saved_query_tool_execute_failure_carries_sql() -> None:
-    """If the executor raises, the tool returns a structured error
-    payload alongside the SQL — same shape as ``query_execute``. The
-    raw driver text is redacted by default; debug mode surfaces it."""
+def test_saved_query_tool_execute_failure_redacts_driver_and_compiled_details() -> None:
+    """Saved-query tool failures use the same safe error envelope."""
 
-    def boom(sql: str, params: dict[str, Any]) -> list[dict[str, Any]]:
-        raise RuntimeError("connection refused")
+    def boom(sql: str, params: dict[str, Any]) -> list[dict[str, Any]]:  # noqa: ARG001
+        raise RuntimeError("connection refused SECRET_DRIVER_TEXT")
 
     async def call(s: MCPServer) -> dict[str, Any]:
         async with _client(s) as c:
             result = await c.call_tool("saved_paid_revenue_by_region", {})
             return result.data  # type: ignore[no-any-return]
 
-    out = _run(call(_server(_catalog_with_saved(), executor=boom)))
-    assert "error" in out
-    assert out["error"]["code"] == "ExecutionError"
-    assert "connection refused" not in out["error"]["message"]
-    # SQL still in the envelope so the caller can debug.
-    assert "sql" in out
-
-    dbg = _run(call(_server(_catalog_with_saved(), executor=boom, debug=True)))
-    assert dbg["error"]["code"] == "RuntimeError"
-    assert "connection refused" in dbg["error"]["message"]
+    for debug in (False, True):
+        out = _run(call(_server(_catalog_with_saved(), executor=boom, debug=debug)))
+        assert "error" in out
+        assert out["error"]["code"] == "ExecutionError"
+        assert "SECRET_DRIVER_TEXT" not in str(out)
+        assert "sql" not in out
+        assert "params" not in out
 
 
 # ---------------------------------------------------------------------------

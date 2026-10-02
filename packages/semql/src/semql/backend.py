@@ -274,7 +274,7 @@ class _StdSqlDialect:
         form, works as-is on Postgres / DuckDB / Snowflake. BigQuery
         and ClickHouse override this with their own quantile shapes."""
         return exp.WithinGroup(
-            this=exp.Anonymous(this="PERCENTILE_CONT", expressions=[exp.Literal.number(q)]),
+            this=exp.PercentileCont(this=exp.Literal.number(q)),
             expression=exp.Order(expressions=[exp.Ordered(this=expr)]),
         )
 
@@ -297,7 +297,11 @@ class _StdSqlDialect:
         end: exp.Expression,
         bucket_alias: str,
     ) -> exp.Expression:
-        # Default spine for Postgres + DuckDB:
+        # Bound ISO values arrive as strings; date_trunc/generate_series
+        # overload resolution needs temporal operands (DuckDB in particular
+        # does not implicitly type these placeholders from context).
+        start = exp.Cast(this=start.copy(), to=exp.DataType.build("TIMESTAMP"))
+        end = exp.Cast(this=end.copy(), to=exp.DataType.build("TIMESTAMP"))
         # generate_series(date_trunc(g, start), date_trunc(g, end - 1 step), 1 step)
         # BigQuery and Snowflake override this with their own table-function shapes.
         step = exp.Interval(
@@ -311,10 +315,20 @@ class _StdSqlDialect:
         trunc_end = exp.Anonymous(
             this="date_trunc", expressions=[exp.Literal.string(granularity), end_minus_step]
         )
-        series = exp.Anonymous(
-            this="generate_series",
-            expressions=[trunc_start, trunc_end, step.copy()],
-        )
+        series = exp.Anonymous(this="generate_series", expressions=[trunc_start, trunc_end, step])
+        if self.dialect == Dialect.DUCKDB:
+            # DuckDB resolves generate_series(start, end, step) in a
+            # SELECT expression as a TIMESTAMP[] value. Put it in FROM
+            # as a table function so the spine contains one row per bucket.
+            series_table = exp.Table(
+                this=series,
+                alias=exp.TableAlias(
+                    this=exp.to_identifier("generated"),
+                    columns=[exp.to_identifier(bucket_alias)],
+                ),
+            )
+            bucket = exp.column(bucket_alias, table="generated")
+            return exp.Select().select(bucket, copy=False).from_(series_table, copy=False)
         inner = exp.Select().select(exp.alias_(series, bucket_alias, copy=False), copy=False)
         return inner
 

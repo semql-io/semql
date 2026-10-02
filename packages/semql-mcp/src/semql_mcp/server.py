@@ -82,7 +82,7 @@ from semql.refs import cube_of
 from semql.rows import EntityFetch, EntityList
 from semql.safe import is_read_only_statement
 from semql.spec import Filter, SemanticQuery, TimeWindow
-from semql.validate import ValidationError
+from semql.validate import ValidationError, ValidationWarning
 from semql.validate import validate as validate_query
 
 Transport = Literal["stdio", "http", "sse", "streamable-http"]
@@ -228,16 +228,16 @@ class MCPServer:
         )
         def validate(spec: SemanticQuery) -> list[dict[str, Any]]:
             # Thread the resolved viewer/policy so validation filters the
-            # catalog to the viewer's authorized surface, exactly like
-            # ``query_semantic``/``explain``. Without it this entry point
-            # fails *open* where ``compile`` fails closed, turning validate
-            # into a hidden-catalog oracle: a low-role viewer validating a
-            # spec against a role-gated cube would get ``[]`` (clean) instead
-            # of an unknown-identifier error (SEMQL-MCP-VALIDATE-VIEWER).
+            # catalog to the viewer's authorized surface.
             errors: list[ValidationError] = validate_query(
                 spec, catalog, viewer=resolve_viewer(), policy=catalog.policy
             )
-            return [asdict(e) for e in errors]
+            return [
+                error.to_public_payload(
+                    severity="advisory" if isinstance(error, ValidationWarning) else "error"
+                )
+                for error in errors
+            ]
 
         @self.mcp.tool(
             name="explain",
@@ -255,7 +255,7 @@ class MCPServer:
             try:
                 compiled = catalog.compile(spec, context=context, viewer=resolve_viewer())
             except Exception as exc:
-                return f"-- compile failed: {exc}"
+                return f"-- compile failed: {_error_payload(exc)['error']['message']}"
             return compiled.sql
 
         @self.mcp.tool(
@@ -309,10 +309,7 @@ class MCPServer:
                     _guard_read_only(compiled)
                     rows = executor(compiled.sql, compiled.params)
                 except Exception as exc:
-                    return _error_payload(exc, debug=debug) | {
-                        "sql": compiled.sql,
-                        "params": compiled.params,
-                    }
+                    return _error_payload(exc, debug=debug)
                 return {
                     "dialect": compiled.dialect.value,
                     "sql": compiled.sql,
@@ -691,30 +688,16 @@ def _guard_read_only(compiled: CompiledQuery) -> None:
 
 
 def _error_payload(exc: Exception, *, debug: bool = False) -> dict[str, Any]:
-    """Turn an exception into a structured tool response.
-
-    The MCP client should be able to surface the failure mode to the
-    planner; raising would just crash the tool call. ``code`` matches
-    SemQL's error-leaf class names so callers can branch on them
-    without parsing the message.
-
-    Trust boundary: SemQL's own structured errors (and the read-only
-    guard) carry planner-facing messages by construction — they name
-    catalog fields, never raw rows — so they pass through verbatim. An
-    *arbitrary* executor / driver exception (``RuntimeError`` from a
-    DB-API call, a psycopg ``ProgrammingError``, …) can leak table /
-    column names or even row data in ``str(exc)``, so by default it is
-    reduced to a generic ``ExecutionError`` message. Construct the
-    server with ``debug=True`` to surface the raw text for local
-    troubleshooting."""
+    """Render a safe structured tool error, never arbitrary exception text."""
     if isinstance(exc, SemQLError):
-        return {"error": exc.to_payload()}
-    if isinstance(exc, ReadOnlyError) or debug:
-        return {"error": {"code": type(exc).__name__, "message": str(exc)}}
+        return {"error": exc.to_public_payload()}
+    readonly = isinstance(exc, ReadOnlyError)
     return {
         "error": {
-            "code": "ExecutionError",
-            "message": "Execution failed. Enable server debug mode to see details.",
+            "code": type(exc).__name__ if readonly else "ExecutionError",
+            "severity": "error",
+            "reason": "read_only_refusal" if readonly else "execution_failed",
+            "message": "read only refusal." if readonly else "execution failed.",
         }
     }
 
@@ -806,7 +789,7 @@ def _make_query_cube_tool(
             _guard_read_only(compiled)
             envelope["rows"] = executor(compiled.sql, compiled.params)
         except Exception as exc:
-            return _error_payload(exc, debug=debug) | envelope
+            return _error_payload(exc, debug=debug)
         return envelope
 
     query_cube_fn.__name__ = f"query_{cube_name}"
@@ -873,7 +856,7 @@ def _run_entity_read(
             raise ReadOnlyError("Compiled entity SQL is not a read-only SELECT; refusing.")
         envelope["rows"] = executor(compiled.sql, compiled.params)
     except Exception as exc:
-        return _error_payload(exc, debug=debug) | envelope
+        return _error_payload(exc, debug=debug)
     return envelope
 
 
@@ -906,19 +889,17 @@ def _run_entity_mutation(
     try:
         preview_rows = executor(compiled.preview_sql, compiled.preview_params)
     except Exception as exc:
-        return _error_payload(exc, debug=debug) | envelope
+        return _error_payload(exc, debug=debug)
     affected = len(preview_rows)
     cap = compiled.max_affected_rows
     if cap is not None and affected > cap:
-        return envelope | {
+        return {
             "error": {
                 "code": "MutationCapExceeded",
-                "message": (
-                    f"Mutation would affect {affected} rows, exceeding the cap of "
-                    f"{cap}. Narrow the target or raise max_mutation_rows."
-                ),
+                "severity": "error",
+                "reason": "mutation_cap_exceeded",
+                "message": "mutation exceeds affected row cap.",
             },
-            "affected_rows": affected,
             "executed": False,
         }
     if not confirm:
@@ -931,7 +912,7 @@ def _run_entity_mutation(
     try:
         executor(compiled.sql, compiled.params)
     except Exception as exc:
-        return _error_payload(exc, debug=debug) | envelope
+        return _error_payload(exc, debug=debug)
     return envelope | {"confirmed": True, "executed": True, "affected_rows": affected}
 
 
@@ -1154,7 +1135,7 @@ def _make_saved_query_tool(
             _guard_read_only(compiled)
             envelope["rows"] = executor(compiled.sql, compiled.params)
         except Exception as exc:
-            return _error_payload(exc, debug=debug) | envelope
+            return _error_payload(exc, debug=debug)
         return envelope
 
     saved_query_fn.__name__ = f"saved_{saved_name}"

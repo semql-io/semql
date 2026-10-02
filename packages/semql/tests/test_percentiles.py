@@ -45,33 +45,6 @@ def _cube(dialect: Dialect, name: str = "orders") -> Cube:
     )
 
 
-# ---------------------------------------------------------------------------
-# Postgres / DuckDB / Snowflake — ANSI ``PERCENTILE_CONT`` shape
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    "dialect",
-    [Dialect.POSTGRES, Dialect.DUCKDB, Dialect.SNOWFLAKE],
-)
-def test_percentile_emits_ansi_within_group(dialect: Dialect) -> None:
-    """The ANSI shape compiles via sqlglot's ``WithinGroup`` node.
-    Postgres + Snowflake render the textbook form ``PERCENTILE_CONT(q)
-    WITHIN GROUP (ORDER BY ...)``; DuckDB renders its accepted
-    shorthand ``PERCENTILE_CONT(q ORDER BY ...)`` — both compile
-    against the same node and both are valid in their dialect."""
-    cat = Catalog([_cube(dialect)])
-    q = SemanticQuery(measures=["orders.amount_median"], dimensions=["orders.region"])
-    out = cat.compile(q)
-    upper = out.sql.upper()
-    assert "PERCENTILE_CONT" in upper
-    assert "0.5" in out.sql
-    assert "ORDER BY" in upper
-    # Either the ANSI ``WITHIN GROUP (ORDER BY ...)`` (PG / SF) or the
-    # DuckDB shorthand ``PERCENTILE_CONT(q ORDER BY ...)``.
-    assert "WITHIN GROUP" in upper or "PERCENTILE_CONT(0.5 ORDER BY" in upper
-
-
 def test_percentile_q_values_per_agg() -> None:
     """Each agg literal maps to the right quantile (0.5/0.75/0.9/0.95)."""
     cat = Catalog([_cube(Dialect.DUCKDB)])

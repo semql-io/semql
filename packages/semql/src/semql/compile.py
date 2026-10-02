@@ -60,20 +60,24 @@ from sqlglot.errors import ParseError
 # import graph (no top-level package import).
 import semql.logical as _logical_mod
 from semql._resolve import (
-    _ResolvedFields,
-    walk_query_fields,
-)
-from semql._resolve import (
     resolve_field as _resolve_field_raw,
 )
+from semql._resolve import (
+    resolve_query_fields,
+)
+from semql.analysis import CatalogContext, SemanticAnalysis, build_analysis
 from semql.backend import DialectStrategy, dialect_for
+from semql.bindings import BindingRequirement, final_binding_requirements
+from semql.capabilities import require_query_capabilities
 
 # Importing from semql.dialect also registers the ClickHouse placeholder
 # override against the ``clickhouse`` dialect name (side effect on import).
 from semql.dialect import dialect_for as sqlglot_dialect_for
 from semql.errors import (
     CompileError,
+    ContractError,
     CrossDialectError,
+    Diagnostic,
     FederationError,
     FilterTypeError,
     JoinPathError,
@@ -212,6 +216,9 @@ class ColumnMeta:
         )
 
 
+COMPILED_QUERY_VERSION = 1
+
+
 @dataclass
 class CompiledQuery:
     dialect: Dialect
@@ -247,6 +254,16 @@ class CompiledQuery:
     # tie-break, or a fan-out join a future SUM would over-count across.
     # Empty for the overwhelming majority of queries.
     warnings: tuple[str, ...] = ()
+    version: int = COMPILED_QUERY_VERSION
+    analysis: SemanticAnalysis = dc_field(default_factory=SemanticAnalysis.unavailable)
+    binding_requirements: tuple[BindingRequirement, ...] | None = None
+    diagnostics: tuple[Diagnostic, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.binding_requirements is None:
+            self.binding_requirements = final_binding_requirements(
+                self.sql, self.dialect, self.params
+            )
 
     def model_dump(self) -> dict[str, Any]:
         """JSON-safe dict view of this CompiledQuery (round-trip helper).
@@ -256,6 +273,7 @@ class CompiledQuery:
         tool-call payloads / eval-loop fixtures can swap to a plain dict
         without changing the call site.
         """
+        assert self.binding_requirements is not None
         return {
             "dialect": self.dialect.value,
             "sql": self.sql,
@@ -266,6 +284,10 @@ class CompiledQuery:
             "derived_sources": list(self.derived_sources),
             "applied_rollup": self.applied_rollup,
             "physical_sources_hit": list(self.physical_sources_hit),
+            "version": self.version,
+            "analysis": self.analysis.model_dump(mode="json"),
+            "binding_requirements": [r.model_dump() for r in self.binding_requirements],
+            "diagnostics": [item.model_dump(mode="json") for item in self.diagnostics],
             "warnings": list(self.warnings),
         }
 
@@ -278,9 +300,23 @@ class CompiledQuery:
         equals ``cq`` field-for-field.
         """
         dialect = data["dialect"]
+        version = int(data.get("version", 0))
+        if version not in (0, COMPILED_QUERY_VERSION):
+            raise ValueError(f"Unsupported compiled query version {version}.")
         if isinstance(dialect, str):
             dialect = Dialect(dialect)
         column_meta = [ColumnMeta.model_validate(m) for m in data.get("column_meta", [])]
+        analysis_data = data.get("analysis")
+        analysis = (
+            SemanticAnalysis.model_validate(analysis_data)
+            if isinstance(analysis_data, dict)
+            else SemanticAnalysis.unavailable()
+        )
+        requirements = (
+            tuple(BindingRequirement.model_validate(item) for item in data["binding_requirements"])
+            if "binding_requirements" in data
+            else None
+        )
         return cls(
             dialect=dialect,
             sql=data["sql"],
@@ -292,6 +328,12 @@ class CompiledQuery:
             applied_rollup=data.get("applied_rollup"),
             physical_sources_hit=tuple(data.get("physical_sources_hit", ())),
             warnings=tuple(data.get("warnings", ())),
+            version=version,
+            analysis=analysis,
+            binding_requirements=requirements,
+            diagnostics=tuple(
+                Diagnostic.model_validate(item) for item in data.get("diagnostics", ())
+            ),
         )
 
 
@@ -1140,40 +1182,6 @@ def _validate_query_invariants(
         )
 
 
-def _resolve_query_fields(
-    q: SemanticQuery,
-    catalog: dict[str, Cube],
-    views_map: dict[str, View],
-) -> _ResolvedFields:
-    """Resolve every ``cube.field`` reference in ``q`` to its catalog
-    entry and collect the ordered set of touched cubes.
-
-    Thin wrapper over :func:`semql._resolve.walk_query_fields`. The
-    shared walker accumulates per-reference diagnostics without
-    raising; this wrapper translates them into the compile-time error
-    contract: a single combined ``CompileError`` listing every
-    problem, or — when exactly one diagnostic carries a typed source
-    (``FilterTypeError`` / ``UnknownIdentifierError``) — that typed
-    exception standalone so UIs branching on the leaf class still
-    receive it."""
-    resolved, diagnostics = walk_query_fields(q, catalog, views_map=views_map)
-    if diagnostics:
-        if len(diagnostics) == 1:
-            src = diagnostics[0].source
-            if isinstance(src, CompileError):
-                raise src
-            raise CompileError(diagnostics[0].message)
-        lines = [f"  - {d.message}" for d in diagnostics]
-        raise CompileError(
-            f"SemanticQuery has {len(diagnostics)} resolution errors:\n" + "\n".join(lines)
-        )
-
-    if not resolved.touched:
-        raise CompileError("Could not determine any cubes from the query.")
-
-    return resolved
-
-
 def _check_viewer_authorization(
     touched: list[Cube],
     viewer: AuthContext | None,
@@ -1386,83 +1394,82 @@ def _check_fan_out(
     join_edges: list[tuple[Cube, Cube, Any]],
     *,
     symmetric_handled: bool = False,
-) -> None:
-    """Refuse a query whose join graph fans out an additive measure.
-
-    A ``one_to_many`` / ``many_to_one`` join duplicates the rows of its
-    "one" side; ``SUM`` / ``COUNT`` over a measure on that cube then
-    double-counts — the canonical semantic-layer wrong result. The
-    cardinality is read from ``Join.relationship`` (this is its first
-    reader) and from ``Join.to`` rather than the plan's left/right
-    assignment, so spine-rooting that flips an edge can't fool it: the
-    "one" side is intrinsic to the declared relationship.
-
-    Scoped to a single query's join edges, so a cube whose measures only
-    fan out under *some other* join still aggregates fine on its own."""
-    duplicated: dict[str, tuple[str, str]] = {}  # cube -> (other cube, relationship)
-    # ``parents[X]`` = cubes ``X`` joins to on *its* many side (X is the
-    # duplicated-causing side). Used for the conformed-dimension chasm-trap
-    # check below: two cubes sharing a many-side parent cross-multiply.
+) -> tuple[Diagnostic, ...]:
+    """Reject unsafe additive fanout and report safe distinct fanout."""
+    duplicated: dict[str, tuple[str, str]] = {}
     parents: dict[str, set[str]] = {}
+    references: dict[str, str] = {}
     for left, right, join in join_edges:
         target = getattr(join, "to", None)
-        rel = getattr(join, "relationship", None)
+        relationship = getattr(join, "relationship", None)
         names = {left.name, right.name}
         if target not in names or len(names) != 2:
-            continue  # self-join or malformed edge — not a plain fan-out
+            continue
         declarer = (names - {target}).pop()
-        if rel == "many_to_one":
-            # many ``declarer`` rows per one ``target`` row → target duplicates.
-            duplicated.setdefault(target, (declarer, rel))
+        edge_ref = f"join:{left.name}->{right.name}"
+        references[left.name] = edge_ref
+        references[right.name] = edge_ref
+        if relationship == "many_to_one":
+            duplicated.setdefault(target, (declarer, relationship))
             parents.setdefault(declarer, set()).add(target)
-        elif rel == "one_to_many":
-            # one ``declarer`` row per many ``target`` rows → declarer duplicates.
-            duplicated.setdefault(declarer, (target, rel))
+        elif relationship == "one_to_many":
+            duplicated.setdefault(declarer, (target, relationship))
             parents.setdefault(target, set()).add(declarer)
 
-    # Conformed-dimension chasm trap. Two cubes that each carry an additive
-    # measure and are both the *many* side of a join to a shared bridge cube
-    # cross-multiply when joined through it (``factA ⋈ bridge ⋈ factB``),
-    # inflating every additive measure — the per-edge check below can't see
-    # it, because the duplicated cube is the *bridge*, not either fact.
-    # Refuse it here unless the planner recognised a shape symmetric
-    # aggregation can emit fan-safely (``symmetric_handled``), in which
-    # case ``_emit_symmetric_query`` produces the correct per-fact-subquery
-    # SQL and there is nothing to refuse.
-    additive = [(c, m) for c, m in measure_fields if m.agg in FAN_OUT_SENSITIVE_AGGS]
+    additive = [
+        (cube, measure) for cube, measure in measure_fields if measure.agg in FAN_OUT_SENSITIVE_AGGS
+    ]
     if not symmetric_handled:
-        for i in range(len(additive)):
-            cube_a, m_a = additive[i]
-            for j in range(i + 1, len(additive)):
-                cube_b, m_b = additive[j]
+        for index, (cube_a, measure_a) in enumerate(additive):
+            for cube_b, measure_b in additive[index + 1 :]:
                 if cube_a.name == cube_b.name:
-                    continue  # several additive measures on one fact — fine.
+                    continue
                 shared = parents.get(cube_a.name, set()) & parents.get(cube_b.name, set())
                 if shared:
                     bridge = sorted(shared)[0]
-                    raise CompileError(
-                        f"Measures {cube_a.name}.{m_a.name} and "
-                        f"{cube_b.name}.{m_b.name} both aggregate across a shared "
-                        f"join to {bridge!r} — a conformed-dimension 'chasm trap'. "
-                        f"Joining {cube_a.name!r} and {cube_b.name!r} through "
-                        f"{bridge!r} cross-multiplies their rows, so both "
-                        f"{m_a.agg.upper()}s would be inflated. Query each fact "
-                        f"separately for now; multi-fact symmetric aggregation "
-                        f"(one pre-aggregated subquery per fact) is the planned fix."
+                    refs = (
+                        f"{cube_a.name}.{measure_a.name}",
+                        f"{cube_b.name}.{measure_b.name}",
+                        references.get(cube_a.name, f"join:{cube_a.name}->{bridge}"),
+                        references.get(cube_b.name, f"join:{cube_b.name}->{bridge}"),
                     )
-
+                    raise ContractError(
+                        "Measures aggregate across a conformed join fanout.",
+                        reason="unsafe_fanout",
+                        references=refs,
+                        operation="aggregate",
+                        stage="lowering",
+                    )
     if not duplicated:
-        return
-    for cube, m in measure_fields:
-        if m.agg in FAN_OUT_SENSITIVE_AGGS and cube.name in duplicated:
-            other, rel = duplicated[cube.name]
-            raise CompileError(
-                f"Measure {cube.name}.{m.name} ({m.agg}) fans out: the "
-                f"{rel} join between {cube.name!r} and {other!r} duplicates "
-                f"{cube.name!r}'s rows, so {m.agg.upper()} would over-count. "
-                f"Aggregate it without traversing that join, or pre-aggregate "
-                f"{cube.name!r} to the join grain."
+        return ()
+
+    advisories: list[Diagnostic] = []
+    for cube, measure in measure_fields:
+        if cube.name not in duplicated:
+            continue
+        other, relationship = duplicated[cube.name]
+        edge = references.get(cube.name, f"join:{cube.name}->{other}")
+        reference = f"{cube.name}.{measure.name}"
+        if measure.agg in FAN_OUT_SENSITIVE_AGGS:
+            raise ContractError(
+                f"Measure {reference} ({measure.agg}) fans out over a join.",
+                reason="unsafe_fanout",
+                references=(reference, edge),
+                operation="aggregate",
+                stage="lowering",
             )
+        if measure.agg == "count_distinct":
+            advisories.append(
+                Diagnostic(
+                    code="fanout_distinct_advisory",
+                    severity="advisory",
+                    reason="distinct_aggregation_fanout",
+                    references=(reference, edge),
+                    operation="aggregate",
+                    stage="lowering",
+                )
+            )
+    return tuple(advisories)
 
 
 def _pick_single_dialect(touched: list[Cube]) -> Dialect:
@@ -1507,6 +1514,7 @@ class _CompileEnv:
         scope_fns: dict[str, ScopeFn] | None,
         allow_unbounded_ungrouped: bool,
         plan: LogicalPlan | None = None,
+        catalog_context: CatalogContext | None = None,
     ) -> None:
         # ``plan`` — a prebuilt :class:`LogicalPlan` the env must *trust*
         # verbatim instead of re-lowering ``q`` itself.  ``compile_plan``
@@ -1521,7 +1529,9 @@ class _CompileEnv:
         # resolution caches + pre-flight checks read it); ``compile_plan``
         # reconstructs it from the plan to guarantee that.
         self._prebuilt_plan = plan
+        self.catalog_context = catalog_context
         _validate_query_invariants(q, allow_unbounded_ungrouped=allow_unbounded_ungrouped)
+        require_query_capabilities(q)
 
         # Rollup routing — check before resolution. When a rollup
         # covers the query, the plan→plan transform rewrites the
@@ -1563,6 +1573,8 @@ class _CompileEnv:
         self.viewer = viewer
         self.policy = policy
         self.scope_fns = scope_fns
+        self.evaluated_scopes: set[str] = set()
+        self.effective_scope_refs: set[str] = set()
 
         # Compile context: caller-supplied substitutions + viewer
         # auto-flattening for ``{ctx.viewer_id}`` and the identity's
@@ -1581,7 +1593,8 @@ class _CompileEnv:
 
         # Use visible_catalog (viewer-filtered) so error messages don't enumerate
         # cubes the viewer can't access (SEMQL-RESOLVER-DIAGNOSTIC-HIDDEN-CATALOG-ENUMERATION).
-        resolved = _resolve_query_fields(q, self.visible_catalog, self.views_map)
+        resolved = resolve_query_fields(q, self.visible_catalog, self.views_map)
+        self.resolved_fields = resolved
         self.measure_fields = resolved.measure_fields
         self.dim_fields = resolved.dim_fields
         self.time_cube = resolved.time_cube
@@ -1594,6 +1607,20 @@ class _CompileEnv:
         # they participate in the fan-out guard so a cross-cube operand
         # that the join would inflate is refused (C17).
         self.derived_operand_fields = resolved.derived_operand_fields
+        if viewer is not None:
+            missing_scope_fns = sorted(
+                {
+                    cube.scope
+                    for cube in self.touched
+                    if cube.scope is not None
+                    and (self.scope_fns is None or cube.scope not in self.scope_fns)
+                }
+            )
+            if missing_scope_fns:
+                raise CompileError(
+                    "Viewer-scoped compilation requires registered ScopeFn(s) for "
+                    f"{missing_scope_fns!r}."
+                )
 
         _check_lifecycle(self.touched)
         _check_viewer_authorization(self.touched, viewer, policy)
@@ -1720,7 +1747,7 @@ class _CompileEnv:
         # COUNT). Needs the edges, so it runs here rather than in the
         # touched-cube prelude above. A chasm trap the planner flagged for
         # symmetric aggregation is emitted fan-safely, so it is not refused.
-        _check_fan_out(
+        self.diagnostics = _check_fan_out(
             [*self.measure_fields, *self.derived_operand_fields],
             self.join_edges,
             symmetric_handled=self.plan.symmetric is not None,
@@ -1736,6 +1763,7 @@ class _CompileEnv:
         # intent (one filter, one bound value) is preserved.
         self.params: dict[str, Any] = {}
         self._binds: dict[tuple[Any, str], str] = {}
+        self._logical_binding_types: dict[str, str] = {}
 
         # Output-column allocation. Collision-prefix any name that
         # appears more than once across dims + measures so each output
@@ -1884,6 +1912,7 @@ class _CompileEnv:
         name = f"p{len(self.params)}"
         self.params[name] = value
         self._binds[key] = name
+        self._logical_binding_types[name] = dim_type
         return self.strategy.placeholder(name, dim_type)
 
     def resolve_in_ctx(self, sql: str) -> str:
@@ -1979,6 +2008,7 @@ class _CompileEnv:
         if self.viewer is not None and cube.scope is not None and self.scope_fns is not None:
             fn = self.scope_fns.get(cube.scope)
             if fn is not None:
+                self.evaluated_scopes.add(cube.scope)
                 pred: ScopePredicate | None = fn(cube, self.viewer)
                 if pred is not None:
                     missing = [k for k in pred.ctx_keys if k not in self.ctx]
@@ -1988,6 +2018,10 @@ class _CompileEnv:
                             f"ctx_keys={pred.ctx_keys!r} but the following are not in "
                             f"the resolution context: {missing}."
                         )
+                    self.effective_scope_refs.add(f"scope:{cube.scope}")
+                    self.effective_scope_refs.update(
+                        f"scope_context:{key}" for key in pred.ctx_keys
+                    )
                     predicates.append(
                         _parse_fragment(
                             self._resolve_security_sql(cube, pred.sql), self.sqlglot_dialect
@@ -2070,7 +2104,11 @@ class _CompileEnv:
             q_val = _PERCENTILE_AGGS[m.agg]
             agg: exp.Expression = self.strategy.emit_percentile(q_val, inner)
         else:
-            agg = _agg_node(m, inner)
+            agg = (
+                exp.Sum(this=inner)
+                if self.applied_rollup is not None and m.agg == "count"
+                else _agg_node(m, inner)
+            )
         if m.filter:
             agg = exp.Filter(
                 this=agg,
@@ -2436,7 +2474,46 @@ class _CompileEnv:
         else:
             compiled = _emit_simple_query(self)
         warnings = self._compile_warnings()
-        return _dc_replace(compiled, warnings=warnings) if warnings else compiled
+        result = _dc_replace(compiled, warnings=warnings) if warnings else compiled
+        requirements = tuple(
+            _dc_replace(
+                requirement,
+                logical_type=self._logical_binding_types.get(requirement.name),
+            )
+            for requirement in final_binding_requirements(result.sql, result.dialect, result.params)
+        )
+        params = {
+            item.name: result.params[item.name]
+            for item in requirements
+            if item.name in result.params
+        }
+        return _dc_replace(
+            result,
+            version=COMPILED_QUERY_VERSION,
+            analysis=build_analysis(
+                self.q,
+                self.plan,
+                self.resolved_fields,
+                self.catalog_context,
+                viewer_roles=frozenset(self.viewer.roles) if self.viewer else frozenset(),
+                effective_scope_refs=tuple(sorted(self.effective_scope_refs)),
+                evaluated_scopes=tuple(sorted(self.evaluated_scopes)),
+                applied_rollup=result.applied_rollup,
+                physical_sources_hit=result.physical_sources_hit,
+                scope_coverage=(
+                    "not_established"
+                    if self.viewer is not None
+                    and any(
+                        cube.scope and cube.scope not in self.evaluated_scopes
+                        for cube in self.touched
+                    )
+                    else "complete"
+                ),
+            ),
+            params=params,
+            binding_requirements=requirements,
+            diagnostics=(*result.diagnostics, *self.diagnostics),
+        )
 
     def _compile_warnings(self) -> tuple[str, ...]:
         """Human-readable advisories built from the plan's join diagnostics.
@@ -3201,8 +3278,9 @@ def compile_plan(
     policy: PolicyFn | None = None,
     scope_fns: dict[str, ScopeFn] | None = None,
     _allow_unbounded_ungrouped: bool = False,
+    catalog_context: CatalogContext | None = None,
 ) -> CompiledQuery:
-    """Compile a :class:`LogicalPlan` directly to a :class:`CompiledQuery`.
+    """Compile a privileged host/optimizer LogicalPlan to executable SQL.
 
     Plan-driven entry point — the plan is the single source of truth for
     emission.  Used by:
@@ -3229,6 +3307,11 @@ def compile_plan(
     byte-identical to :func:`compile_query` on the equivalent query —
     the plan is a strict intermediate representation; the spec-tree
     path and the plan path agree exactly.
+
+    This is a privileged host/optimizer boundary, not an untrusted request
+    format. External adapters MUST accept ``SemanticQuery`` rather than
+    caller-supplied plans. Host provenance is trusted; existing authorization
+    and consistency checks are retained, not relaxed.
     """
     # Re-derive the SemanticQuery from the plan.  The plan is
     # frozen and the schema is small; a structural rebuild keeps
@@ -3372,6 +3455,7 @@ def compile_plan(
         scope_fns=scope_fns,
         allow_unbounded_ungrouped=_allow_unbounded_ungrouped,
         plan=plan,
+        catalog_context=catalog_context,
     )
     return env.emit()
 
@@ -3389,6 +3473,7 @@ def compile_query(
     policy: PolicyFn | None = None,
     scope_fns: dict[str, ScopeFn] | None = None,
     _allow_unbounded_ungrouped: bool = False,
+    catalog_context: CatalogContext | None = None,
 ) -> CompiledQuery:
     """Compile a SemanticQuery to a CompiledQuery bundle.
 
@@ -3434,6 +3519,7 @@ def compile_query(
         policy=policy,
         scope_fns=scope_fns,
         allow_unbounded_ungrouped=_allow_unbounded_ungrouped,
+        catalog_context=catalog_context,
     )
     return env.emit()
 
@@ -3450,5 +3536,6 @@ __all__ = [
     "UnknownIdentifierError",
     "compile_plan",
     "compile_query",
+    "COMPILED_QUERY_VERSION",
     "explain_plan",
 ]

@@ -189,17 +189,14 @@ def _run_viz(
             supported_charts=supported,
         )
     except SemQLError as exc:
-        return {"error": exc.to_payload(), "_stability": "beta"}
-    except Exception as exc:
-        if debug:
-            return {
-                "error": {"code": type(exc).__name__, "message": str(exc)},
-                "_stability": "beta",
-            }
+        return {"error": exc.to_public_payload(), "_stability": "beta"}
+    except Exception:
         return {
             "error": {
                 "code": "ExecutionError",
-                "message": "Visualization failed. Enable server debug mode to see details.",
+                "severity": "error",
+                "reason": "visualization_failed",
+                "message": "visualization failed.",
             },
             "_stability": "beta",
         }

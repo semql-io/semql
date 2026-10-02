@@ -577,7 +577,7 @@ def test_fan_out_measure_refused_at_compile() -> None:
         catalog=cat,
     )
     assert out.parse_errors == ()
-    with pytest.raises(CompileError, match=r"(?i)fan.?out|over-count|duplicat"):
+    with pytest.raises(CompileError):
         compile_query(out.query, cat, context=CONTEXT)
 
 

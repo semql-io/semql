@@ -79,6 +79,22 @@ def test_server_exposes_expected_tools() -> None:
     assert {"query_semantic", "validate", "explain", "catalog_prompt"}.issubset(names)
 
 
+def test_external_query_tool_does_not_accept_logical_plan_input() -> None:
+    server = _server()
+
+    async def fetch() -> dict[str, Any]:
+        async with _client(server) as client:
+            tools = await client.list_tools()
+            tool = next(tool for tool in tools if tool.name == "query_semantic")
+            schema: dict[str, Any] = tool.inputSchema
+            return schema
+
+    schema = _run(fetch())
+    properties = schema["properties"]
+    assert set(properties) == {"spec", "context"}
+    assert "LogicalPlan" not in str(schema)
+
+
 # ---------------------------------------------------------------------------
 # query_semantic
 # ---------------------------------------------------------------------------
@@ -406,10 +422,8 @@ def _run_query_execute(server: MCPServer) -> dict[str, Any]:
     return _run(call())
 
 
-def test_query_execute_failure_redacts_driver_text_by_default() -> None:
-    """A raw driver exception must not leak its text to the client. By
-    default the message is generic; the SQL is still returned so the
-    caller can inspect / replay it."""
+def test_query_execute_failure_redacts_driver_text_and_compiled_details() -> None:
+    """Driver text, SQL, and bindings stay out of public error envelopes."""
 
     def boom(sql: str, params: dict[str, Any]) -> list[dict[str, Any]]:  # noqa: ARG001
         raise RuntimeError("connection refused to db.internal:5432 as user 'svc_billing'")
@@ -417,24 +431,24 @@ def test_query_execute_failure_redacts_driver_text_by_default() -> None:
     out = _run_query_execute(MCPServer(_orders_catalog(), executor=boom))
     assert "error" in out
     assert out["error"]["code"] == "ExecutionError"
-    assert "connection refused" not in out["error"]["message"]
-    assert "db.internal" not in out["error"]["message"]
-    # The compiled SQL is still in the response for replay / inspection.
-    assert "sql" in out
-    assert "SUM" in out["sql"].upper()
+    public = str(out)
+    for secret in ("connection refused", "db.internal", "svc_billing", "SUM"):
+        assert secret not in public
+    assert "sql" not in out
+    assert "params" not in out
 
 
-def test_query_execute_failure_surfaces_driver_text_in_debug_mode() -> None:
-    """With debug=True the raw exception text is surfaced for local
-    troubleshooting."""
+def test_query_execute_failure_stays_redacted_in_debug_mode() -> None:
+    """Debug mode does not weaken public diagnostic rendering."""
 
     def boom(sql: str, params: dict[str, Any]) -> list[dict[str, Any]]:  # noqa: ARG001
-        raise RuntimeError("connection refused")
+        raise RuntimeError("connection refused SECRET_DRIVER_TEXT")
 
     out = _run_query_execute(MCPServer(_orders_catalog(), executor=boom, debug=True))
-    assert out["error"]["code"] == "RuntimeError"
-    assert "connection refused" in out["error"]["message"]
-    assert "SUM" in out["sql"].upper()
+    assert out["error"]["code"] == "ExecutionError"
+    assert "SECRET_DRIVER_TEXT" not in str(out)
+    assert "sql" not in out
+    assert "params" not in out
 
 
 def test_query_semantic_compile_only_even_when_executor_set() -> None:

@@ -15,68 +15,108 @@ Backwards compatibility:
   visualisation layer's ``except ResolveError:`` pattern.
 
 Uniform error contract:
-- Every leaf exposes :meth:`to_payload` returning a ``dict`` shaped
-  ``{"code", "message", ...}`` with the leaf's structured attrs. The
-  shape is JSON-safe (lists, dicts, strings, bools, ints, None) so MCP
-  / API layers serialise it verbatim.
-- The default ``code`` is the class name; leaves may override via
-  ``_payload_code``.
-- :meth:`SemQLError.from_payload` dispatches by ``code`` and rebuilds
-  the same class — the structured attrs survive across a process
-  boundary (MCP, HTTP, persisted error logs).
-- ``UnknownIdentifierError`` includes ``valid_alternatives`` (the
-  LLM-friendly spelling of ``hint``). ``FilterTypeError`` includes
-  ``next_tool`` / ``next_tool_args`` / ``did_you_mean`` when the
-  failing dim has a registered ``Lookup`` — the LLM can repair via a
-  tool call instead of guessing.
+- ``to_payload`` / ``from_payload`` preserve lossless trusted internal error
+  data, including values needed by authorized repair and round-trip callers.
+- ``to_public_payload`` is a separate allowlisted rendering for external
+  adapters; it never copies arbitrary exception text, SQL, bindings, or
+  repair arguments.
+- ``Diagnostic`` carries stable codes, severity, bounded reasons, semantic
+  references, and typed operation/stage details.
 """
 
 from __future__ import annotations
 
 import difflib
+import re
 from collections.abc import Iterable, Mapping
-from typing import Any, ClassVar, cast
+from typing import Any, ClassVar, Literal, cast
+
+from pydantic import BaseModel, ConfigDict, field_validator
 
 _ErrorPayload = dict[str, Any]
+
+
+class Diagnostic(BaseModel):
+    """Safe, structured diagnostic suitable for external consumers."""
+
+    model_config = ConfigDict(frozen=True)
+
+    code: str
+    severity: Literal["error", "warning", "advisory"] = "error"
+    reason: str
+    references: tuple[str, ...] = ()
+    operation: str | None = None
+    stage: str | None = None
+
+    @field_validator("code", "operation", "stage")
+    @classmethod
+    def _bounded_token(cls, value: str | None) -> str | None:
+        if value is not None and not re.fullmatch(r"[A-Za-z0-9_.:-]{1,80}", value):
+            return "contract_violation"
+        return value
+
+    @field_validator("references")
+    @classmethod
+    def _safe_references(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        return tuple(
+            value
+            for value in values
+            if len(value) <= 128 and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.]*", value)
+        )
+
+    @field_validator("reason")
+    @classmethod
+    def _bounded_reason(cls, value: str) -> str:
+        if not re.fullmatch(r"[a-z0-9_:-]{1,80}", value):
+            return "contract_violation"
+        return value
+
+    def render_message(self) -> str:
+        """Render a message from bounded, non-value-bearing diagnostic fields."""
+        refs = f" ({', '.join(self.references)})" if self.references else ""
+        return f"{self.reason.replace('_', ' ')}{refs}."
+
+    def to_public_payload(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "code": self.code,
+            "severity": self.severity,
+            "reason": self.reason,
+            "message": self.render_message(),
+            "references": list(self.references),
+        }
+        if self.operation is not None:
+            payload["operation"] = self.operation
+        if self.stage is not None:
+            payload["stage"] = self.stage
+        return payload
 
 
 class SemQLError(Exception):
     """Top-level base for every error raised by the semantic layer."""
 
-    #: Stable, machine-readable code. Default is the class name; leaves
-    #: may override via :attr:`_payload_code` to alias across refactors.
     _payload_code: ClassVar[str] = ""
 
     def to_payload(self) -> _ErrorPayload:
-        """Return a JSON-safe dict representation of this error.
-
-        Shape: ``{"code": <class name>, "message": <str(err)>}``.
-        Leaves extend with their structured attrs.
-
-        >>> SemQLError("boom").to_payload()
-        {'code': 'SemQLError', 'message': 'boom'}
-        """
+        """Lossless trusted serialization; may contain sensitive exception text."""
         return {"code": self.code, "message": str(self)}
+
+    def to_public_payload(self) -> dict[str, Any]:
+        """Safe allowlisted rendering; never serializes exception text."""
+        reason = "invalid_query" if isinstance(self, CompileError) else "semantic_error"
+        if isinstance(self, AuthError):
+            reason = "authentication_failed"
+        elif isinstance(self, UnknownIdentifierError) or (
+            isinstance(self, ResolveError) and not isinstance(self, CompileError)
+        ):
+            reason = "invalid_reference"
+        return Diagnostic(code=self.code, reason=reason).to_public_payload()
 
     @property
     def code(self) -> str:
-        """The error's stable code. Defaults to the class name; leaves
-        may override via :attr:`_payload_code`."""
         return self._payload_code or type(self).__name__
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, Any]) -> SemQLError:
-        """Rebuild a :class:`SemQLError` (or leaf) from a ``to_payload``
-        dict. Dispatches on ``payload["code"]``; raises ``ValueError``
-        for unknown codes so a stale or hand-built envelope fails
-        loudly.
-
-        >>> from semql.errors import JoinPathError
-        >>> original = JoinPathError("no path", root_cube="a", target_cube="b")
-        >>> rebuilt = SemQLError.from_payload(original.to_payload())
-        >>> (rebuilt.root_cube, rebuilt.target_cube)
-        ('a', 'b')
-        """
         code = payload.get("code")
         if code is None:
             raise ValueError("Error payload is missing 'code'.")
@@ -87,11 +127,6 @@ class SemQLError(Exception):
                 f"{sorted(_PAYLOAD_DISPATCH)}. Add the leaf class to "
                 "semql.errors._PAYLOAD_DISPATCH if this is a new error."
             )
-        # ``_from_payload`` is defined on each leaf (see below); the
-        # dispatch table only references leaves that implement it.
-        # mypy can't follow ``_from_payload`` on a ``type[SemQLError]``
-        # so we cast — the dispatch table is constructed from leaves
-        # that define the classmethod.
         return cast("SemQLError", leaf._from_payload(payload))  # type: ignore[attr-defined]
 
 
@@ -103,6 +138,70 @@ class ResolveError(SemQLError):
 class CompileError(ResolveError):
     """Compilation failed. Subclasses ResolveError so visualisation
     callers keep working; specific leaves below carry structured attrs."""
+
+
+class ContractError(CompileError):
+    """Typed contract failure with sensitive internal and safe public forms."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        reason: str,
+        artifact: str | None = None,
+        names: tuple[str, ...] = (),
+        references: tuple[str, ...] = (),
+        operation: str | None = None,
+        stage: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.reason = reason
+        self.artifact = artifact
+        self.names = tuple(names)
+        self.references = tuple(references)
+        self.operation = operation
+        self.stage = stage
+
+    def to_payload(self) -> _ErrorPayload:
+        payload: _ErrorPayload = {
+            "code": self.code,
+            "message": str(self),
+            "reason": self.reason,
+            "names": list(self.names),
+            "references": list(self.references),
+        }
+        for key in ("artifact", "operation", "stage"):
+            value = getattr(self, key)
+            if value is not None:
+                payload[key] = value
+        return payload
+
+    def to_diagnostic(
+        self, *, severity: Literal["error", "warning", "advisory"] = "error"
+    ) -> Diagnostic:
+        return Diagnostic(
+            code=self.code,
+            severity=severity,
+            reason=self.reason,
+            references=self.references,
+            operation=self.operation,
+            stage=self.stage,
+        )
+
+    def to_public_payload(self) -> dict[str, Any]:
+        return self.to_diagnostic().to_public_payload()
+
+    @classmethod
+    def _from_payload(cls, payload: Mapping[str, Any]) -> ContractError:
+        return cls(
+            str(payload.get("message", "")),
+            reason=str(payload.get("reason", "contract_violation")),
+            artifact=payload.get("artifact"),
+            names=tuple(str(value) for value in payload.get("names", ())),
+            references=tuple(str(value) for value in payload.get("references", ())),
+            operation=payload.get("operation"),
+            stage=payload.get("stage"),
+        )
 
 
 class UnknownIdentifierError(CompileError):
@@ -349,6 +448,14 @@ class FederationError(CompileError):
             "reason": self.reason,
         }
 
+    def to_public_payload(self) -> dict[str, Any]:
+        return Diagnostic(
+            code=self.code,
+            reason=self.reason,
+            operation="federation",
+            stage="lowering",
+        ).to_public_payload()
+
     @classmethod
     def _from_payload(cls, payload: Mapping[str, Any]) -> FederationError:
         return cls(str(payload.get("message", "")), reason=str(payload.get("reason", "")))
@@ -394,6 +501,7 @@ class AuthError(SemQLError):
 _PAYLOAD_DISPATCH: dict[str, type[SemQLError]] = {
     cls.__name__: cls
     for cls in (
+        ContractError,
         UnknownIdentifierError,
         JoinPathError,
         FilterTypeError,
@@ -428,7 +536,9 @@ def closest_match(
 __all__ = [
     "CompileError",
     "AuthError",
+    "ContractError",
     "CrossDialectError",
+    "Diagnostic",
     "FederationError",
     "FilterTypeError",
     "JoinPathError",

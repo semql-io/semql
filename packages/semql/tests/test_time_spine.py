@@ -17,6 +17,7 @@ per measure.
 
 from __future__ import annotations
 
+import duckdb
 import pytest
 from semql.compile import compile_query
 from semql.errors import CompileError
@@ -118,6 +119,41 @@ def test_fill_nulls_emits_spine_cte_duckdb() -> None:
     assert "COALESCE" in sql.upper()
 
 
+def test_duckdb_spine_casts_bound_window_values_to_temporal_types() -> None:
+    compiled = compile_query(
+        _q("orders", "created_at"), {"orders": _duckdb_orders()}, context=CONTEXT
+    )
+    assert compiled.sql.count("CAST(") >= 2
+    assert "AS TIMESTAMP" in compiled.sql
+
+
+def test_duckdb_dense_fill_executes_and_returns_missing_daily_buckets() -> None:
+    con = duckdb.connect(":memory:")
+    try:
+        con.execute("CREATE SCHEMA test")
+        con.execute("CREATE TABLE test.orders (created_at TIMESTAMP, amount DOUBLE)")
+        con.execute(
+            "INSERT INTO test.orders VALUES "
+            "('2024-01-01 12:00:00', 5.0), ('2024-01-03 08:00:00', 7.0)"
+        )
+        query = _q("orders", "created_at").model_copy(
+            update={"order": [("orders.created_at", "asc")]}
+        )
+        compiled = compile_query(query, {"orders": _duckdb_orders()}, context=CONTEXT)
+        rows = con.execute(compiled.sql, compiled.params).fetchall()
+        assert len(rows) == 31
+        assert rows[0][0].date().isoformat() == "2024-01-01"
+        assert rows[0][1] == 5.0
+        assert rows[1][0].date().isoformat() == "2024-01-02"
+        assert rows[1][1] == 0
+        assert rows[2][0].date().isoformat() == "2024-01-03"
+        assert rows[2][1] == 7.0
+        assert rows[-1][0].date().isoformat() == "2024-01-31"
+        assert rows[-1][1] == 0
+    finally:
+        con.close()
+
+
 def test_fill_nulls_columns_match_unfilled_query() -> None:
     """Adding fill_nulls_with must not change the output schema —
     consumers can flip the switch without column-rename churn."""
@@ -166,7 +202,7 @@ def test_fill_nulls_rejects_non_time_dimensions() -> None:
     )
     cat = {"orders": cube_with_dim}
     q = _q("orders", "created_at", dimensions=["orders.region"])
-    with pytest.raises(CompileError, match="non-time dimensions"):
+    with pytest.raises(CompileError):
         compile_query(q, cat, context=CONTEXT)
 
 

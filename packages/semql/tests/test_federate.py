@@ -13,10 +13,12 @@ from semql.compile import compile_query
 from semql.errors import FederationError
 from semql.federate import (
     FederatedPlan,
+    MergeKeyRequirement,
     MergeSpec,
     compile_federated_query,
 )
 from semql.model import (
+    AuthContext,
     Cube,
     Dialect,
     Dimension,
@@ -24,7 +26,7 @@ from semql.model import (
     Measure,
     TimeDimension,
 )
-from semql.spec import Filter, SemanticQuery, TimeWindow
+from semql.spec import Filter, InlineDerived, SemanticQuery, TimeWindow
 
 # ---------------------------------------------------------------------------
 # Fixtures — a two-backend catalog: orders (Postgres fact) + customers
@@ -1004,3 +1006,180 @@ def test_cross_backend_symmetric_non_bridge_dimension_refuses() -> None:
             _symmetric_catalog(),
         )
     assert exc.value.reason == "measures_span_backends"
+
+
+def test_symmetric_population_filters_apply_before_fact_presence() -> None:
+    plan = compile_federated_query(
+        SemanticQuery(
+            measures=["activity.active_secs", "worklog.hours"],
+            dimensions=["employees.name"],
+            filters=[Filter(dimension="activity.employee_id", op="eq", values=[1])],
+        ),
+        _symmetric_catalog(),
+    )
+    assert 1 in plan.fragments[1].params.values()
+    assert 1 not in plan.fragments[2].params.values()
+
+
+def test_raw_rows_aliases_follow_requested_order() -> None:
+    orders = _orders().model_copy(
+        update={
+            "measures": [
+                *_orders().measures,
+                Measure(
+                    name="aov",
+                    sql="",
+                    agg="ratio",
+                    numerator="revenue",
+                    denominator="count",
+                ),
+            ]
+        }
+    )
+    query = SemanticQuery(
+        measures=["orders.aov", "orders.avg_amount", "orders.revenue"],
+        dimensions=["customers.region"],
+        aliases={
+            "rate": "orders.aov",
+            "mean_amount": "orders.avg_amount",
+            "net": "orders.revenue",
+        },
+    )
+    plan = compile_federated_query(query, _catalog(orders, _customers()), mode="raw_rows")
+    assert plan.columns == ["region", "rate", "mean_amount", "net"]
+    assert [measure.output_name for measure in plan.merge_spec.measures] == [
+        "rate",
+        "mean_amount",
+        "net",
+    ]
+
+
+def test_symmetric_spec_records_fact_presence_and_exact_materialized_keys() -> None:
+    plan = compile_federated_query(
+        SemanticQuery(
+            measures=["activity.active_secs", "worklog.hours"],
+            dimensions=["employees.name"],
+        ),
+        _symmetric_catalog(),
+    )
+    assert plan.merge_spec.observed_fact_sources == (
+        plan.merge_spec.bridges[0].right,
+        plan.merge_spec.bridges[1].right,
+    )
+    assert plan.merge_spec.merge_key_requirements == (
+        MergeKeyRequirement(fragment_index=0, columns=("id",)),
+    )
+
+    assert plan.analysis.populations[0].inclusion == "observed_facts"
+    assumptions = {item.reference: item for item in plan.analysis.assumptions}
+    assert assumptions["fragment:0.id"].kind == "unique_merge_key"
+    assert assumptions["fragment:0.id"].verification == "catalog_trust"
+
+
+def test_symmetric_analysis_and_obligations_survive_round_trip() -> None:
+    from semql.analysis import CatalogContext
+
+    plan = compile_federated_query(
+        SemanticQuery(
+            measures=["activity.active_secs", "worklog.hours"],
+            dimensions=["employees.name"],
+        ),
+        _symmetric_catalog(),
+        catalog_context=CatalogContext(namespace="tenant_a", semantic_revision="rev-4"),
+    )
+    restored = FederatedPlan.model_validate(plan.model_dump())
+    assert restored == plan
+    assert restored.merge_spec.analysis.outputs == plan.analysis.outputs
+    assert restored.merge_spec.observed_fact_sources == plan.merge_spec.observed_fact_sources
+    assert restored.merge_spec.merge_key_requirements == plan.merge_spec.merge_key_requirements
+    assert restored.analysis.derivations == plan.analysis.derivations
+    assert restored.analysis.assumptions == plan.analysis.assumptions
+    assert restored.analysis.joins == plan.analysis.joins
+    assert restored.analysis.catalog_context == CatalogContext(
+        namespace="tenant_a", semantic_revision="rev-4"
+    )
+
+
+def test_federated_analysis_keeps_logical_avg_and_count_with_physical_recipes() -> None:
+    plan = compile_federated_query(
+        SemanticQuery(
+            measures=["orders.avg_amount", "orders.count"],
+            dimensions=["customers.region"],
+        ),
+        _catalog(_orders(), _customers()),
+    )
+    outputs = {item.sql_alias: item for item in plan.analysis.outputs}
+    nodes = {item.node_id: item for item in plan.analysis.nodes}
+    derivations = {
+        node_id: derivation
+        for derivation in plan.analysis.derivations
+        for node_id in derivation.logical_node_ids
+    }
+
+    sum_source = plan.merge_spec.measures[0].sum_source
+    count_source = plan.merge_spec.measures[0].count_source
+    assert sum_source is not None
+    assert count_source is not None
+
+    avg_node_id = outputs["avg_amount"].node_id
+    count_node_id = outputs["count"].node_id
+    assert nodes[avg_node_id].aggregate == "avg"
+    assert nodes[count_node_id].aggregate == "count"
+    assert derivations[avg_node_id].operation == "avg"
+    assert derivations[avg_node_id].recipe == "sum_count_recomposition"
+    assert derivations[avg_node_id].physical_refs == (
+        f"sum=fragment:{sum_source.fragment_index}.{sum_source.column_name}",
+        f"count=fragment:{count_source.fragment_index}.{count_source.column_name}",
+    )
+    assert derivations[count_node_id].operation == "count"
+    assert derivations[count_node_id].recipe == "sum_stored_partial_counts"
+    restored = FederatedPlan.model_validate(plan.model_dump())
+    assert restored.analysis.derivations == plan.analysis.derivations
+    assert restored.merge_spec.analysis.derivations == plan.merge_spec.analysis.derivations
+    assert restored.analysis.assumptions == plan.analysis.assumptions
+
+
+def test_federated_analysis_records_scope_fn_that_returns_none() -> None:
+    orders = _orders().model_copy(update={"scope": "viewer_scope"})
+    plan = compile_federated_query(
+        SemanticQuery(
+            measures=["orders.revenue"],
+            dimensions=["customers.region"],
+        ),
+        _catalog(orders, _customers()),
+        viewer=AuthContext(viewer_id="viewer-1"),
+        scope_fns={"viewer_scope": lambda _cube, _viewer: None},
+    )
+    (population,) = plan.analysis.populations
+    assert population.evaluated_scopes == ("viewer_scope",)
+    assert "scope:viewer_scope" not in population.policy_refs
+    assert plan.analysis.coverage.status == "complete"
+
+
+@pytest.mark.parametrize("mode", ["distributive", "raw_rows"])
+def test_multi_backend_inline_derived_outputs_are_typed_rejections(mode: str) -> None:
+    query = SemanticQuery(
+        measures=["orders.revenue", "orders.avg_amount"],
+        dimensions=["customers.region"],
+        derived_measures=[
+            InlineDerived(
+                name="share",
+                op="ratio",
+                operands=["orders.revenue", "orders.count"],
+            )
+        ],
+    )
+    with pytest.raises(FederationError) as exc:
+        compile_federated_query(query, _federated_catalog(), mode=mode)  # type: ignore[arg-type]
+    assert exc.value.reason == "inline_derived_multibackend"
+
+
+def test_federated_alias_to_unselected_field_is_rejected() -> None:
+    query = SemanticQuery(
+        measures=["orders.revenue"],
+        dimensions=["customers.region"],
+        aliases={"count": "orders.count"},
+    )
+    with pytest.raises(FederationError) as exc:
+        compile_federated_query(query, _federated_catalog())
+    assert exc.value.reason == "alias_target_not_selected"

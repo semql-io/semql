@@ -19,11 +19,16 @@ path return identical records for the same request.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 
+from semql.bindings import final_binding_requirements, validate_bindings
+from semql.errors import ContractError
+from semql.model import Dialect
 from semql.rows import CompiledEntityQuery, RowPlan, RowPred
+from semql.safe import is_read_only_statement
 
 from semql_engine.adapter import Adapter, AdapterResult
+from semql_engine.engine import ExecutionContractError
 
 __all__ = [
     "InMemoryRowAdapter",
@@ -43,6 +48,13 @@ class RowCapableAdapter(Protocol):
     def execute_rows(self, plan: RowPlan) -> AdapterResult: ...
 
 
+def _materialize_result(result: AdapterResult) -> AdapterResult:
+    return AdapterResult(
+        columns=list(result.columns),
+        rows=[tuple(row) for row in result.rows],
+    )
+
+
 def execute_entity(
     compiled: CompiledEntityQuery,
     adapter: Adapter | RowCapableAdapter,
@@ -53,20 +65,59 @@ def execute_entity(
     :class:`~semql_engine.adapter.Adapter`; custom backends run via a
     :class:`RowCapableAdapter`. Raises ``TypeError`` if the adapter doesn't
     match the compiled shape."""
+    if compiled.plan.version != 1:
+        raise ExecutionContractError(
+            "Entity row plan uses an unsupported version.",
+            reason="artifact_version_unsupported",
+            artifact="entity_plan",
+            operation="execute",
+            stage="preflight",
+        )
     if compiled.sql is not None:
         if not hasattr(adapter, "execute"):
             raise TypeError(
                 "compiled query has SQL but the adapter is not a SQL Adapter (no execute method)."
             )
-        sql_adapter: Adapter = adapter  # type: ignore[assignment]
-        return sql_adapter.execute(compiled.sql, compiled.params)
-    if not hasattr(adapter, "execute_rows"):
-        raise TypeError(
-            "compiled query has no SQL (custom backend) but the adapter is "
-            "not a RowCapableAdapter (no execute_rows method)."
+        sql_adapter = cast(Adapter, adapter)
+        dialect = Dialect(compiled.plan.source.backend)
+        try:
+            requirements = final_binding_requirements(compiled.sql, dialect, compiled.params)
+            validate_bindings(
+                compiled.sql,
+                dialect,
+                compiled.params,
+                requirements,
+                artifact="entity_query",
+            )
+        except ContractError as error:
+            raise ExecutionContractError.from_contract_error(error) from error
+        if not is_read_only_statement(compiled.sql, dialect=dialect.value):
+            raise ExecutionContractError(
+                "Entity SQL is not a read-only SELECT.",
+                reason="artifact_not_read_only",
+                artifact="entity_query",
+                operation="execute",
+                stage="preflight",
+            )
+        result = _materialize_result(sql_adapter.execute(compiled.sql, compiled.params))
+    else:
+        if not hasattr(adapter, "execute_rows"):
+            raise TypeError(
+                "compiled query has no SQL (custom backend) but the adapter is "
+                "not a RowCapableAdapter (no execute_rows method)."
+            )
+        row_adapter: RowCapableAdapter = adapter  # type: ignore[assignment]
+        result = _materialize_result(row_adapter.execute_rows(compiled.plan))
+    if list(result.columns) != list(compiled.columns):
+        raise ExecutionContractError(
+            "Entity adapter columns do not match the compiled output projection.",
+            reason="output_columns_mismatch",
+            artifact="entity_query",
+            names=tuple(compiled.columns),
+            operation="execute",
+            stage="output_validation",
         )
-    row_adapter: RowCapableAdapter = adapter  # type: ignore[assignment]
-    return row_adapter.execute_rows(compiled.plan)
+    return result
 
 
 # ---------------------------------------------------------------------------

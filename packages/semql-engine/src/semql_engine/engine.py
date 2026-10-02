@@ -25,17 +25,23 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import re
 import time
 import warnings
 from collections import OrderedDict
-from collections.abc import AsyncIterator, Callable, Generator, Iterator
+from collections.abc import AsyncIterator, Callable, Generator, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
-from typing import Any, Protocol, cast, runtime_checkable
+from typing import Any, Literal, Protocol, cast, runtime_checkable
 
 import duckdb
-from semql.compile import ColumnMeta
-from semql.federate import FederatedPlan
+from semql.analysis import SemanticAnalysis
+from semql.bindings import (
+    BindingRequirement,
+    final_binding_requirements,
+    validate_bindings,
+)
+from semql.compile import COMPILED_QUERY_VERSION, ColumnMeta, CompiledQuery
+from semql.errors import ContractError
+from semql.federate import FEDERATED_PLAN_VERSION, FederatedPlan, MergeSpec
 from semql.model import Dialect
 from semql.safe import is_read_only_statement
 
@@ -61,6 +67,47 @@ class EngineError(RuntimeError):
     surfaces runtime issues such as a missing adapter for a backend the
     plan references, or an adapter returning rows whose columns don't
     match the fragment's declared output."""
+
+
+class ExecutionContractError(ContractError, EngineError):
+    """Typed execution failure that remains catchable as EngineError."""
+
+    _payload_code = "ContractError"
+
+    @classmethod
+    def from_contract_error(cls, error: ContractError) -> ExecutionContractError:
+        return cls(
+            str(error),
+            reason=error.reason,
+            artifact=error.artifact,
+            names=error.names,
+            references=error.references,
+            operation=error.operation,
+            stage=error.stage,
+        )
+
+
+def _execution_final_binding_requirements(
+    sql: str, dialect: Dialect, params: Mapping[str, Any]
+) -> tuple[BindingRequirement, ...]:
+    try:
+        return final_binding_requirements(sql, dialect, params)
+    except ContractError as error:
+        raise ExecutionContractError.from_contract_error(error) from error
+
+
+def _execution_validate_bindings(
+    sql: str,
+    dialect: Dialect,
+    params: Mapping[str, Any],
+    requirements: Sequence[BindingRequirement],
+    *,
+    artifact: str,
+) -> None:
+    try:
+        validate_bindings(sql, dialect, params, requirements, artifact=artifact)
+    except ContractError as error:
+        raise ExecutionContractError.from_contract_error(error) from error
 
 
 def _assert_fragments_read_only(plan: FederatedPlan) -> None:
@@ -92,6 +139,196 @@ def _assert_merge_read_only(merge_sql: str) -> None:
         raise EngineError("Merge SQL is not a read-only SELECT; refusing to execute.")
 
 
+def _preflight(plan: FederatedPlan) -> tuple[str, dict[str, Any]]:
+    """Validate versions, fragment binds, and rendered merge SQL before I/O."""
+    if plan.version != FEDERATED_PLAN_VERSION:
+        raise ExecutionContractError(
+            "Federated plan uses an unsupported version.",
+            reason="artifact_version_unsupported",
+            artifact="federated_plan",
+            operation="execute",
+            stage="preflight",
+        )
+    for index, fragment in enumerate(plan.fragments):
+        artifact_name = f"fragment_{index}"
+        if fragment.version != COMPILED_QUERY_VERSION:
+            raise ExecutionContractError(
+                "Compiled fragment uses an unsupported version.",
+                reason="artifact_version_unsupported",
+                artifact=artifact_name,
+                operation="execute",
+                stage="preflight",
+            )
+        requirements = fragment.binding_requirements
+        if requirements is None:
+            raise ExecutionContractError(
+                "Compiled fragment is missing its required binding manifest.",
+                reason="binding_manifest_missing",
+                artifact=artifact_name,
+                operation="execute",
+                stage="preflight",
+            )
+        _execution_validate_bindings(
+            fragment.sql,
+            fragment.dialect,
+            fragment.params,
+            requirements,
+            artifact=artifact_name,
+        )
+    for requirement in plan.merge_spec.merge_key_requirements:
+        index = requirement.fragment_index
+        names = tuple(requirement.columns)
+        if (
+            index < 0
+            or index >= len(plan.fragments)
+            or not names
+            or len(set(names)) != len(names)
+            or not set(names).issubset(plan.fragments[index].columns)
+        ):
+            raise ExecutionContractError(
+                "Merge-key requirement does not match a fragment projection.",
+                reason="merge_key_requirement_invalid",
+                artifact="merge",
+                names=names,
+                references=(f"fragment:{index}",),
+                operation="merge",
+                stage="preflight",
+            )
+    merge_sql, merge_params = render_merge_sql(plan.merge_spec)
+    merge_requirements = _execution_final_binding_requirements(
+        merge_sql, Dialect.DUCKDB, merge_params
+    )
+    _execution_validate_bindings(
+        merge_sql,
+        Dialect.DUCKDB,
+        merge_params,
+        merge_requirements,
+        artifact="merge",
+    )
+    _assert_merge_read_only(merge_sql)
+    return merge_sql, merge_params
+
+
+def _plan_analysis(plan: FederatedPlan) -> SemanticAnalysis:
+    return plan.analysis
+
+
+def _materialize_result(result: AdapterResult) -> _MaterializedAdapterResult:
+    """Consume adapter rows once so evidence checks and merge share rows."""
+    return _MaterializedAdapterResult(
+        columns=list(result.columns),
+        rows=[tuple(row) for row in result.rows],
+    )
+
+
+def _duckdb_key_value(value: object, duckdb_type: str, null_sentinel: object) -> object:
+    """Normalize supported keys as DuckDB stores them; reject uncertain casts."""
+    if value is None:
+        return null_sentinel
+    import datetime as dt
+
+    if duckdb_type == "BOOLEAN":
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, int) and value in (0, 1):
+            return bool(value)
+        if isinstance(value, str) and value.casefold() in {"true", "false"}:
+            return value.casefold() == "true"
+    if duckdb_type == "BIGINT":
+        if isinstance(value, (int, bool)):
+            return int(value)
+        if isinstance(value, str):
+            return int(value)
+    if duckdb_type == "DOUBLE" and isinstance(value, (int, float, str)):
+        converted = float(value)
+        return ("DOUBLE", "NaN") if converted != converted else converted
+    if duckdb_type == "VARCHAR" and isinstance(value, str):
+        return value
+    if duckdb_type == "DATE" and isinstance(value, (dt.date, dt.datetime)):
+        return value.date() if isinstance(value, dt.datetime) else value
+    if duckdb_type == "TIMESTAMP" and isinstance(value, dt.datetime):
+        return value
+    if duckdb_type == "TIME" and isinstance(value, dt.time):
+        return value
+    if duckdb_type == "BLOB" and isinstance(value, bytes):
+        return value
+    raise TypeError("value cannot be normalized without relying on an implicit cast")
+
+
+def _validate_merge_keys(
+    spec: MergeSpec,
+    fragment_results: Sequence[AdapterResult | _MaterializedAdapterResult],
+) -> tuple[MergeKeyValidationEvidence, ...]:
+    evidence: list[MergeKeyValidationEvidence] = []
+    for requirement in spec.merge_key_requirements:
+        index = requirement.fragment_index
+        if index < 0 or index >= len(fragment_results):
+            raise ExecutionContractError(
+                "Merge-key requirement refers to an absent materialized fragment.",
+                reason="merge_key_requirement_invalid",
+                artifact="merge",
+                references=(f"fragment:{index}",),
+                operation="merge",
+                stage="preflight",
+            )
+        result = fragment_results[index]
+        columns = tuple(requirement.columns)
+        if not set(columns).issubset(result.columns):
+            raise ExecutionContractError(
+                "Merge-key columns are absent from the materialized fragment.",
+                reason="merge_key_columns_mismatch",
+                artifact=f"fragment_{index}",
+                names=columns,
+                references=(f"fragment:{index}",),
+                operation="merge",
+                stage="preflight",
+            )
+        positions = tuple(result.columns.index(name) for name in columns)
+        types = _infer_column_types(list(result.columns), [tuple(row) for row in result.rows])
+        null_sentinel = object()
+        seen: set[tuple[object, ...]] = set()
+        for row in result.rows:
+            key = tuple(row[position] for position in positions)
+            if not requirement.nulls_equal and any(value is None for value in key):
+                continue
+            try:
+                normalized = tuple(
+                    _duckdb_key_value(value, types[position], null_sentinel)
+                    for position, value in zip(positions, key, strict=True)
+                )
+                duplicate = normalized in seen
+                if not duplicate:
+                    seen.add(normalized)
+            except (TypeError, ValueError, OverflowError):
+                raise ExecutionContractError(
+                    "Materialized merge-key values cannot be validated.",
+                    reason="merge_key_validation_uncheckable",
+                    artifact=f"fragment_{index}",
+                    names=columns,
+                    references=(f"fragment:{index}",),
+                    operation="merge",
+                    stage="materialized_validation",
+                ) from None
+            if duplicate:
+                raise ExecutionContractError(
+                    "Materialized merge-key uniqueness declaration was violated.",
+                    reason="merge_key_uniqueness_violation",
+                    artifact=f"fragment_{index}",
+                    names=columns,
+                    references=(f"fragment:{index}",),
+                    operation="merge",
+                    stage="materialized_validation",
+                )
+        evidence.append(MergeKeyValidationEvidence(index, columns, "validated"))
+    return tuple(evidence)
+
+
+@dataclass
+class _MaterializedAdapterResult:
+    columns: list[str]
+    rows: list[tuple[Any, ...]]
+
+
 OnExecuteHook = Callable[..., Any]
 """Observability hook fired after every ``Engine.run``.
 
@@ -107,18 +344,74 @@ arg doesn't compose well with the ``Callable[...]`` syntax in
 older Pythons; the engine's call site enforces the contract."""
 
 
+@dataclass(frozen=True)
+class MergeKeyValidationEvidence:
+    fragment_index: int
+    columns: tuple[str, ...]
+    status: Literal["validated"]
+
+
 @dataclass
 class ExecutionResult:
-    """Final result of running a :class:`FederatedPlan`.
-
-    ``columns`` and ``column_meta`` are pass-throughs from the plan so a
-    consumer that wants formatted output (units, percent, etc.) has
-    everything it needs without re-resolving against the catalog.
-    """
+    """Final result of running a :class:`FederatedPlan`."""
 
     columns: list[str]
     column_meta: list[ColumnMeta]
     rows: list[tuple[Any, ...]]
+    analysis: SemanticAnalysis = SemanticAnalysis.unavailable()
+    validation_evidence: tuple[MergeKeyValidationEvidence, ...] = ()
+
+
+class ExecutionRowIterator(Iterator[dict[str, Any]]):
+    """Sync row iterator with immutable per-stream analysis and evidence."""
+
+    def __init__(
+        self,
+        rows: Iterator[dict[str, Any]],
+        analysis: SemanticAnalysis,
+        validation_evidence: tuple[MergeKeyValidationEvidence, ...] = (),
+    ) -> None:
+        self.analysis = analysis
+        self.validation_evidence = validation_evidence
+        self._rows = rows
+
+    def __iter__(self) -> ExecutionRowIterator:
+        return self
+
+    def __next__(self) -> dict[str, Any]:
+        return next(self._rows)
+
+    def close(self) -> None:
+        """Close the wrapped row iterator when it exposes a close method."""
+        close = getattr(self._rows, "close", None)
+        if close is not None:
+            close()
+
+
+class AsyncExecutionIterator(AsyncIterator[list[tuple[Any, ...]]]):
+    """Async chunk iterator with per-stream analysis and validation evidence."""
+
+    def __init__(
+        self,
+        chunks: AsyncIterator[list[tuple[Any, ...]]],
+        analysis: SemanticAnalysis,
+        validation_evidence: tuple[MergeKeyValidationEvidence, ...] = (),
+    ) -> None:
+        self.analysis = analysis
+        self.validation_evidence = validation_evidence
+        self._chunks = chunks
+
+    def __aiter__(self) -> AsyncExecutionIterator:
+        return self
+
+    async def __anext__(self) -> list[tuple[Any, ...]]:
+        return await self._chunks.__anext__()
+
+    async def aclose(self) -> None:
+        """Close the wrapped async generator when iteration ends early."""
+        close = getattr(self._chunks, "aclose", None)
+        if close is not None:
+            await close()
 
 
 @dataclass
@@ -144,6 +437,8 @@ def _isolate(result: ExecutionResult) -> ExecutionResult:
         columns=list(result.columns),
         column_meta=[replace(m) for m in result.column_meta],
         rows=list(result.rows),
+        analysis=result.analysis,
+        validation_evidence=result.validation_evidence,
     )
 
 
@@ -190,6 +485,8 @@ def _merge_spec_key(spec: Any) -> tuple[Any, ...]:  # noqa: ANN401 — MergeSpec
         repr(spec.having),
         tuple(spec.order_by),
         spec.cross_partition_clauses,
+        repr(getattr(spec, "merge_key_requirements", ())),
+        repr(getattr(spec, "observed_fact_sources", ())),
     )
 
 
@@ -244,10 +541,14 @@ class DuckDBMergeEngine:
     ) -> AdapterResult:
         sql, params = render_merge_sql(spec)
         _assert_merge_read_only(sql)
+        requirements = _execution_final_binding_requirements(sql, Dialect.DUCKDB, params)
+        _execution_validate_bindings(sql, Dialect.DUCKDB, params, requirements, artifact="merge")
+        materialized = [_materialize_result(result) for result in fragment_results]
+        _validate_merge_keys(spec, materialized)
         con = duckdb.connect(":memory:")
         try:
-            for i, result in enumerate(fragment_results):
-                _load_fragment_into(con, i, result.columns, [tuple(r) for r in result.rows])
+            for i, result in enumerate(materialized):
+                _load_fragment_into(con, i, result.columns, list(result.rows))
             cursor = con.execute(sql, params)
             columns = [d[0] for d in cursor.description]
             rows = cursor.fetchall()
@@ -392,6 +693,7 @@ class Engine:
         actually ran the plan" — a hit is "the engine returned from
         cache". The two counters are independent and useful for
         /metrics emission."""
+        merge_sql, merge_params = _preflight(plan)
         cache_enabled = self._cache_size > 0
         cache_key: tuple[Any, ...] | None = (
             self._cache_key(plan, cache_namespace) if cache_enabled else None
@@ -400,27 +702,30 @@ class Engine:
             entry = self._cache.get(cache_key)
             if entry is not None:
                 if entry.expires_at is not None and self._clock() >= entry.expires_at:
-                    # Past its TTL: drop it and fall through to re-execute.
                     del self._cache[cache_key]
                 else:
-                    # Mark as recently used: pop + reinsert moves to the end.
                     self._cache.move_to_end(cache_key)
                     self._cache_hits += 1
                     self._fire_hook(plan, 0.0, cache_hit=True)
-                    # Hand back a private copy so caller mutation can't
-                    # poison the stored entry or other consumers.
-                    return _isolate(entry.result)
+                    result = _isolate(entry.result)
+                    result.columns = list(plan.columns)
+                    result.column_meta = [replace(m) for m in plan.column_meta]
+                    result.analysis = _plan_analysis(plan)
+                    return result
 
         start = time.perf_counter()
-        result = self._execute_uncached(plan)
+        result = self._execute_uncached(plan, merge_sql, merge_params)
         elapsed_ms = (time.perf_counter() - start) * 1000.0
         if cache_enabled and cache_key is not None:
             expires_at = self._clock() + self._cache_ttl if self._cache_ttl is not None else None
-            # Store an isolated copy so the result we return to the
-            # caller stays independent of the cached one.
-            self._cache[cache_key] = _CacheEntry(_isolate(result), expires_at)
+            physical_result = ExecutionResult(
+                columns=list(result.columns),
+                column_meta=[replace(m) for m in result.column_meta],
+                rows=list(result.rows),
+                validation_evidence=result.validation_evidence,
+            )
+            self._cache[cache_key] = _CacheEntry(physical_result, expires_at)
             self._cache.move_to_end(cache_key)
-            # Evict oldest entry if over capacity.
             while len(self._cache) > self._cache_size:
                 self._cache.popitem(last=False)
         self._cache_misses += 1
@@ -436,9 +741,11 @@ class Engine:
             # failure mode can wrap their own hook to log + re-raise.
             self._on_execute(plan, elapsed_ms, cache_hit=cache_hit)
 
-    def _execute_uncached(self, plan: FederatedPlan) -> ExecutionResult:
+    def _execute_uncached(
+        self, plan: FederatedPlan, merge_sql: str, merge_params: dict[str, Any]
+    ) -> ExecutionResult:
         _assert_fragments_read_only(plan)
-        fragment_results: list[AdapterResult] = []
+        fragment_results: list[_MaterializedAdapterResult] = []
         for i, fragment in enumerate(plan.fragments):
             adapter = self._adapters.get(fragment.dialect)
             if adapter is None:
@@ -448,52 +755,80 @@ class Engine:
                     f"Dialect.{fragment.dialect.name}, your_adapter) "
                     f"before running this plan."
                 )
-            result = adapter.execute(fragment.sql, fragment.params)
-            if set(result.columns) != set(fragment.columns):
-                raise EngineError(
-                    f"Fragment {i} (backend {fragment.dialect.value!r}) "
-                    f"adapter returned columns {result.columns!r} but the "
-                    f"fragment declares {fragment.columns!r}. Adapter "
-                    f"must preserve the SELECT-list aliases."
+            result = _materialize_result(adapter.execute(fragment.sql, fragment.params))
+            if list(result.columns) != list(fragment.columns):
+                raise ExecutionContractError(
+                    "Adapter columns do not match the compiled fragment projection.",
+                    reason="output_columns_mismatch",
+                    artifact=f"fragment_{i}",
+                    names=tuple(fragment.columns),
+                    references=(f"fragment:{i}",),
+                    operation="execute",
+                    stage="output_validation",
                 )
             fragment_results.append(result)
+        evidence = _validate_merge_keys(plan.merge_spec, fragment_results)
 
         if self._merge_engine is not None:
-            merged = self._merge_engine.merge(fragment_results, plan.merge_spec)
-            if list(merged.columns) != plan.columns:
-                raise EngineError(
-                    f"Merge engine returned columns {merged.columns!r} but plan declares "
-                    f"{plan.columns!r}."
+            merged = _materialize_result(
+                self._merge_engine.merge(
+                    cast("list[AdapterResult]", fragment_results), plan.merge_spec
+                )
+            )
+            if list(merged.columns) != list(plan.columns):
+                raise ExecutionContractError(
+                    "Merge engine columns do not match the declared output projection.",
+                    reason="output_columns_mismatch",
+                    artifact="merge",
+                    names=tuple(plan.columns),
+                    operation="merge",
+                    stage="output_validation",
                 )
             return ExecutionResult(
                 columns=list(plan.columns),
                 column_meta=[replace(m) for m in plan.column_meta],
-                rows=[tuple(r) for r in merged.rows],
+                rows=list(merged.rows),
+                analysis=_plan_analysis(plan),
+                validation_evidence=evidence,
             )
 
         self._reset_frag_tables(len(plan.fragments))
         for i, result in enumerate(fragment_results):
-            materialised: list[tuple[Any, ...]] = [tuple(r) for r in result.rows]
-            self._load_fragment(i, result.columns, materialised)
+            self._load_fragment(i, result.columns, list(result.rows))
 
         self._warn_inline_once()
-        merge_sql, merge_params = render_merge_sql(plan.merge_spec)
-        _assert_merge_read_only(merge_sql)
         merge_cursor = self._con.execute(merge_sql, dict(merge_params))
+        columns = [item[0] for item in merge_cursor.description]
+        if columns != list(plan.columns):
+            raise ExecutionContractError(
+                "Rendered merge columns do not match the declared output projection.",
+                reason="output_columns_mismatch",
+                artifact="merge",
+                names=tuple(plan.columns),
+                operation="merge",
+                stage="output_validation",
+            )
         rows = merge_cursor.fetchall()
         return ExecutionResult(
             columns=list(plan.columns),
             column_meta=[replace(m) for m in plan.column_meta],
             rows=rows,
+            analysis=_plan_analysis(plan),
+            validation_evidence=evidence,
         )
 
-    def iter_rows(self, plan: FederatedPlan) -> Iterator[dict[str, Any]]:
-        """Convenience: run the plan and yield each row as a
-        ``{column: value}`` dict. Useful for callers wiring the result
-        into a templating layer / JSON envelope."""
-        result = self.run(plan)
-        for row in result.rows:
-            yield dict(zip(result.columns, row, strict=True))
+    def iter_rows(self, plan: FederatedPlan) -> ExecutionRowIterator:
+        """Yield row dictionaries with per-iterator semantic metadata."""
+        stream: ExecutionRowIterator
+
+        def rows() -> Iterator[dict[str, Any]]:
+            result = self.run(plan)
+            stream.validation_evidence = result.validation_evidence
+            for row in result.rows:
+                yield dict(zip(result.columns, row, strict=True))
+
+        stream = ExecutionRowIterator(rows(), _plan_analysis(plan))
+        return stream
 
     # ------------------------------------------------------------------
     # Internals
@@ -598,9 +933,6 @@ def _load_fragment_into(
     )
 
 
-_FRAG_TABLE_RE = re.compile(r"\bfrag_(\d+)\b")
-
-
 def _can_stream_single_fragment(plan: FederatedPlan) -> bool:
     if len(plan.fragments) != 1:
         return False
@@ -694,108 +1026,146 @@ class AsyncEngine:
         Raises :class:`EngineError` for missing adapters or column
         mismatches.
         """
+        merge_sql, merge_params = _preflight(plan)
         self._adapters_present(plan)
         _assert_fragments_read_only(plan)
-
-        results = await asyncio.gather(
-            *(
-                self._adapters[frag.dialect].execute(frag.sql, frag.params)
-                for frag in plan.fragments
+        results = [
+            _materialize_result(result)
+            for result in await asyncio.gather(
+                *(
+                    self._adapters[frag.dialect].execute(frag.sql, frag.params)
+                    for frag in plan.fragments
+                )
             )
-        )
-
+        ]
         for i, (fragment, result) in enumerate(zip(plan.fragments, results, strict=True)):
             self._validate_result(i, fragment, result)
+        evidence = _validate_merge_keys(plan.merge_spec, results)
 
         if self._merge_engine is not None:
-            merged = await self._merge_engine.merge(list(results), plan.merge_spec)
-            if list(merged.columns) != plan.columns:
-                raise EngineError(
-                    f"Merge engine returned columns {merged.columns!r} but plan declares "
-                    f"{plan.columns!r}."
+            merged = _materialize_result(
+                await self._merge_engine.merge(
+                    cast("list[AdapterResult]", results), plan.merge_spec
+                )
+            )
+            if list(merged.columns) != list(plan.columns):
+                raise ExecutionContractError(
+                    "Merge engine columns do not match the declared output projection.",
+                    reason="output_columns_mismatch",
+                    artifact="merge",
+                    names=tuple(plan.columns),
+                    operation="merge",
+                    stage="output_validation",
                 )
             return ExecutionResult(
-                columns=plan.columns,
-                column_meta=plan.column_meta,
-                rows=[tuple(r) for r in merged.rows],
+                columns=list(plan.columns),
+                column_meta=[replace(m) for m in plan.column_meta],
+                rows=list(merged.rows),
+                analysis=_plan_analysis(plan),
+                validation_evidence=evidence,
             )
 
         with self._merge_con(len(plan.fragments)) as con:
             for i, result in enumerate(results):
-                _load_fragment_into(con, i, result.columns, [tuple(r) for r in result.rows])
+                _load_fragment_into(con, i, result.columns, list(result.rows))
             self._warn_inline_once()
-            merge_sql, merge_params = render_merge_sql(plan.merge_spec)
-            _assert_merge_read_only(merge_sql)
-            rows = con.execute(merge_sql, dict(merge_params)).fetchall()
+            cursor = con.execute(merge_sql, dict(merge_params))
+            columns = [item[0] for item in cursor.description]
+            if columns != list(plan.columns):
+                raise ExecutionContractError(
+                    "Rendered merge columns do not match the declared output projection.",
+                    reason="output_columns_mismatch",
+                    artifact="merge",
+                    names=tuple(plan.columns),
+                    operation="merge",
+                    stage="output_validation",
+                )
+            rows = cursor.fetchall()
         return ExecutionResult(
-            columns=plan.columns,
-            column_meta=plan.column_meta,
+            columns=list(plan.columns),
+            column_meta=[replace(m) for m in plan.column_meta],
             rows=rows,
+            analysis=_plan_analysis(plan),
+            validation_evidence=evidence,
         )
 
-    async def iter_run(
+    def iter_run(
         self,
         plan: FederatedPlan,
         *,
         chunk_rows: int = 10_000,
-    ) -> AsyncIterator[list[tuple[Any, ...]]]:
-        """Run ``plan`` and yield merge result rows in chunks.
+    ) -> AsyncExecutionIterator:
+        """Return streamed merge chunks with metadata scoped to this iterator."""
+        stream: AsyncExecutionIterator
 
-        Two paths:
+        async def chunks() -> AsyncIterator[list[tuple[Any, ...]]]:
+            if chunk_rows <= 0:
+                raise EngineError(f"iter_run: chunk_rows must be positive, got {chunk_rows!r}.")
+            merge_sql, merge_params = _preflight(plan)
+            self._adapters_present(plan)
+            _assert_fragments_read_only(plan)
+            self.last_iter_run_used_fast_path = False
 
-        - **Single-fragment fast path** — when ``merge_spec`` says the
-          plan has one fragment and all measures are passthrough, rows
-          stream directly from the adapter without DuckDB.
-          ``last_iter_run_used_fast_path`` is set to ``True``.
-        - **DuckDB merge** — multi-fragment plans, or shapes the fast
-          path doesn't recognise (HAVING etc.). Fragments materialise
-          into DuckDB temp tables and the merge cursor is fetched via
-          ``fetchmany`` for memory-bounded streaming.
+            if _can_stream_single_fragment(plan):
+                fragment = plan.fragments[0]
+                self.last_iter_run_used_fast_path = True
+                adapter_result = await self._adapters[fragment.dialect].execute(
+                    fragment.sql, fragment.params
+                )
+                self._validate_result(0, fragment, adapter_result)
+                if plan.merge_spec.merge_key_requirements:
+                    materialized_result = _materialize_result(adapter_result)
+                    stream.validation_evidence = _validate_merge_keys(
+                        plan.merge_spec, [materialized_result]
+                    )
+                    row_iter: Iterator[Sequence[Any]] = iter(materialized_result.rows)
+                else:
+                    row_iter = iter(adapter_result.rows)
+                while True:
+                    chunk: list[tuple[Any, ...]] = []
+                    for _ in range(chunk_rows):
+                        try:
+                            chunk.append(tuple(next(row_iter)))
+                        except StopIteration:
+                            break
+                    if not chunk:
+                        return
+                    yield chunk
 
-        Yields a list of row tuples per iteration; an empty list is
-        never emitted — the iterator terminates instead.
-        """
-        if chunk_rows <= 0:
-            raise EngineError(f"iter_run: chunk_rows must be positive, got {chunk_rows!r}.")
-        self._adapters_present(plan)
-        _assert_fragments_read_only(plan)
-        self.last_iter_run_used_fast_path = False
-
-        if _can_stream_single_fragment(plan):
-            fragment = plan.fragments[0]
-            self.last_iter_run_used_fast_path = True
-            adapter = self._adapters[fragment.dialect]
-            result = await adapter.execute(fragment.sql, fragment.params)
-            self._validate_result(0, fragment, result)
-            rows = [tuple(row) for row in result.rows]
-            for start in range(0, len(rows), chunk_rows):
-                yield rows[start : start + chunk_rows]
-            return
-
-        results = await asyncio.gather(
-            *(
-                self._adapters[frag.dialect].execute(frag.sql, frag.params)
-                for frag in plan.fragments
+            adapter_results: list[AdapterResult] = await asyncio.gather(
+                *(
+                    self._adapters[frag.dialect].execute(frag.sql, frag.params)
+                    for frag in plan.fragments
+                )
             )
-        )
-        for i, (fragment, result) in enumerate(zip(plan.fragments, results, strict=True)):
-            self._validate_result(i, fragment, result)
+            results = [_materialize_result(result) for result in adapter_results]
+            for i, (fragment, result) in enumerate(zip(plan.fragments, results, strict=True)):
+                self._validate_result(i, fragment, result)
+            stream.validation_evidence = _validate_merge_keys(plan.merge_spec, results)
 
-        # The per-call connection stays open for the whole streaming loop;
-        # the contextmanager closes (or releases) it when the generator
-        # finishes or is closed early.
-        with self._merge_con(len(plan.fragments)) as con:
-            for i, result in enumerate(results):
-                _load_fragment_into(con, i, result.columns, [tuple(r) for r in result.rows])
-            self._warn_inline_once()
-            merge_sql, merge_params = render_merge_sql(plan.merge_spec)
-            _assert_merge_read_only(merge_sql)
-            cursor = con.execute(merge_sql, dict(merge_params))
-            while True:
-                chunk = await asyncio.to_thread(cursor.fetchmany, chunk_rows)
-                if not chunk:
-                    return
-                yield [tuple(row) for row in chunk]
+            with self._merge_con(len(plan.fragments)) as con:
+                for i, result in enumerate(results):
+                    _load_fragment_into(con, i, result.columns, result.rows)
+                self._warn_inline_once()
+                cursor = con.execute(merge_sql, dict(merge_params))
+                columns = [item[0] for item in cursor.description]
+                if columns != list(plan.columns):
+                    raise ExecutionContractError(
+                        "Rendered merge columns do not match the declared output projection.",
+                        reason="output_columns_mismatch",
+                        artifact="merge",
+                        names=tuple(plan.columns),
+                        operation="merge",
+                        stage="output_validation",
+                    )
+                while True:
+                    chunk = await asyncio.to_thread(cursor.fetchmany, chunk_rows)
+                    if not chunk:
+                        return
+                    yield [tuple(row) for row in chunk]
+
+        stream = AsyncExecutionIterator(chunks(), _plan_analysis(plan))
+        return stream
 
     # ------------------------------------------------------------------
     # Internals
@@ -811,23 +1181,33 @@ class AsyncEngine:
                     f"running this plan."
                 )
 
-    def _validate_result(self, index: int, fragment: Any, result: AdapterResult) -> None:  # noqa: ANN401
-        if set(result.columns) != set(fragment.columns):
-            raise EngineError(
-                f"Fragment {index} (backend {fragment.dialect.value!r}) "
-                f"adapter returned columns {result.columns!r} but the "
-                f"fragment declares {fragment.columns!r}. Adapter "
-                f"must preserve the SELECT-list aliases."
+    def _validate_result(
+        self,
+        index: int,
+        fragment: CompiledQuery,
+        result: AdapterResult | _MaterializedAdapterResult,
+    ) -> None:
+        if list(result.columns) != list(fragment.columns):
+            raise ExecutionContractError(
+                "Adapter columns do not match the compiled fragment projection.",
+                reason="output_columns_mismatch",
+                artifact=f"fragment_{index}",
+                names=tuple(fragment.columns),
+                references=(f"fragment:{index}",),
+                operation="execute",
+                stage="output_validation",
             )
 
 
 __all__ = [
+    "AsyncExecutionIterator",
     "AsyncEngine",
     "AsyncMergeEngine",
     "DuckDBMergeEngine",
     "Engine",
-    "EngineError",
+    "ExecutionContractError",
     "ExecutionResult",
+    "ExecutionRowIterator",
     "MergeEngine",
     "to_async_merge_engine",
 ]

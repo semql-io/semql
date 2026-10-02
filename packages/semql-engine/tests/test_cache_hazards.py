@@ -27,11 +27,13 @@ entries on a clock the test controls.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any
 
 import duckdb
 import pytest
 from semql import Cube, Dialect, Dimension, Measure, SemanticQuery, compile_federated_query
+from semql.bindings import BindingRequirement
 from semql_engine import AdapterResult, DuckDBAdapter, Engine
 
 
@@ -156,7 +158,13 @@ def test_cache_list_param_round_trips_to_a_hit() -> None:
     """End to end: a plan with a list-valued fragment param caches and
     hits on the second run instead of raising."""
     plan = _plan()
-    plan.fragments[0].params["ids"] = [1, 2, 3]
+    fragment = plan.fragments[0]
+    plan.fragments[0] = replace(
+        fragment,
+        sql=f"SELECT * FROM ({fragment.sql}) AS cached WHERE 1 = ANY(%(ids)s)",
+        params={"ids": [1, 2, 3]},
+        binding_requirements=(BindingRequirement(name="ids"),),
+    )
     adapter = _FixedAdapter(plan.fragments[0].columns)
     engine = Engine(cache_size=8)
     engine.register(Dialect.POSTGRES, adapter)

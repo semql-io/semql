@@ -9,7 +9,8 @@ list of ``ValidationError`` records. Two contracts (PHILOSOPHY.md):
   the user / LLM needs to fix in one round-trip.
 
 ``validate`` never raises on input it would otherwise complain about.
-It returns an empty list when the query is compile-ready.
+An empty result means static checks found no problems, not that concrete
+backend lowering or execution support has been established.
 
 The resolution walk itself lives in :mod:`semql._resolve`; this module
 maps its :class:`~semql._resolve.ResolutionDiagnostic` records into
@@ -23,10 +24,11 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from dataclasses import field as _dc_field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from semql._resolve import ResolutionDiagnostic, walk_query_fields
-from semql.errors import closest_match
+from semql.capabilities import check_query_capabilities
+from semql.errors import Diagnostic, closest_match
 from semql.introspect import PolicyFn, viewer_sees
 from semql.model import AuthContext, Cube
 from semql.refs import local_name
@@ -51,13 +53,7 @@ ErrorCode = str  # documented values listed in this module's docstring
 
 @dataclass(frozen=True)
 class ValidationError:
-    """One problem with a query.
-
-    ``code`` is a stable identifier callers can branch on (see this
-    module's leading docstring for the catalog of codes). ``message``
-    is a human-readable explanation. The remaining fields carry the
-    structure the message refers to — populated when applicable.
-    """
+    """One validation problem with legacy detail and safe diagnostic rendering."""
 
     code: ErrorCode
     message: str
@@ -67,16 +63,40 @@ class ValidationError:
     value: Any = None
     hint: str | None = None
     extra: dict[str, Any] = _dc_field(default_factory=dict[str, Any])
+    reason: str | None = None
+    references: tuple[str, ...] = ()
+    operation: str | None = None
+    stage: str | None = None
+
+    def to_diagnostic(
+        self, *, severity: Literal["error", "warning", "advisory"] = "error"
+    ) -> Diagnostic:
+        references = self.references or tuple(
+            ref for ref in (self.cube, self.field) if ref is not None
+        )
+        return Diagnostic(
+            code=self.code,
+            severity=severity,
+            reason=self.reason or self.code,
+            references=references,
+            operation=self.operation,
+            stage=self.stage,
+        )
+
+    def to_public_payload(
+        self, *, severity: Literal["error", "warning", "advisory"] = "error"
+    ) -> dict[str, Any]:
+        return self.to_diagnostic(severity=severity).to_public_payload()
 
 
 @dataclass(frozen=True)
 class ValidationWarning(ValidationError):
-    """An advisory warning returned by :func:`validate`.
+    """An advisory validation warning retained as a ValidationError subtype."""
 
-    Subclasses :class:`ValidationError` so existing ``isinstance(e,
-    ValidationError)`` checks keep working. Filter by severity with
-    ``[e for e in errors if isinstance(e, ValidationWarning)]``.
-    """
+    def to_public_payload(
+        self, *, severity: Literal["error", "warning", "advisory"] = "advisory"
+    ) -> dict[str, Any]:
+        return super().to_public_payload(severity=severity)
 
 
 def _catalog_dict(catalog: Catalog | dict[str, Cube]) -> dict[str, Cube]:
@@ -86,8 +106,9 @@ def _catalog_dict(catalog: Catalog | dict[str, Cube]) -> dict[str, Cube]:
 
 
 def _to_validation_error(d: ResolutionDiagnostic) -> ValidationError:
+    diagnostic = d.to_diagnostic()
     return ValidationError(
-        code=d.code,
+        code=diagnostic.code,
         message=d.message,
         cube=d.cube,
         field=d.field,
@@ -95,6 +116,10 @@ def _to_validation_error(d: ResolutionDiagnostic) -> ValidationError:
         value=d.value,
         hint=d.hint,
         extra=dict(d.extra),
+        reason=diagnostic.reason,
+        references=diagnostic.references,
+        operation=diagnostic.operation,
+        stage=diagnostic.stage,
     )
 
 
@@ -107,7 +132,8 @@ def validate(
 ) -> list[ValidationError]:
     """Return every problem the static checker can find in ``query``.
 
-    Returns ``[]`` for a query that ``compile_query`` would also accept.
+    Returns ``[]`` when static checks find no problem; backend lowering
+    may still reject the concrete query or selected execution strategy.
     Never raises on input.
 
     ``viewer`` / ``policy`` filter the catalog used for identifier
@@ -118,8 +144,25 @@ def validate(
     if viewer is not None:
         cat = {k: v for k, v in cat.items() if viewer_sees(v, viewer, policy)}
     errors: list[ValidationError] = []
+    capability_diagnostics = check_query_capabilities(query)
+    for diagnostic in capability_diagnostics:
+        errors.append(
+            ValidationError(
+                code=diagnostic.code,
+                reason=diagnostic.reason,
+                message=diagnostic.render_message(),
+                references=diagnostic.references,
+                operation=diagnostic.operation,
+                stage=diagnostic.stage,
+            )
+        )
 
-    if not query.measures and not query.dimensions and query.time_dimension is None:
+    if (
+        not query.measures
+        and not query.dimensions
+        and query.time_dimension is None
+        and not any(d.reason == "scalar_derived_only_unsupported" for d in capability_diagnostics)
+    ):
         errors.append(
             ValidationError(
                 code="empty_query",

@@ -200,3 +200,18 @@ def test_cross_partition_clause_resolved_to_fragment_coords() -> None:
         assert isinstance(values, tuple)
     coords = {(frag_idx, col) for _neg, frag_idx, col, _op, _vals in literals}
     assert coords == {(0, "status"), (1, "tier")}
+
+
+def test_many_to_one_merge_records_exact_materialized_one_side_key() -> None:
+    plan = compile_federated_query(
+        SemanticQuery(
+            measures=["orders.revenue"],
+            dimensions=["customers.region"],
+        ),
+        _catalog(),
+        mode="distributive",
+    )
+    (requirement,) = plan.merge_spec.merge_key_requirements
+    assert requirement.fragment_index == 1
+    assert requirement.columns == ("id",)
+    assert requirement.nulls_equal is False

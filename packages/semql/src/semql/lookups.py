@@ -24,9 +24,10 @@ from dataclasses import dataclass
 from difflib import SequenceMatcher
 from typing import Any, Literal
 
+from semql.analysis import EnrichmentProvenance, SemanticAnalysis
 from semql.catalog import Catalog
+from semql.errors import ContractError
 from semql.model import Lookup, MultiFieldEnricher, ResolutionContext
-from semql.refs import field_of
 from semql.safe import is_safe_sql_identifier
 from semql.spec import Filter, FilterOp, SemanticQuery
 
@@ -338,31 +339,81 @@ def enrich_result(
     return rows
 
 
+@dataclass(frozen=True)
+class EnrichedResult:
+    """Rows and their original semantic contract plus lookup provenance."""
+
+    rows: list[dict[str, object]]
+    analysis: SemanticAnalysis
+
+
 def enrich_all(
     rows: list[dict[str, object]],
     catalog: Catalog,
     ctx: ResolutionContext,
-) -> list[dict[str, object]]:
-    """Apply every catalog lookup's enricher to ``rows`` in one call.
+    *,
+    analysis: SemanticAnalysis,
+) -> EnrichedResult:
+    """Attach lookup fields using resolved semantic outputs, including aliases.
 
-    For each :class:`~semql.model.Lookup` whose dimension column is present
-    in the result, delegates to :func:`enrich_result` (which no-ops when the
-    lookup has no ``enricher``). Saves callers hand-rolling the per-lookup loop:
-
-        rows = enrich_all(rows, catalog, ctx)
-
-    The match is by the dimension's *field* name (``orders.region_id`` →
-    column ``region_id``); a query that aliased the column to something else
-    isn't matched (enrichment is best-effort, never raises)."""
-    if not rows:
-        return rows
-    present = set(rows[0].keys())
-    # ``Catalog.lookups`` is a ``{dimension: Lookup}`` map.
-    for lk in catalog.lookups.values():
-        col = field_of(lk.dimension)
-        if col in present:
-            rows = enrich_result(rows, col, lk, ctx)
-    return rows
+    Original keys, rows, grain, nodes, and output references are preserved.
+    Attached fields carry lookup provenance rather than becoming new metrics.
+    An unavailable analysis cannot establish lookup identity and is rejected.
+    Masked outputs never invoke an enricher.
+    """
+    if not analysis.outputs and rows:
+        raise ContractError(
+            "Enrichment requires semantic output mappings.",
+            reason="analysis_unavailable",
+            operation="enrichment",
+        )
+    nodes = {node.node_id: node for node in analysis.nodes}
+    enriched = [dict(row) for row in rows]
+    provenance = list(analysis.enrichments)
+    for output in analysis.outputs:
+        node = nodes[output.node_id]
+        if node.masked or node.catalog_ref not in catalog.lookups:
+            continue
+        lookup = catalog.lookups[node.catalog_ref]
+        if lookup.enricher is None:
+            continue
+        column = output.sql_alias
+        if any(column not in row for row in rows):
+            raise ContractError(
+                "An enrichment input does not match its output contract.",
+                reason="output_correspondence",
+                names=(column,),
+                operation="enrichment",
+            )
+        attachments = [{column: row[column]} for row in rows]
+        enrich_result(attachments, column, lookup, ctx)
+        attached: set[str] = set()
+        for row, attachment in zip(enriched, attachments, strict=True):
+            for name, value in attachment.items():
+                if name == column:
+                    continue
+                if name in row:
+                    raise ContractError(
+                        "An enrichment field collides with an existing output.",
+                        reason="duplicate_output",
+                        names=(name,),
+                        operation="enrichment",
+                    )
+                row[name] = value
+                attached.add(name)
+        provenance.extend(
+            EnrichmentProvenance(
+                output_id=output.output_id,
+                sql_alias=name,
+                lookup_ref=lookup.dimension,
+                field=name[len(column) + 2 :],
+            )
+            for name in sorted(attached)
+        )
+    return EnrichedResult(
+        rows=enriched,
+        analysis=analysis.model_copy(update={"enrichments": tuple(provenance)}),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -500,6 +551,7 @@ def sql_enricher(
 
 
 __all__ = [
+    "EnrichedResult",
     "QueryResolution",
     "ResolutionOutcome",
     "enrich_all",

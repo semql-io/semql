@@ -28,7 +28,7 @@ from semql import (
     ScopePredicate,
     SemanticQuery,
 )
-from semql.errors import CompileError
+from semql.compile import CompileError, compile_query
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -117,6 +117,16 @@ def test_compile_skips_scope_without_viewer() -> None:
     assert "manager_id" not in compiled.sql
 
 
+def test_direct_compile_requires_scope_registry_for_viewer() -> None:
+    cat = Catalog([_tickets()], scope_fns={"reportees": _reportees_scope})
+    with pytest.raises(CompileError):
+        compile_query(
+            SemanticQuery(measures=["tickets.count"]),
+            cat.as_dict(),
+            viewer=AuthContext(viewer_id="manager_42", roles=["manager"]),
+        )
+
+
 def test_compile_scope_inside_isolation_subquery() -> None:
     """The predicate must live *inside* the alias subquery so an outer
     OR cannot reach around it. Structural check: the scope SQL should
@@ -169,6 +179,26 @@ def test_compile_accepts_when_ctx_keys_satisfied() -> None:
     # Value bound, not inlined.
     assert "Engineering" not in compiled.sql
     assert "Engineering" in compiled.params.values()
+
+
+def test_scope_fn_is_evaluated_once_and_captured_in_analysis() -> None:
+    calls = 0
+
+    def counted(cube: Cube, viewer: AuthContext) -> ScopePredicate:
+        nonlocal calls
+        calls += 1
+        predicate = _reportees_scope(cube, viewer)
+        assert predicate is not None
+        return predicate
+
+    cat = Catalog([_tickets()], scope_fns={"reportees": counted})
+    compiled = cat.compile(
+        SemanticQuery(measures=["tickets.count"]),
+        viewer=AuthContext(viewer_id="manager_42", roles=["manager"]),
+    )
+
+    assert calls == 1
+    assert compiled.analysis.populations[0].evaluated_scopes == ("reportees",)
 
 
 # ---------------------------------------------------------------------------

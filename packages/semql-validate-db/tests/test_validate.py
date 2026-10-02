@@ -209,11 +209,14 @@ def test_meta_cubes_are_skipped(conn: duckdb.DuckDBPyConnection) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_finding_carries_db_error_detail(conn: duckdb.DuckDBPyConnection) -> None:
-    """The driver's error string lands in ``detail`` so a CI log can
-    show what the database actually said without us re-parsing."""
+def test_finding_preserves_driver_detail_without_publicly_rendering_it(
+    conn: duckdb.DuckDBPyConnection,
+) -> None:
+    """Raw driver detail remains available only through the trusted detail field."""
     catalog = Catalog([_orders_cube().model_copy(update={"joins": []})])
     findings: list[DbValidationError] = validate_against_db(catalog, connection=conn)
     assert findings, "expected at least one finding when the table is missing"
     detail = findings[0].detail or ""
-    assert detail, "expected detail to carry the driver's error message"
+    assert detail, "expected detail to preserve the driver's error"
+    assert detail not in findings[0].message
+    assert "SELECT" not in findings[0].message.upper()

@@ -11,6 +11,7 @@ import pytest
 from semql.compile import compile_query
 from semql.errors import (
     CompileError,
+    ContractError,
     CrossDialectError,
     FilterTypeError,
     JoinPathError,
@@ -35,6 +36,7 @@ def test_hierarchy_root_is_semqlerror() -> None:
         PlaceholderError,
         CrossDialectError,
         PhaseDeferredError,
+        ContractError,
     ):
         assert issubclass(leaf, CompileError)
         assert issubclass(leaf, SemQLError)
