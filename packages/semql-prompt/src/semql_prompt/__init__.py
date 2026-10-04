@@ -12,8 +12,12 @@ here. Catalog-level conveniences (``planner_prompt`` /
 argument.
 """
 
-from __future__ import annotations
-
+from semql_prompt.adaptive import (
+    AdaptivePromptPolicy,
+    AdaptivePromptRequest,
+    AdaptivePromptResult,
+    build_adaptive_prompt,
+)
 from semql_prompt.bedrock import to_bedrock_converse_tools
 from semql_prompt.catalog_tools import (
     planner_prompt,
@@ -48,8 +52,28 @@ from semql_prompt.prompt_budget import (
     apply_budget,
     estimate_tokens,
 )
+from semql_prompt.repair import (
+    PromptAugmentation,
+    PromptExample,
+    RepairGuidance,
+    RepairPrompt,
+    apply_prompt_augmentation,
+    build_prompt_repair_prompt,
+    build_query_repair_prompt,
+)
 
 __all__ = [
+    "AdaptivePromptPolicy",
+    "AdaptivePromptRequest",
+    "AdaptivePromptResult",
+    "build_adaptive_prompt",
+    "PromptAugmentation",
+    "PromptExample",
+    "RepairGuidance",
+    "RepairPrompt",
+    "apply_prompt_augmentation",
+    "build_prompt_repair_prompt",
+    "build_query_repair_prompt",
     # prompt fragments + rendering
     "CatalogPrompt",
     "ToolDescriptionProjection",

@@ -7,6 +7,19 @@ packages version in lockstep. Format loosely follows
 
 ## [Unreleased]
 
+### Added
+
+- Deterministic adaptive query-generator prompts select relevant authorized
+  cubes, compose fenced conversation/reference context, and incorporate safe
+  diagnostic repair guidance. The host retains model, retry, validation,
+  execution, and external-reference authorization ownership; complete-prompt
+  budget fit is reported explicitly.
+- Separate model-facing query-repair and prompt-improvement hatches preserve
+  fenced original prompts, failed outputs, and safe diagnostics. Query repair
+  requests `QueryPlan`; prompt improvement requests bounded `PromptAugmentation`
+  proposals, accepted only through viewer-aware compilation and selected-scope
+  checks. The host owns model calls and approval; full-prompt budgets remain explicit.
+
 ### Fixed
 
 - JWKS document expiry now invalidates parsed signing keys too, including
