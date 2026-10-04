@@ -7,6 +7,8 @@ packages version in lockstep. Format loosely follows
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-10-04
+
 ### Added
 
 - Deterministic adaptive query-generator prompts select relevant authorized

@@ -96,3 +96,26 @@ Both public demos ran successfully from the isolated worktree. A scoped scan
 found no private-key, AWS-access-key, credential-URL, GitHub-token, or JWT-shaped
 matches in the transferred feature files. No model call, tag, release, or
 package publication is authorized as part of this push.
+
+## Authorized main merge and version preparation
+
+The user subsequently authorized merging into main with a version bump, while
+explicitly withholding publication. The repository-native `just bump minor`
+advanced all eight packages from `0.10.0` to `0.11.0`, with internal sibling
+ranges `>=0.11.0,<0.12`; `uv lock --python 3.12` updated the workspace lock
+entries and `uv sync --python 3.12 --all-extras --frozen` installed that state.
+The changelog now records these additions and prerequisite defect repairs
+under `0.11.0`, with a separate empty Unreleased section.
+
+On the bumped branch, canonical `just check` passed again: **3,296 tests,
+4 skips, 1 expected failure, 81 snapshots**, all formatting/lint/type/boundary
+checks, and disposable PostgreSQL/ClickHouse conformance. All eight wheel/sdist
+pairs built into an isolated temporary directory; all 16 distributions passed
+Twine metadata validation. `scripts/release_artifact_smoke.py` installed the
+actual `0.11.0` wheels in a separate temporary environment and passed package
+origin/version/dependency checks plus real compile/serialize/DuckDB execution.
+These were local builds and installs, not uploads.
+
+Release workflow inspection confirms that publication requires a `v*` tag
+push, and GitHub release creation requires a tag push or explicit manual
+dispatch. Neither is part of this merge; no tag or release workflow is invoked.
