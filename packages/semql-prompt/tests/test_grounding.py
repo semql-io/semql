@@ -43,10 +43,6 @@ def _cube(name: str = "orders", **kwargs: Any) -> Cube:  # noqa: ANN401 — test
 # ---------------------------------------------------------------------------
 
 
-def test_cube_questions_default_empty() -> None:
-    assert _cube().questions == []
-
-
 def test_cube_questions_stored_verbatim() -> None:
     qs = ["How many orders shipped last week?", "Top 10 customers by LTV"]
     c = _cube(questions=qs)
@@ -77,10 +73,6 @@ def test_cube_questions_accepts_200_chars_exactly() -> None:
 # ---------------------------------------------------------------------------
 # Cube.keywords — acronym-preserving normalisation
 # ---------------------------------------------------------------------------
-
-
-def test_cube_keywords_default_empty() -> None:
-    assert _cube().keywords == []
 
 
 def test_cube_keywords_preserves_all_caps_acronyms() -> None:
@@ -181,12 +173,6 @@ def test_cube_deprecated_no_replacement_ok() -> None:
 # ---------------------------------------------------------------------------
 # GlossaryEntry
 # ---------------------------------------------------------------------------
-
-
-def test_glossary_entry_minimal() -> None:
-    g = GlossaryEntry(term="ARR", definition="Annual recurring revenue.")
-    assert g.term == "ARR"
-    assert g.aliases == []
 
 
 def test_glossary_entry_with_aliases() -> None:

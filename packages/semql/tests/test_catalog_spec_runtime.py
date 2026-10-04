@@ -358,3 +358,252 @@ def test_collect_all_emits_unit_diagnostics() -> None:
     assert "unit_display_without_unit" in {e["code"] for e in errors}
     with pytest.raises(ValueError, match="display_unit"):
         Catalog([cube])
+
+
+def test_from_spec_runtime_drives_public_policy_scope_hooks_registry_and_errors() -> None:
+    from semql import AuthContext, ScopePredicate, SemanticQuery
+    from semql.catalog import CatalogRuntime, CatalogSpec
+    from semql.compile import CompileError
+    from semql.hooks import BaseCompileHook, QueryTagRewriter
+    from semql.units import Registry
+
+    class InjectRuntimeLimit(BaseCompileHook):
+        def pre_compile(self, query: SemanticQuery, **_: object) -> SemanticQuery:
+            return query.model_copy(update={"limit": 17})
+
+    def policy(_cube: Cube, viewer: AuthContext) -> bool:
+        return viewer.viewer_id != "blocked"
+
+    def reportees(_cube: Cube, _viewer: AuthContext) -> ScopePredicate:
+        return ScopePredicate(
+            sql="{o}.region = {ctx.viewer_id}",
+            ctx_keys=["ctx.viewer_id"],
+        )
+
+    def transform(error: CompileError) -> Exception | None:
+        if "Unknown field 'missing'" in str(error):
+            return RuntimeError(f"runtime transform: {error}")
+        return None
+
+    registry = Registry()
+    registry.register("widgets", "megawidgets", 1.0 / 1_000_000.0)
+    unit_cube = Cube(
+        name="parts",
+        dialect=Dialect.POSTGRES,
+        table="parts",
+        alias="p",
+        measures=[
+            Measure(
+                name="produced",
+                sql="{p}.count",
+                agg="sum",
+                unit="widgets",
+                display_unit="megawidgets",
+            )
+        ],
+    )
+    runtime = CatalogRuntime(
+        policy=policy,
+        scope_fns={"reportees": reportees},
+        unit_registry=registry,
+        error_transform=transform,
+        compile_hooks=[InjectRuntimeLimit()],
+        sql_rewrite_hooks=[QueryTagRewriter({"runtime": "spec"})],
+    )
+    cat = Catalog.from_spec(
+        CatalogSpec(cubes=(_scoped_cube(), unit_cube)),
+        runtime=runtime,
+    )
+
+    with pytest.raises(CompileError):
+        cat.compile(
+            SemanticQuery(measures=["orders.count"]),
+            viewer=AuthContext(viewer_id="blocked"),
+        )
+
+    compiled = cat.compile(
+        SemanticQuery(measures=["orders.count"]),
+        viewer=AuthContext(viewer_id="manager-17"),
+    )
+    assert compiled.sql.startswith("/* runtime=spec */")
+    assert "LIMIT 17" in compiled.sql
+    assert "region" in compiled.sql
+    assert "manager-17" not in compiled.sql
+    assert "manager-17" in compiled.params.values()
+    assert cat.unit_registry.factor("widgets", "megawidgets") == 1.0 / 1_000_000.0
+
+    with pytest.raises(RuntimeError, match="runtime transform"):
+        cat.compile(SemanticQuery(measures=["orders.missing"]))
+
+
+def test_from_spec_runtime_none_fallback_and_empty_overrides_are_behavioral() -> None:
+    from semql import AuthContext, ScopePredicate, SemanticQuery
+    from semql.catalog import CatalogRuntime, CatalogSpec
+    from semql.compile import CompileError
+    from semql.hooks import BaseCompileHook, QueryTagRewriter
+    from semql.units import Registry
+
+    class KeywordLimit(BaseCompileHook):
+        def pre_compile(self, query: SemanticQuery, **_: object) -> SemanticQuery:
+            return query.model_copy(update={"limit": 23})
+
+    def deny_blocked(_cube: Cube, viewer: AuthContext) -> bool:
+        return viewer.viewer_id != "blocked"
+
+    def scope_all(_cube: Cube, _viewer: AuthContext) -> ScopePredicate:
+        return ScopePredicate(sql="1 = 1")
+
+    def transform(_error: CompileError) -> Exception:
+        return RuntimeError("keyword transform")
+
+    registry = Registry()
+    registry.register("widgets", "megawidgets", 1.0 / 1_000_000.0)
+    unit_cube = Cube(
+        name="parts",
+        dialect=Dialect.POSTGRES,
+        table="parts",
+        alias="p",
+        measures=[
+            Measure(
+                name="produced",
+                sql="{p}.count",
+                agg="sum",
+                unit="widgets",
+                display_unit="megawidgets",
+            )
+        ],
+    )
+    runtime = CatalogRuntime(
+        policy=None,
+        scope_fns={},
+        unit_registry=None,
+        error_transform=None,
+        compile_hooks=[],
+        sql_rewrite_hooks=[],
+    )
+    cat = Catalog.from_spec(
+        CatalogSpec(cubes=(_orders(), unit_cube)),
+        runtime=runtime,
+        policy=deny_blocked,
+        scope_fns={"reportees": scope_all},
+        unit_registry=registry,
+        error_transform=transform,
+        compile_hooks=[KeywordLimit()],
+        sql_rewrite_hooks=[QueryTagRewriter({"keyword": "must-not-win"})],
+    )
+
+    with pytest.raises(RuntimeError, match="keyword transform"):
+        cat.compile(
+            SemanticQuery(measures=["orders.count"]),
+            viewer=AuthContext(viewer_id="blocked"),
+        )
+    compiled = cat.compile(SemanticQuery(measures=["orders.count"]))
+    assert "LIMIT 23" not in compiled.sql
+    assert "keyword=must-not-win" not in compiled.sql
+    assert cat.unit_registry.factor("widgets", "megawidgets") == 1.0 / 1_000_000.0
+    with pytest.raises(RuntimeError, match="keyword transform"):
+        cat.compile(SemanticQuery(measures=["orders.missing"]))
+
+    with pytest.raises(ValueError, match="no scope function is registered"):
+        Catalog.from_spec(
+            CatalogSpec(cubes=(_scoped_cube(),)),
+            runtime=runtime,
+            scope_fns={"reportees": scope_all},
+        )
+
+
+def test_catalog_spec_json_round_trip_preserves_operational_limits() -> None:
+    from semql import MutableEntity, MutableField, Op
+    from semql.catalog import CatalogSpec
+
+    original = Catalog(
+        [_orders()],
+        entities=[
+            MutableEntity(
+                name="order",
+                cubes=["orders"],
+                key="orders.region",
+                target_cube="orders",
+                operations=frozenset({Op.INSERT}),
+                mutable_fields={"region": MutableField(type="string")},
+            )
+        ],
+        allow_mutations=True,
+        max_list_limit=7,
+        max_mutation_rows=3,
+    )
+    payload = json.loads(original.spec.model_dump_json())
+    restored_spec = CatalogSpec.from_dict(payload)
+    restored = Catalog.from_spec(restored_spec)
+
+    assert (
+        restored.allow_mutations,
+        restored.max_list_limit,
+        restored.max_mutation_rows,
+    ) == (True, 7, 3)
+    assert isinstance(restored.entities["order"], MutableEntity)
+
+
+def test_restored_catalog_enforces_serialized_list_and_mutation_limits() -> None:
+    from semql import EntityList, MutableEntity, MutableField, Op, SemanticMutation
+    from semql.catalog import CatalogSpec
+    from semql.mutate import CompiledMutation
+    from semql.rows import compile_list
+
+    entity = MutableEntity(
+        name="order",
+        cubes=["orders"],
+        key="orders.region",
+        list_filters=["orders.region"],
+        target_cube="orders",
+        operations=frozenset({Op.INSERT}),
+        mutable_fields={"region": MutableField(type="string")},
+    )
+    source = Catalog(
+        [_orders()],
+        entities=[entity],
+        allow_mutations=True,
+        max_list_limit=7,
+        max_mutation_rows=3,
+    )
+    restored = Catalog.from_spec(CatalogSpec.from_dict(json.loads(source.spec.model_dump_json())))
+
+    listed = compile_list(EntityList(entity="order", limit=50), restored)
+    mutation = restored.mutate(
+        SemanticMutation(entity="order", operation=Op.INSERT, values={"region": "west"})
+    )
+    assert listed.plan.limit == 7
+    assert mutation.max_affected_rows == 3
+    assert isinstance(mutation, CompiledMutation)
+
+
+def test_catalog_spec_round_trip_keeps_read_only_entity_read_only() -> None:
+    from semql import Entity, Op, SemanticMutation
+    from semql.catalog import CatalogSpec
+    from semql.errors import AuthError
+
+    original = Catalog(
+        [_orders()],
+        entities=[Entity(name="order", cubes=["orders"], key="orders.region")],
+        allow_mutations=True,
+    )
+    restored = Catalog.from_spec(CatalogSpec.from_dict(json.loads(original.spec.model_dump_json())))
+
+    assert type(restored.entities["order"]) is Entity
+    with pytest.raises(AuthError) as exc_info:
+        restored.mutate(
+            SemanticMutation(entity="order", operation=Op.INSERT, values={"region": "west"})
+        )
+    assert exc_info.value.reason == "not_mutable"
+
+
+def test_legacy_mutating_catalog_spec_refuses_ambiguous_entity_subtype() -> None:
+    from semql.catalog import CatalogSpec
+
+    payload = {
+        "schema_version": 1,
+        "entities": [{"name": "order", "cubes": ["orders"], "key": "orders.region"}],
+        "allow_mutations": True,
+    }
+    with pytest.raises(ValueError, match="cannot safely restore entity mutation"):
+        CatalogSpec.from_dict(payload)

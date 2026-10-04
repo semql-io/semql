@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from decimal import Decimal
 from typing import Any
 
 import pytest
@@ -30,14 +31,45 @@ def _plan() -> Any:
 
 
 class _Rows:
-    def __init__(self, columns: list[str], rows: list[tuple[Any, ...]]) -> None:
+    def __init__(
+        self,
+        columns: list[str],
+        rows: list[tuple[Any, ...]],
+        *,
+        numeric_type: str = "BIGINT",
+    ) -> None:
         self.columns = columns
         self.rows = rows
         self.calls = 0
+        self.column_types: list[str | None] = []
+        for column_index, column in enumerate(columns):
+            if column == "status":
+                self.column_types.append("VARCHAR")
+            elif numeric_type != "BIGINT":
+                self.column_types.append(numeric_type)
+            else:
+                sample = next(
+                    (row[column_index] for row in rows if row[column_index] is not None),
+                    1,
+                )
+                if isinstance(sample, bool):
+                    self.column_types.append("BOOLEAN")
+                elif isinstance(sample, int):
+                    self.column_types.append("BIGINT")
+                elif isinstance(sample, float):
+                    self.column_types.append("DOUBLE")
+                elif isinstance(sample, Decimal):
+                    self.column_types.append("DECIMAL(38, 18)")
+                else:
+                    self.column_types.append("VARCHAR")
 
     def execute(self, sql: str, params: Any) -> AdapterResult:
         self.calls += 1
-        return AdapterResult(columns=self.columns, rows=iter(self.rows))
+        return AdapterResult(
+            columns=self.columns,
+            rows=iter(self.rows),
+            column_types=self.column_types,
+        )
 
 
 class _Merge:
@@ -112,7 +144,11 @@ def test_duckdb_nan_values_compare_equal_for_merge_key_uniqueness() -> None:
         plan,
         merge_spec=replace(plan.merge_spec, merge_key_requirements=(requirement,)),
     )
-    adapter = _Rows(cols, [("paid", float("nan")), ("paid", float("nan"))])
+    adapter = _Rows(
+        cols,
+        [("paid", float("nan")), ("paid", float("nan"))],
+        numeric_type="DOUBLE",
+    )
 
     with pytest.raises(ContractError) as raised:
         Engine(
@@ -202,3 +238,42 @@ def test_cache_retains_validation_evidence_for_the_cached_rows() -> None:
     assert cached.validation_evidence == first.validation_evidence
     assert cached.rows == [("paid", 1), ("pending", 2)]
     assert adapter.calls == 1
+
+
+@pytest.mark.parametrize(
+    ("declared_type", "values"),
+    [
+        ("INTEGER", [1, 1]),
+        ("HUGEINT", [2**70, 2**70]),
+        ("DECIMAL(12,2)", [Decimal("1.0"), Decimal("1.00")]),
+    ],
+    ids=["declared-integer", "declared-hugeint", "decimal-scale-equivalence"],
+)
+def test_declared_numeric_merge_keys_use_duckdb_value_semantics(
+    declared_type: str,
+    values: list[Any],
+) -> None:
+    plan = _plan()
+    columns = list(plan.fragments[0].columns)
+    requirement = MergeKeyRequirement(0, ("status", "revenue"))
+    plan = replace(
+        plan,
+        merge_spec=replace(plan.merge_spec, merge_key_requirements=(requirement,)),
+    )
+    physical_types = [declared_type if column == "revenue" else "VARCHAR" for column in columns]
+
+    class TypedRows:
+        def execute(self, sql: str, params: Any) -> AdapterResult:
+            return AdapterResult(
+                columns=columns,
+                rows=[("paid", value) for value in values],
+                column_types=physical_types,
+            )
+
+    with pytest.raises(ContractError) as raised:
+        Engine(
+            adapters={Dialect.DUCKDB: TypedRows()},
+            merge_engine=_Merge(list(plan.columns)),
+        ).run(plan)
+
+    assert raised.value.reason == "merge_key_uniqueness_violation"

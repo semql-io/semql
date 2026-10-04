@@ -32,6 +32,10 @@ _FIELD_DESCRIPTION_RE = re.compile(
 )
 _DIALECTS = "|".join(re.escape(dialect.value) for dialect in Dialect)
 _CUBE_HEADER_RE = re.compile(rf"\n### ([\w-]+) \(({_DIALECTS})\)")
+_LEVEL_TWO_HEADING_RE = re.compile(r"(?m)^## (?!#).*$")
+_DOMAIN_CONTEXT_HEADING_RE = re.compile(r"(?m)^## DOMAIN CONTEXT[ \t]*$")
+_GLOSSARY_HEADING_RE = re.compile(r"(?m)^\*\*Glossary:\*\*[ \t]*$")
+_RELATIONS_HEADING_RE = re.compile(r"(?m)^\*\*Relations:\*\*[ \t]*$")
 
 
 def _estimate_tokens(text: str) -> int:
@@ -54,29 +58,24 @@ def _catalog_span(text: str) -> tuple[int, int] | None:
 
 
 def _drop_domain_subsection(text: str, marker: str) -> tuple[str, bool]:
-    """Drop one recognized subsection from ``## DOMAIN CONTEXT`` (or a
-    bare ``## <name>`` heading, for callers that synthesize their own).
-    """
-    domain_start = text.find("## DOMAIN CONTEXT")
-    if domain_start != -1:
-        domain_end = text.find("\n## ", domain_start + len("## DOMAIN CONTEXT"))
-        if domain_end == -1:
-            domain_end = len(text)
-        search_lo = domain_start
-        search_hi = domain_end
-    else:
-        search_lo = 0
-        search_hi = len(text)
-    start = text.find(marker, search_lo, search_hi)
-    if start == -1:
+    """Remove an optional subsection only inside a recognized domain block."""
+    domain = _DOMAIN_CONTEXT_HEADING_RE.search(text)
+    if domain is None:
         return text, False
+
+    domain_end_match = _LEVEL_TWO_HEADING_RE.search(text, domain.end())
+    domain_end = len(text) if domain_end_match is None else domain_end_match.start()
+    subsection_re = _GLOSSARY_HEADING_RE if marker == "**Glossary:**" else _RELATIONS_HEADING_RE
+    subsection = subsection_re.search(text, domain.end(), domain_end)
+    if subsection is None:
+        return text, False
+
     if marker == "**Glossary:**":
-        relations = text.find("**Relations:**", start + len(marker), search_hi)
-        end = relations if relations != -1 else search_hi
+        relations = _RELATIONS_HEADING_RE.search(text, subsection.end(), domain_end)
+        end = domain_end if relations is None else relations.start()
     else:
-        end = text.find("\n## ", start + len(marker))
-        end = end if end != -1 else search_hi
-    return text[:start] + text[end:], True
+        end = domain_end
+    return text[: subsection.start()] + text[end:], True
 
 
 def _drop_field_descriptions(text: str) -> tuple[str, int]:

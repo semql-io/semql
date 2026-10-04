@@ -1,7 +1,4 @@
 # serializer version: 1
-# name: test_sql_fixture_compiles_to_snapshot[SELECT /*+ COMPARE prior_period */ region, SUM(revenue) AS rev FROM orders WHERE created_at BETWEEN '2026-01-01' AND '2026-03-31' GROUP BY region]
-  'WITH current AS (SELECT o.region AS region, SUM(o.amount) AS revenue FROM prod.orders AS o WHERE o.deleted_at IS NULL AND o.created_at >= %(p0)s AND o.created_at < %(p1)s GROUP BY region), prior AS (SELECT o.region AS region, SUM(o.amount) AS revenue FROM prod.orders AS o WHERE o.deleted_at IS NULL AND o.created_at >= %(p2)s AND o.created_at < %(p3)s GROUP BY region) SELECT COALESCE(current.region, prior.region) AS region, current.revenue AS revenue_current, prior.revenue AS revenue_prior, COALESCE(current.revenue, 0) - COALESCE(prior.revenue, 0) AS revenue_delta, CASE WHEN prior.revenue > 0 THEN CAST((current.revenue - prior.revenue) * 100.0 AS DOUBLE PRECISION) / prior.revenue ELSE NULL END AS revenue_pct_change FROM current FULL OUTER JOIN prior ON current.region = prior.region'
-# ---
 # name: test_sql_fixture_compiles_to_snapshot[SELECT COUNT(*) FROM orders]
   'SELECT COUNT(*) AS count FROM prod.orders AS o WHERE o.deleted_at IS NULL'
 # ---

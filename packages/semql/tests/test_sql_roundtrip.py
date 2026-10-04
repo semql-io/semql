@@ -24,12 +24,13 @@ measure once emitted the raw column (``ORDER BY o.amount``) instead of
 its aggregate, and ``NOT IN`` / ``IS NOT NULL`` / ``MEDIAN(...)`` were
 silently dropped. The snapshot is what catches a regression of those.
 
-(A row-level execution oracle — run on seeded DuckDB, assert rows — is
-deliberately deferred here as too slow; the SQL snapshot is the contract.)
+Comparison uses seeded DuckDB execution to assert independent numeric,
+NULL-group, and alias expectations instead of repinning rendered SQL wording.
 """
 
 from __future__ import annotations
 
+import duckdb
 import pytest
 from semql import Catalog, Cube, Dialect, Dimension, Join, Measure, TimeDimension
 from semql.parse import parse_sql_statement
@@ -232,9 +233,6 @@ CASES: list[str] = [
     "SELECT region, SUM(revenue) FROM orders GROUP BY region LIMIT 10",
     "SELECT region, SUM(revenue) FROM orders GROUP BY region LIMIT 10 OFFSET 20",
     "SELECT region, SUM(revenue) AS rev FROM orders GROUP BY region ORDER BY rev DESC LIMIT 5",
-    # --- COMPARE hint → previous-period ---
-    "SELECT /*+ COMPARE prior_period */ region, SUM(revenue) AS rev FROM orders"
-    " WHERE created_at BETWEEN '2026-01-01' AND '2026-03-31' GROUP BY region",
     # --- Malloy-style JOIN: aggregate the many side (orders) by a dimension
     #     on the one side (customers / products). The ON clause is ignored;
     #     the compiler derives the join from the catalog. ---
@@ -279,3 +277,43 @@ def test_sql_fixture_compiles_to_snapshot(sql: str, snapshot: SnapshotAssertion)
     assert decision.parse_errors == (), decision.parse_errors
     out = CATALOG.compile(decision.query, context=CONTEXT)
     assert out.sql == snapshot
+
+
+def test_comparison_sql_alias_preserves_null_group_identity_and_numeric_outputs() -> None:
+    catalog = Catalog(
+        [
+            Cube(
+                name="orders",
+                table="orders",
+                alias="o",
+                dialect=Dialect.DUCKDB,
+                measures=[Measure(name="revenue", sql="{o}.amount", agg="sum")],
+                dimensions=[Dimension(name="region", sql="{o}.region", type="string")],
+                time_dimensions=[TimeDimension(name="created_at", sql="{o}.created_at")],
+            )
+        ]
+    )
+    decision = parse_sql_statement(
+        "SELECT /*+ COMPARE prior_period */ region, SUM(revenue) AS rev FROM orders "
+        "WHERE created_at BETWEEN '2026-01-01' AND '2026-03-31' GROUP BY region",
+        catalog.as_dict(),
+        strict=True,
+    )
+    compiled = catalog.compile(decision.query)
+    with duckdb.connect(":memory:") as connection:
+        connection.execute(
+            "CREATE TABLE orders(region VARCHAR, amount INTEGER, created_at TIMESTAMP)"
+        )
+        connection.executemany(
+            "INSERT INTO orders VALUES (?, ?, ?)",
+            [(None, 5, "2026-01-10"), (None, 2, "2025-12-15")],
+        )
+        cursor = connection.execute(compiled.sql, compiled.params)
+        assert [column[0] for column in cursor.description] == [
+            "region",
+            "rev_current",
+            "rev_prior",
+            "rev_delta",
+            "rev_pct_change",
+        ]
+        assert cursor.fetchall() == [(None, 5, 2, 3, 150.0)]

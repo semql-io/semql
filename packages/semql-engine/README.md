@@ -75,9 +75,11 @@ number by hand.
 
 ## Adapters
 
-An `Adapter` is anything with `execute(sql, params) -> AdapterResult`
-where `AdapterResult` carries `columns: list[str]` and an iterable of positional
-rows aligned exactly to those columns. Built-ins:
+An `Adapter` is anything with `execute(sql, params) -> AdapterResult`.
+`AdapterResult` carries `columns: list[str]`, positional `rows`, and optional
+`column_types: list[str | None]`, aligned exactly with the columns. Physical
+type declarations preserve numeric types, including decimal precision/scale,
+even when a fragment is empty or its values are all NULL. Built-ins:
 
 - `DuckDBAdapter(con)` — runs the SQL inside an existing DuckDB
   connection. Useful for local CSV / Parquet enrichment cubes.
@@ -85,6 +87,35 @@ rows aligned exactly to those columns. Built-ins:
   sqlite, etc).
 
 Bring your own for warehouses that need a vendor SDK.
+
+Built-in adapters retain driver schema metadata where available. Custom adapters
+should supply supported physical type names such as `INTEGER`, `DOUBLE`, or
+`DECIMAL(12,2)`; common BigQuery/ClickHouse names are normalized for DuckDB.
+Missing declarations can be inferred only from supported non-NULL values.
+An empty/all-NULL undeclared column raises `physical_schema_missing`;
+unsupported declared types raise `physical_schema_unsupported` rather than
+silently materializing numeric data as text.
+
+DB-API decimal precision/scale is retained when supplied. An unbounded
+`NUMERIC` declaration without those parameters is unknown, not a fixed
+BigQuery decimal; inference still requires observed values. Python `float`
+type codes map to `DOUBLE` so their mantissa is not narrowed.
+
+DuckDB materialization accepts decimal precision up to 38 digits. Higher declared
+precision (including BigQuery's default `BIGNUMERIC(76,38)`) and over-precision
+legacy `Decimal` values are rejected explicitly, not narrowed to an integer or
+rounded to fit.
+
+The engine owns acquired row iterators and closes closeable iterators after
+materialization, exhaustion, errors, or explicit stream closure. It does not
+close caller-owned adapter connections. Async fragment failure or caller
+cancellation cancels and drains request-owned tasks before returning; an
+already-running `asyncio.to_thread` worker cannot be forcibly stopped, so sync
+drivers still need their own query timeouts/cancellation policy.
+
+Cached rows isolate nested list/dict/tuple cells both on insertion and cache
+hits. Mutating a miss result or a later hit cannot change the cached value.
+Uncached execution does not perform these cache-isolation copies.
 
 ## Semi-joins
 

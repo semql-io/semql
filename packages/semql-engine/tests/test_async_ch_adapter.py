@@ -18,9 +18,11 @@ from __future__ import annotations
 import asyncio
 import re
 from collections.abc import Awaitable, Mapping
+from decimal import Decimal
 from typing import Any
 
 import duckdb
+import pytest
 from semql import (
     Cube,
     Dialect,
@@ -234,3 +236,79 @@ def test_async_ch_adapter_supports_native_named_params() -> None:
     )
     assert client.calls[0]["query"] == "SELECT {p0:Int64} AS v"
     assert client.calls[0]["parameters"] == {"p0": 42}
+
+
+@pytest.mark.parametrize(
+    ("source_rows", "expected"),
+    [
+        ([(1, "paid", Decimal("12.34"))], [("paid", Decimal("12.34"))]),
+        ([(1, "paid", None)], [("paid", None)]),
+        ([], []),
+    ],
+    ids=["decimal", "all-null", "empty"],
+)
+def test_async_ch_physical_schema_executes_empty_and_null_numeric_results(
+    source_rows: list[tuple[int, str, Any]],
+    expected: list[tuple[Any, ...]],
+) -> None:
+    raw = duckdb.connect(":memory:")
+    raw.execute("CREATE TABLE orders (id INTEGER, status TEXT, amount DECIMAL(12, 2))")
+    if source_rows:
+        raw.executemany("INSERT INTO orders VALUES (?, ?, ?)", source_rows)
+
+    class ClickHouseType:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+    class TypedResult:
+        def __init__(
+            self,
+            names: list[str],
+            types: list[ClickHouseType],
+            rows: list[tuple[Any, ...]],
+        ) -> None:
+            self.column_names = names
+            self.column_types = types
+            self.result_rows = rows
+
+    class TypedClient:
+        async def query(
+            self,
+            query: str,
+            parameters: Mapping[str, Any] | None = None,
+        ) -> TypedResult:
+            translated = re.sub(r"\{(\w+):[^}]+\}", r"$\1", query)
+            cursor = raw.execute(translated, dict(parameters or {}) or None)
+            description = list(cursor.description or [])
+            return TypedResult(
+                [str(column[0]) for column in description],
+                [
+                    ClickHouseType(
+                        "LowCardinality(Nullable(String))"
+                        if str(column[1]).upper() == "VARCHAR"
+                        else f"Nullable({column[1]})"
+                    )
+                    for column in description
+                ],
+                list(cursor.fetchall()),
+            )
+
+    cube = Cube(
+        name="orders",
+        dialect=Dialect.CLICKHOUSE,
+        table="orders",
+        alias="o",
+        primary_key="id",
+        measures=[Measure(name="revenue", sql="{o}.amount", agg="sum")],
+        dimensions=[Dimension(name="status", sql="{o}.status", type="string")],
+    )
+    plan = compile_federated_query(
+        SemanticQuery(measures=["orders.revenue"], dimensions=["orders.status"]),
+        {cube.name: cube},
+    )
+    engine = AsyncEngine()
+    engine.register(Dialect.CLICKHOUSE, AsyncClickHouseAdapter(TypedClient()))
+
+    result = _run(engine.run(plan))
+
+    assert result.rows == expected

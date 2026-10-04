@@ -1099,11 +1099,12 @@ def apply_partition_to_plan(plan: LogicalPlan, cube: Cube) -> LogicalPlan:
     sources. Pure plan→plan transform.
 
     Mirrors :func:`apply_rollup_to_plan` in shape — the matched
-    ``Scan`` is replaced with a ``Scan`` whose cube is a synthetic
-    :class:`Cube` (a fresh ``model_copy``) carrying a
-    :class:`PartitionedScan` on its ``partitioned_scan`` slot.  The
-    emitter reads that slot and emits the unioned subquery in
-    place of ``cube.table``.
+    ``Scan`` is replaced with a ``Scan`` whose cube is a fresh
+    :meth:`Cube.model_copy` carrying a :class:`PartitionedScan` on its
+    ``partitioned_scan`` slot. The cube retains its canonical
+    ``physical_sources`` and ``time_partition`` declaration; emission
+    uses that declaration with the plan's time window to read the
+    selected physical tables.
 
     The original cube, the original catalog, and the input plan
     are all untouched.  A future plan transform can keep
@@ -1144,18 +1145,11 @@ def apply_partition_to_plan(plan: LogicalPlan, cube: Cube) -> LogicalPlan:
         ordered = tuple(next(s for s in cube.physical_sources if s.name == m.name) for m in matched)
         partitioned = PartitionedScan(sources=ordered, is_empty=False)
 
-    # Synthetic cube — a model_copy with ``partitioned_scan`` set
-    # and the cube's normal table field cleared (so the emitter's
-    # table-name fallback doesn't trip on a stale value).
-    new_cube = cube.model_copy(
-        update={
-            "table": "",
-            "source": None,
-            "physical_sources": [],
-            "time_partition": None,
-            "partitioned_scan": partitioned,
-        }
-    )
+    # The routed metadata supplements, but does not replace, the
+    # cube's canonical physical_sources/time_partition declaration.
+    # The source-consistency validators require that declaration, and
+    # the emitter uses it to resolve the matched partition tables.
+    new_cube = cube.model_copy(update={"partitioned_scan": partitioned})
 
     new_scans: list[Scan] = []
     for scan in plan.scans:

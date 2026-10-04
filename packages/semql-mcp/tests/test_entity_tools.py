@@ -9,6 +9,8 @@ import asyncio
 from collections.abc import Awaitable
 from typing import Any
 
+import duckdb
+import pytest
 from fastmcp import Client
 from semql import (
     AuthContext,
@@ -252,3 +254,80 @@ def test_mutate_role_gate_denied() -> None:
     )
     assert "error" in out
     assert out["error"]["code"] == "AuthError"
+
+
+@pytest.mark.parametrize(("matching", "cap"), [(3, 2), (3, 3), (2, 3)])
+@pytest.mark.parametrize("round_trip", [False, True], ids=["original", "json-restored"])
+def test_serialized_mutation_cap_controls_actual_confirmed_writes(
+    matching: int, cap: int, round_trip: bool
+) -> None:
+    from semql.catalog import CatalogSpec
+
+    cube = _cube().model_copy(update={"dialect": Dialect.DUCKDB})
+    entity = _mutable_entity().model_copy(update={"predicate_targeting": True})
+    catalog = Catalog([cube], entities=[entity], allow_mutations=True, max_mutation_rows=cap)
+    if round_trip:
+        catalog = Catalog.from_spec(CatalogSpec.model_validate_json(catalog.spec.model_dump_json()))
+    connection = duckdb.connect(":memory:")
+    try:
+        connection.execute("CREATE TABLE orders(id INTEGER, region VARCHAR, amount INTEGER)")
+        connection.executemany(
+            "INSERT INTO orders VALUES (?, ?, ?)",
+            [(i, "us", 1) for i in range(matching)] + [(99, "other", 1)],
+        )
+
+        def execute(sql: str, params: dict[str, Any]) -> list[dict[str, Any]]:
+            cursor = connection.execute(sql, params)
+            names = [column[0] for column in cursor.description]
+            return [dict(zip(names, row, strict=True)) for row in cursor.fetchall()]
+
+        server = MCPServer(catalog, executor=execute, require_viewer=False)
+        output = _call(
+            server,
+            "mutate_order",
+            {"operation": "delete", "where": {"region": "us"}, "confirm": True},
+        )
+        if matching > cap:
+            assert output["error"]["code"] == "MutationCapExceeded"
+            assert output["executed"] is False
+        else:
+            assert output["executed"] is True
+            assert output["affected_rows"] == matching
+        assert connection.execute("SELECT id FROM orders WHERE region = 'other'").fetchall() == [
+            (99,)
+        ]
+        remaining = connection.execute("SELECT count(*) FROM orders WHERE region = 'us'").fetchone()
+        assert remaining == (matching if matching > cap else 0,)
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize("round_trip", [False, True], ids=["original", "json-restored"])
+def test_serialized_list_cap_limits_actual_entity_rows(round_trip: bool) -> None:
+    from semql.catalog import CatalogSpec
+
+    catalog = Catalog(
+        [_cube().model_copy(update={"dialect": Dialect.DUCKDB})],
+        entities=[_read_entity()],
+        max_list_limit=2,
+    )
+    if round_trip:
+        catalog = Catalog.from_spec(CatalogSpec.model_validate_json(catalog.spec.model_dump_json()))
+    connection = duckdb.connect(":memory:")
+    try:
+        connection.execute("CREATE TABLE orders(id INTEGER, region VARCHAR, amount INTEGER)")
+        connection.executemany(
+            "INSERT INTO orders VALUES (?, ?, ?)", [(i, "us", 1) for i in range(5)]
+        )
+
+        def execute(sql: str, params: dict[str, Any]) -> list[dict[str, Any]]:
+            cursor = connection.execute(sql, params)
+            names = [column[0] for column in cursor.description]
+            return [dict(zip(names, row, strict=True)) for row in cursor.fetchall()]
+
+        server = MCPServer(catalog, executor=execute, require_viewer=False)
+        output = _call(server, "list_order", {"region": "us", "limit": 50})
+        assert [row["id"] for row in output["rows"]] == [0, 1]
+        assert connection.execute("SELECT count(*) FROM orders").fetchone() == (5,)
+    finally:
+        connection.close()

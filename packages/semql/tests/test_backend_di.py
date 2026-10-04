@@ -65,6 +65,11 @@ class RecordingDialect:
         self.trunc_calls.append((granularity, e.sql(dialect="postgres")))
         return self.inner.trunc(granularity, e, timezone, week_start)
 
+    def emit_null_safe_eq(
+        self, left: exp.Expression, right: exp.Expression, value_type: str
+    ) -> exp.Expression:
+        return self.inner.emit_null_safe_eq(left, right, value_type)
+
     def emit_contains(
         self,
         f: exp.Expression,

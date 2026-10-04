@@ -33,11 +33,11 @@ aggregated into a single list instead of a first-error raise.
 from __future__ import annotations
 
 import difflib
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, TypeVar, cast
+from typing import TYPE_CHECKING, Annotated, Any, cast
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Discriminator, Field, Tag, model_validator
 
 from semql._grounding import validate_relations
 from semql.analysis import CatalogContext
@@ -69,7 +69,20 @@ if TYPE_CHECKING:
 from semql.units import DEFAULT_REGISTRY, Registry
 from semql.validate import ValidationError, validate
 
-_T = TypeVar("_T", bound=BaseField)
+
+def _entity_spec_tag(value: object) -> str | None:
+    if isinstance(value, Mapping):
+        tag = cast(Mapping[object, object], value).get("entity_type")
+    else:
+        tag = getattr(value, "entity_type", None)
+    return tag if isinstance(tag, str) else None
+
+
+EntitySpecValue = Annotated[
+    Annotated[MutableEntity, Tag("mutable_entity")] | Annotated[Entity, Tag("entity")],
+    Discriminator(_entity_spec_tag),
+]
+
 
 # ``emit(code, message, **extra)`` — the one knob that distinguishes the
 # two catalog-validation contracts. ``Catalog.__init__`` passes an emit
@@ -626,13 +639,13 @@ class CatalogSpec(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     #: Bump on a breaking change to the wire format.
-    schema_version: int = 1
+    schema_version: int = 2
     cubes: tuple[Cube, ...] = ()
     views: tuple[View, ...] = ()
     lookups: tuple[Lookup, ...] = ()
     saved_queries: tuple[SavedQuery, ...] = ()
     glossary: tuple[GlossaryEntry, ...] = ()
-    entities: tuple[Entity, ...] = ()
+    entities: tuple[EntitySpecValue, ...] = ()
     relations: str = ""
     compile_hook_names: tuple[str, ...] = ()
     sql_rewrite_hook_names: tuple[str, ...] = ()
@@ -649,6 +662,54 @@ class CatalogSpec(BaseModel):
     #: ``()`` for a clean build; populated when collect-all surfaces
     #: a problem the legacy first-error constructor would have raised.
     construction_errors: tuple[dict[str, Any], ...] = Field(default_factory=tuple)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _tag_entity_wire_values(cls, value: object) -> object:
+        if not isinstance(value, Mapping):
+            return value
+        data: dict[object, object] = dict(cast(Mapping[object, object], value))
+        raw_entities: object = data.get("entities", ())
+        if not isinstance(raw_entities, Sequence) or isinstance(raw_entities, (str, bytes)):
+            return cast(object, value)
+        raw_entities = cast(Sequence[object], raw_entities)
+        version = data.get("schema_version", 2)
+        if (
+            isinstance(version, int)
+            and version < 2
+            and bool(data.get("allow_mutations"))
+            and raw_entities
+        ):
+            raise ValueError(
+                "CatalogSpec schema version 1 cannot safely restore entity mutation "
+                "declarations; rebuild the spec from trusted MutableEntity definitions."
+            )
+        write_fields = {
+            "target_cube",
+            "operations",
+            "mutable_fields",
+            "pinned_values",
+            "predicate_targeting",
+        }
+        entities: list[object] = []
+        for raw_entity in raw_entities:
+            if isinstance(raw_entity, (Entity, MutableEntity)):
+                entities.append(raw_entity)
+                continue
+            if isinstance(raw_entity, Mapping):
+                entity: dict[object, object] = dict(cast(Mapping[object, object], raw_entity))
+                if "entity_type" not in entity:
+                    if write_fields.intersection(entity):
+                        raise ValueError(
+                            "Mutable entity wire values require an explicit "
+                            "entity_type discriminator."
+                        )
+                    entity["entity_type"] = "entity"
+                entities.append(entity)
+            else:
+                entities.append(raw_entity)
+        data["entities"] = entities
+        return data
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> CatalogSpec:
@@ -828,24 +889,30 @@ class Catalog:
                 f"error(s); build via from_iterables and surface them, or fix "
                 f"the spec first. First: {messages[0]!r}"
             )
-        # Materialise the spec into a Catalog via the legacy kwargs
-        # path: the spec's cubes / views / lookups / saved_queries /
-        # glossary / relations are user-supplied; the META auto-append
-        # and the rest of the first-error validation runs in __init__.
         return cls(
             list(spec.cubes),
             views=list(spec.views),
             lookups=list(spec.lookups),
             saved_queries=list(spec.saved_queries),
             glossary=list(spec.glossary),
-            entities=list(spec.entities),
+            entities=cast(list[Entity], list(spec.entities)),
             relations=spec.relations,
-            policy=policy,
-            scope_fns=scope_fns,
-            unit_registry=unit_registry,
-            error_transform=error_transform,
-            compile_hooks=compile_hooks,
-            sql_rewrite_hooks=sql_rewrite_hooks,
+            policy=runtime.policy if runtime is not None and runtime.policy is not None else policy,
+            scope_fns=runtime.scope_fns if runtime is not None else scope_fns,
+            unit_registry=(
+                runtime.unit_registry
+                if runtime is not None and runtime.unit_registry is not None
+                else unit_registry
+            ),
+            error_transform=(
+                runtime.error_transform
+                if runtime is not None and runtime.error_transform is not None
+                else error_transform
+            ),
+            compile_hooks=runtime.compile_hooks if runtime is not None else compile_hooks,
+            sql_rewrite_hooks=(
+                runtime.sql_rewrite_hooks if runtime is not None else sql_rewrite_hooks
+            ),
             allow_mutations=spec.allow_mutations,
             max_list_limit=spec.max_list_limit,
             max_mutation_rows=spec.max_mutation_rows,
@@ -968,6 +1035,9 @@ class Catalog:
             glossary=tuple(glossary_list),
             entities=tuple(entity_list),
             relations=self.relations,
+            allow_mutations=allow_mutations,
+            max_list_limit=max_list_limit,
+            max_mutation_rows=max_mutation_rows,
         )
         self.runtime = CatalogRuntime(
             policy=policy,
@@ -1334,10 +1404,12 @@ def _resolve_extends(cubes: list[Cube]) -> list[Cube]:
             )
         parent = _flatten(cube.extends, (*stack, name))
 
-        def _merge_by_name(parent_list: list[_T], child_list: list[_T]) -> list[_T]:
-            by_field_name: dict[str, _T] = {f.name: f for f in parent_list}
-            for f in child_list:
-                by_field_name[f.name] = f
+        def _merge_by_name[T: BaseField](
+            parent_list: Sequence[T], child_list: Sequence[T]
+        ) -> list[T]:
+            by_field_name: dict[str, T] = {field.name: field for field in parent_list}
+            for field in child_list:
+                by_field_name[field.name] = field
             return list(by_field_name.values())
 
         return cube.model_copy(

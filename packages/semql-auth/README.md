@@ -46,6 +46,12 @@ mapper = DictMapper({"tok-abc": ...})
 See [API reference](../../docs/api/semql_auth.md) for the full adapter
 surface.
 
+`JWKSVerifier(ttl=...)` applies one lifetime to both the JWKS document and
+its parsed public keys. Unexpired documents reuse keys; expiry refreshes
+before a known key can be trusted again. `ttl=0` disables both caches.
+Removed keys and same-`kid` replacements take effect on refresh; a refresh
+failure raises `AuthError` rather than falling back to stale signing material.
+
 ## License
 
 BSD-3-Clause.

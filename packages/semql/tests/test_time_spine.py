@@ -22,7 +22,7 @@ import pytest
 from semql.compile import compile_query
 from semql.errors import CompileError
 from semql.model import Cube, Dialect, Measure, TimeDimension
-from semql.spec import SemanticQuery, TimeWindow
+from semql.spec import InlineDerived, SemanticQuery, TimeWindow
 
 CONTEXT = {"schema": "test"}
 
@@ -150,6 +150,128 @@ def test_duckdb_dense_fill_executes_and_returns_missing_daily_buckets() -> None:
         assert rows[2][1] == 7.0
         assert rows[-1][0].date().isoformat() == "2024-01-31"
         assert rows[-1][1] == 0
+    finally:
+        con.close()
+
+
+@pytest.mark.parametrize(
+    ("granularity", "window", "facts", "expected"),
+    [
+        pytest.param(
+            "day",
+            ("2024-01-01", "2024-01-03"),
+            [("2024-01-01 08:00:00", 5.0), ("2024-01-02 10:00:00", 7.0)],
+            [("2024-01-01", 5.0), ("2024-01-02", 7.0)],
+            id="aligned-exclusive-end",
+        ),
+        pytest.param(
+            "day",
+            ("2024-01-01 12:00:00", "2024-01-02 12:00:00"),
+            [("2024-01-02 10:00:00", 7.0)],
+            [("2024-01-01", 0.0), ("2024-01-02", 7.0)],
+            id="unaligned-final-intersection",
+        ),
+        pytest.param(
+            "day",
+            ("2024-01-01 12:00:00", "2024-01-01 13:00:00"),
+            [("2024-01-01 12:30:00", 9.0)],
+            [("2024-01-01", 9.0)],
+            id="substep-window",
+        ),
+        pytest.param(
+            "month",
+            ("2024-01-31 12:00:00", "2024-03-01 00:00:00"),
+            [("2024-01-31 18:00:00", 11.0), ("2024-02-29 20:00:00", 13.0)],
+            [("2024-01-01", 11.0), ("2024-02-01", 13.0)],
+            id="calendar-month",
+        ),
+    ],
+)
+def test_duckdb_dense_spine_preserves_every_intersecting_bucket(
+    granularity: str,
+    window: tuple[str, str],
+    facts: list[tuple[str, float]],
+    expected: list[tuple[str, float]],
+) -> None:
+    con = duckdb.connect(":memory:")
+    try:
+        con.execute("CREATE SCHEMA test")
+        con.execute("CREATE TABLE test.orders (created_at TIMESTAMP, amount DOUBLE)")
+        con.executemany("INSERT INTO test.orders VALUES (?, ?)", facts)
+        query = SemanticQuery(
+            measures=["orders.revenue"],
+            time_dimension=TimeWindow(
+                dimension="orders.created_at",
+                granularity=granularity,  # type: ignore[arg-type]
+                range=window,
+                fill_nulls_with=0,
+            ),
+            order=[("orders.created_at", "asc")],
+        )
+        compiled = compile_query(query, {"orders": _duckdb_orders()}, context=CONTEXT)
+        rows = con.execute(compiled.sql, compiled.params).fetchall()
+        observed = [(bucket.date().isoformat(), amount) for bucket, amount in rows]
+        assert observed == expected
+    finally:
+        con.close()
+
+
+@pytest.mark.parametrize(
+    ("operation", "expected_values"),
+    [
+        pytest.param("ratio", [7.5, None, 60.0], id="ratio"),
+        pytest.param("sum", [17.0, 0.0, 61.0], id="sum"),
+        pytest.param("diff", [13.0, 0.0, 59.0], id="diff"),
+    ],
+)
+def test_duckdb_dense_fill_preserves_complete_derived_projection_contract(
+    operation: str, expected_values: list[float | None]
+) -> None:
+    con = duckdb.connect(":memory:")
+    try:
+        con.execute("CREATE SCHEMA test")
+        con.execute("CREATE TABLE test.orders (created_at TIMESTAMP, amount DOUBLE)")
+        con.execute(
+            "INSERT INTO test.orders VALUES "
+            "('2024-01-01 08:00:00', 10.0), "
+            "('2024-01-01 09:00:00', 5.0), "
+            "('2024-01-03 10:00:00', 60.0)"
+        )
+        query = SemanticQuery(
+            measures=["orders.revenue"],
+            aliases={"gross": "orders.revenue"},
+            derived_measures=[
+                InlineDerived(
+                    name="derived_value",
+                    op=operation,  # type: ignore[arg-type]
+                    operands=["orders.revenue", "orders.count"],
+                )
+            ],
+            time_dimension=TimeWindow(
+                dimension="orders.created_at",
+                granularity="day",
+                range=("2024-01-01", "2024-01-04"),
+                fill_nulls_with=0,
+            ),
+            order=[("orders.created_at", "asc")],
+        )
+        compiled = compile_query(query, {"orders": _duckdb_orders()}, context=CONTEXT)
+        cursor = con.execute(compiled.sql, compiled.params)
+        result_columns = [item[0] for item in cursor.description]
+        rows = cursor.fetchall()
+
+        expected_columns = ["created_at_day", "gross", "derived_value"]
+        assert compiled.columns == expected_columns
+        assert result_columns == expected_columns
+        assert [meta.name for meta in compiled.column_meta] == expected_columns
+        assert [output.sql_alias for output in compiled.analysis.outputs] == expected_columns
+        assert all(len(row) == len(expected_columns) for row in rows)
+        assert [(row[0].date().isoformat(), row[1], row[2]) for row in rows] == [
+            ("2024-01-01", 15.0, expected_values[0]),
+            ("2024-01-02", 0.0, expected_values[1]),
+            ("2024-01-03", 60.0, expected_values[2]),
+        ]
+        assert "count" not in result_columns
     finally:
         con.close()
 

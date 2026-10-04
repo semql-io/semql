@@ -14,7 +14,6 @@ from __future__ import annotations
 import pytest
 from semql import (
     Catalog,
-    CompareWindow,
     Cube,
     Dialect,
     Dimension,
@@ -152,22 +151,6 @@ def test_snap_ungrouped_row_listing(snapshot: SnapshotAssertion, context: dict[s
             dimensions=["orders.region", "orders.status"],
             ungrouped=True,
             limit=50,
-        ),
-        context=context,
-    )
-    assert out.sql == snapshot
-
-
-def test_snap_compare_previous_period(snapshot: SnapshotAssertion, context: dict[str, str]) -> None:
-    out = _orders_catalog().compile(
-        SemanticQuery(
-            measures=["orders.revenue"],
-            dimensions=["orders.region"],
-            time_dimension=TimeWindow(
-                dimension="orders.created_at",
-                range=("2026-01-01", "2026-02-01"),
-            ),
-            compare=CompareWindow(),
         ),
         context=context,
     )

@@ -218,3 +218,74 @@ def test_all_merges_segments_for_full_visible_set() -> None:
     )
     merged = proj.all()
     assert set(merged) == {"orders", "audit_events"}
+
+
+def test_protected_fields_are_viewer_specific_not_invariant() -> None:
+    cube = Cube(
+        name="orders",
+        dialect=Dialect.POSTGRES,
+        table="orders",
+        alias="o",
+        measures=[
+            Measure(name="revenue", sql="{o}.amount", agg="sum"),
+            Measure(
+                name="secret",
+                sql="{o}.secret",
+                agg="sum",
+                required_roles=["admin"],
+            ),
+        ],
+    )
+    catalog = Catalog([cube])
+    anonymous = project_tool_descriptions(catalog.as_dict())
+    admin = project_tool_descriptions(
+        catalog.as_dict(),
+        viewer=AuthContext(viewer_id="admin", roles=["admin"]),
+    )
+    guest = project_tool_descriptions(
+        catalog.as_dict(),
+        viewer=AuthContext(viewer_id="guest", roles=[]),
+    )
+
+    assert anonymous.invariant == admin.invariant == guest.invariant
+    assert "secret" not in str(admin.invariant)
+    assert "secret" in str(admin.all())
+    assert "secret" not in str(guest.all())
+
+
+def test_all_prefers_authorized_overlay_for_duplicate_cube_key() -> None:
+    projection = ToolDescriptionProjection(
+        invariant={"orders": "public fields only"},
+        viewer_gated={"orders": "authorized fields including secret"},
+    )
+
+    assert projection.all()["orders"] == "authorized fields including secret"
+
+
+def test_dynamic_policy_is_authoritative_at_projection_api() -> None:
+    catalog = Catalog(
+        [_public_orders()],
+        policy=lambda _cube, viewer: viewer.viewer_id == "admin",
+    )
+    no_viewer = project_tool_descriptions(
+        catalog.as_dict(),
+        policy=catalog.policy,
+    )
+    admin = project_tool_descriptions(
+        catalog.as_dict(),
+        viewer=AuthContext(viewer_id="admin"),
+        policy=catalog.policy,
+    )
+    guest = project_tool_descriptions(
+        catalog.as_dict(),
+        viewer=AuthContext(viewer_id="guest"),
+        policy=catalog.policy,
+    )
+
+    assert no_viewer.invariant == admin.invariant == guest.invariant == {}
+    assert "orders" in no_viewer.viewer_gated
+    assert "orders" in no_viewer.all()
+    assert "orders" in admin.viewer_gated
+    assert "orders" in admin.all()
+    assert guest.viewer_gated == {}
+    assert "orders" not in guest.all()

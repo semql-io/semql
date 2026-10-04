@@ -16,6 +16,7 @@ import asyncio
 import re
 import time
 from collections.abc import Awaitable, Mapping
+from decimal import Decimal
 from typing import Any
 
 import duckdb
@@ -35,7 +36,9 @@ from semql_engine import (
     AsyncEngine,
     AsyncMergeEngine,
     DuckDBAdapter,
+    DuckDBMergeEngine,
     EngineError,
+    ExecutionContractError,
     to_async_adapter,
     to_async_merge_engine,
 )
@@ -545,3 +548,127 @@ def test_iter_run_fast_path_streams_in_requested_chunks(
     sizes = _run(collect())
     assert engine.last_iter_run_used_fast_path
     assert sizes == [1, 1]  # two status groups, one row each
+
+
+@pytest.mark.parametrize("explicit_merge", [False, True], ids=["inline", "explicit"])
+@pytest.mark.parametrize(
+    ("amount_type", "source_rows", "expected"),
+    [
+        ("DECIMAL(12, 2)", [(1, 10, Decimal("12.34"))], [("EU", Decimal("12.34"))]),
+        ("DECIMAL(12, 2)", [(1, 10, None)], [("EU", None)]),
+        ("DECIMAL(12, 2)", [], []),
+        ("INTEGER", [(1, 10, 12)], [("EU", 12)]),
+        ("DOUBLE", [(1, 10, 12.5)], [("EU", 12.5)]),
+    ],
+    ids=["decimal", "all-null", "empty", "integer", "float"],
+)
+def test_async_merge_preserves_physical_numeric_schema(
+    amount_type: str,
+    explicit_merge: bool,
+    source_rows: list[tuple[int, int, Any]],
+    expected: list[tuple[Any, ...]],
+) -> None:
+    orders = duckdb.connect(":memory:")
+    orders.execute(f"CREATE TABLE orders (id INTEGER, customer_id INTEGER, amount {amount_type})")
+    if source_rows:
+        orders.executemany("INSERT INTO orders VALUES (?, ?, ?)", source_rows)
+    customers = duckdb.connect(":memory:")
+    customers.execute("CREATE TABLE customers (id INTEGER, region TEXT)")
+    customers.execute("INSERT INTO customers VALUES (10, 'EU')")
+    catalog = _catalog(_orders_cube(), _customers_cube())
+    plan = compile_federated_query(
+        SemanticQuery(measures=["orders.revenue"], dimensions=["customers.region"]),
+        catalog,
+    )
+
+    class AsyncTypedAdapter:
+        def __init__(self, connection: duckdb.DuckDBPyConnection) -> None:
+            self.inner = DuckDBAdapter(connection)
+
+        async def execute(self, sql: str, params: Mapping[str, Any]) -> AdapterResult:
+            return self.inner.execute(sql, params)
+
+    merge_engine = to_async_merge_engine(DuckDBMergeEngine()) if explicit_merge else None
+    engine = AsyncEngine(merge_engine=merge_engine)
+    engine.register(Dialect.POSTGRES, AsyncTypedAdapter(orders))
+    engine.register(Dialect.BIGQUERY, AsyncTypedAdapter(customers))
+
+    result = _run(engine.run(plan))
+
+    assert result.rows == expected
+    if source_rows and source_rows[0][2] is not None:
+        assert type(result.rows[0][1]) is type(source_rows[0][2])
+
+
+@pytest.mark.parametrize(
+    ("terminal", "expected_rows"),
+    [
+        ("exhaustion", [("paid", 650.0), ("pending", 25.0)]),
+        ("early-close", [("paid", 650.0)]),
+        ("iteration-error", []),
+        ("validation-error", []),
+    ],
+    ids=["exhaustion", "early-close", "iteration-error", "validation-error"],
+)
+def test_fast_stream_closes_acquired_adapter_rows(
+    pg_con: duckdb.DuckDBPyConnection,
+    terminal: str,
+    expected_rows: list[tuple[Any, ...]],
+) -> None:
+    plan = compile_federated_query(
+        SemanticQuery(measures=["orders.revenue"], dimensions=["orders.status"]),
+        _catalog(_orders_cube()),
+    )
+
+    class CloseableRows:
+        def __init__(self) -> None:
+            self.rows = iter([("paid", 650.0), ("pending", 25.0)])
+            self.closed = False
+            self.calls = 0
+
+        def __iter__(self) -> CloseableRows:
+            return self
+
+        def __next__(self) -> tuple[Any, ...]:
+            self.calls += 1
+            if terminal == "iteration-error" and self.calls == 2:
+                raise RuntimeError("row iteration failed")
+            return next(self.rows)
+
+        def close(self) -> None:
+            self.closed = True
+
+    rows = CloseableRows()
+
+    class CloseableAdapter:
+        async def execute(self, sql: str, params: Mapping[str, Any]) -> AdapterResult:
+            columns = (
+                ["wrong"] if terminal == "validation-error" else list(plan.fragments[0].columns)
+            )
+            return AdapterResult(columns=columns, rows=rows)
+
+    engine = AsyncEngine()
+    engine.register(Dialect.POSTGRES, CloseableAdapter())
+
+    async def drive() -> list[tuple[Any, ...]]:
+        stream = engine.iter_run(plan, chunk_rows=1)
+        out: list[tuple[Any, ...]] = []
+        if terminal == "early-close":
+            out.extend(await stream.__anext__())
+            await stream.aclose()
+        elif terminal == "iteration-error":
+            with pytest.raises(RuntimeError, match="row iteration failed"):
+                while True:
+                    await stream.__anext__()
+        elif terminal == "validation-error":
+            with pytest.raises(ExecutionContractError, match="columns do not match"):
+                await stream.__anext__()
+        else:
+            async for chunk in stream:
+                out.extend(chunk)
+        return out
+
+    actual = _run(drive())
+
+    assert actual == expected_rows
+    assert rows.closed

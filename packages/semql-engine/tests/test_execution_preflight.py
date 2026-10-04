@@ -39,6 +39,10 @@ def _plan(*, filtered: bool = False) -> Any:
     )
 
 
+def _physical_types(columns: list[str]) -> list[str]:
+    return ["VARCHAR" if column == "status" else "DOUBLE" for column in columns]
+
+
 class _CountingAdapter:
     def __init__(self, columns: list[str] | None = None) -> None:
         self.calls = 0
@@ -46,7 +50,12 @@ class _CountingAdapter:
 
     def execute(self, sql: str, params: Any) -> AdapterResult:
         self.calls += 1
-        return AdapterResult(columns=list(self.columns or []), rows=[])
+        columns = list(self.columns or [])
+        return AdapterResult(
+            columns=columns,
+            rows=[],
+            column_types=_physical_types(columns),
+        )
 
 
 class _AsyncCountingAdapter:
@@ -56,7 +65,12 @@ class _AsyncCountingAdapter:
 
     async def execute(self, sql: str, params: Any) -> AdapterResult:
         self.calls += 1
-        return AdapterResult(columns=list(self.columns or []), rows=[])
+        columns = list(self.columns or [])
+        return AdapterResult(
+            columns=columns,
+            rows=[],
+            column_types=_physical_types(columns),
+        )
 
 
 def test_missing_final_binding_fails_before_sync_adapter() -> None:
