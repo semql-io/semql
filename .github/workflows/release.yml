@@ -81,7 +81,7 @@ jobs:
           name: dist
           path: dist/
 
-      - uses: pypa/gh-action-pypi-publish@v1.14.1
+      - uses: pypa/gh-action-pypi-publish@v1.14.2
 
   # GitHub Release with the built artifacts — on a tag push and on manual
   # dispatch. Independent of the PyPI gate.
