@@ -7,6 +7,8 @@ packages version in lockstep. Format loosely follows
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-10-23
+
 ### Added
 
 - Single-hop `CohortQuery` specifications and `compile_cohort_query` select a

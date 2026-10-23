@@ -2,7 +2,7 @@
 
 ## Scope and authorization
 
-Implement issue #16 following the executable cohort spike. Use branch `feat/cohort-spine`, based on main `066c3d408e0f2f3b8e08e87aa9ca7215ba7c875b`, in the matching isolated worktree. The user authorizes implementation with a default subagent, commit/push, and a pull request. No merge, version bump, tag, or publication.
+Implement issue #16 following the executable cohort spike. Use branch `feat/cohort-spine`, based on main `066c3d408e0f2f3b8e08e87aa9ca7215ba7c875b`, in the matching isolated worktree. Initial authorization covered implementation with a default subagent, commit/push, and a pull request. The user subsequently authorized a version bump, merge, tag, and publication. Prepare all eight packages as 0.14.0; merge only after final-head checks, then require merged-main CI before tagging and publishing through the existing OIDC workflow.
 
 ## Contract
 
@@ -46,7 +46,9 @@ The default subagent owns implementation and focused behavioral regressions in c
 
 Implemented the contract with staged execution in core/engine, opt-in prompt
 guidance, public exports, a runnable demo, and the cohort contract guide.
-Package versions remain 0.13.0. No merge or publication is authorized here.
+All eight packages and their internal dependency ranges are prepared at 0.14.0.
+Publication is authorized but remains gated on the final PR/main checks and
+release artifact verification.
 
 ### Observed verification
 
@@ -81,7 +83,8 @@ boundaries, and actual View-based execution, replacing internal binding-only
 assertions. The CI-equivalent engine-only run then passed **325 tests** with
 **84.16% branch-inclusive coverage**, retaining the 83% floor.
 
-PR: <https://github.com/semql-io/semql/pull/21>. Remains unmerged.
+PR: <https://github.com/semql-io/semql/pull/21>. Authorized for merge and release
+after the versioned-head checks pass.
 
 ### Review-driven repairs
 
@@ -98,3 +101,21 @@ staged semi-joins, and aliases are explicitly unsupported rather than silently
 changing member grain or dropping semantics. Plain time ranges remain supported.
 There is no live model/provider call, snapshot guarantee, durable persistence,
 generic finalized-result reaggregation, or arbitrary stage DAG.
+
+### Version 0.14.0 release verification
+
+The native lockstep bump updates all eight package versions and internal sibling
+ranges to `>=0.14.0,<0.15`; `uv lock` records the same release.
+Versioned native `just check` passed **3,616 tests, 8 skips, 1 xfail, and
+78 snapshots**, plus lint/types/boundary guards and disposable actual backend
+conformance. The cohort demo and API-break checker also passed.
+
+All eight wheels and eight source distributions built successfully and passed
+Twine metadata validation. Isolated wheel installation passed dependency checks,
+version/import-origin validation, compile/serialization/alias-equivalence smoke,
+and actual DuckDB execution. The cohort demo also executed from those installed
+wheels outside the checkout, preserving original winners and missingness.
+
+The final versioned commit must pass PR CI before merge, and the merged commit
+must pass main CI before creating `v0.14.0`. Publishing uses the existing enabled
+OIDC workflow; no credentials or publishing settings are changed.
