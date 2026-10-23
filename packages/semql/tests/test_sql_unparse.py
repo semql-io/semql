@@ -27,7 +27,9 @@ from semql.parse import parse_sql_statement
 from semql.spec import (
     BoolExpr,
     CompareWindow,
+    DecimalLiteral,
     Filter,
+    FilterOp,
     InlineDerived,
     SemanticQuery,
     TimeWindow,
@@ -115,6 +117,22 @@ def test_contains_without_faithful_sql_representation_is_rejected(placement: str
     )
     with pytest.raises(UnparseError, match="contains"):
         query_to_sql(query, CATALOG.as_dict())
+
+
+@pytest.mark.parametrize("op", ["eq", "in"])
+def test_exact_decimal_filters_refuse_lossy_sql_round_trip(op: FilterOp) -> None:
+    query = SemanticQuery(
+        dimensions=["orders.amount"],
+        filters=[
+            Filter(
+                dimension="orders.amount",
+                op=op,
+                values=[DecimalLiteral(value="0.10000000000000000001")],
+            )
+        ],
+    )
+    with pytest.raises(UnparseError, match="lossless"):
+        query_to_sql(query)
 
 
 def test_roundtrip_offset_and_multi_alias() -> None:

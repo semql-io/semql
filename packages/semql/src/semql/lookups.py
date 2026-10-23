@@ -30,7 +30,7 @@ from semql.catalog import Catalog
 from semql.errors import ContractError
 from semql.model import Lookup, MultiFieldEnricher, ResolutionContext
 from semql.safe import is_safe_sql_identifier
-from semql.spec import Filter, FilterOp, SemanticQuery
+from semql.spec import DecimalLiteral, Filter, FilterOp, SemanticQuery
 
 # ---------------------------------------------------------------------------
 # Materialization — turn a Lookup into a concrete (values, labels) tuple
@@ -260,7 +260,7 @@ def resolve_query_filters(
         if f.dimension not in catalog.lookups or f.op not in _RESOLVABLE_OPS:
             new_filters.append(f)
             continue
-        resolved_values: list[str | int | float | bool] = []
+        resolved_values: list[str | int | float | bool | DecimalLiteral] = []
         blocked = False
         for v in f.values:
             if not isinstance(v, str):

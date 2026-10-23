@@ -204,6 +204,68 @@ See `demos/pipeline_demo.py` for the full Router → Generator →
 Compile → Presenter → Drilldown flow against a small realistic
 catalog. Run with `uv run demos/pipeline_demo.py`.
 
+## Fixed-member cohorts
+
+To measure the same selected entities in another period, use a single-hop
+`CohortQuery`, not independent rankings for each period. Given a catalog with
+`stores.id`, `stores.region`, `stores.period`, and `stores.conversion`:
+
+```python
+from semql import (
+    Cohort, CohortMeasurement, CohortQuery, Filter,
+    PartitionRank, RankOrder, SemanticQuery, compile_cohort_query,
+)
+from semql_engine import run_cohort
+
+request = CohortQuery(
+    cohort=Cohort(
+        source=SemanticQuery(
+            dimensions=["stores.id", "stores.region"],
+            measures=["stores.conversion"],
+            filters=[Filter(dimension="stores.period", op="eq", values=["prior"])],
+            rank=PartitionRank(
+                partition_by=["stores.region"],
+                order_by=[RankOrder(field="stores.conversion", direction="desc")],
+                count=1,
+            ),
+        ),
+        member_keys=["stores.id"],
+        attributes=["stores.region"],
+        max_members=100,
+    ),
+    measurements=[
+        CohortMeasurement(
+            name="current",
+            query=SemanticQuery(
+                dimensions=["stores.id"],
+                measures=["stores.conversion"],
+                filters=[Filter(dimension="stores.period", op="eq", values=["current"])],
+            ),
+            key_mapping={"stores.id": "stores.id"},
+        ),
+    ],
+)
+plan = compile_cohort_query(request, catalog.as_dict(), viewer=viewer)
+result = run_cohort(plan, engine)
+```
+
+Execution is staged on the engine's registered adapters, even on one backend.
+The engine validates unique, non-NULL member keys and row bounds before dependent
+measurement I/O; it never silently truncates or substitutes new winners.
+Selection-time attributes remain separate from measurement-time attributes.
+Missing measurements preserve the member with NULL metrics and explicit
+`presence`/`coverage` evidence.
+
+Add named `CohortComparison` values for NULL-preserving differences, ratios, or
+percentage changes. Do not sum finalized member rates or distinct counts.
+This API does not promise snapshots, persistence, nested cohorts, or an arbitrary
+stage DAG. Child query compiler/backend restrictions still apply.
+
+Generation is opt-in with `build_generation_contract(..., output_model=CohortQuery)`;
+the default planner response is unchanged. See the
+[cohort contract guide](docs/migrations/cohort-spine.md) and run
+`uv run python demos/cohort_spine_demo.py` for a full authorized example.
+
 ## Surface to LLMs
 
 ```python

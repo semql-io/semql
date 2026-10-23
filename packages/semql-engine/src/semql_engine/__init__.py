@@ -14,6 +14,12 @@ from semql_engine.adapter import (
     DuckDBAdapter,
     to_async_adapter,
 )
+from semql_engine.cohort import (
+    CohortCoverage,
+    CohortResult,
+    CohortStageProvenance,
+    run_cohort,
+)
 from semql_engine.engine import (
     AsyncEngine,
     AsyncExecutionIterator,
@@ -36,6 +42,9 @@ from semql_engine.rows import (
 from semql_engine.semijoin import run_semi_join
 
 __all__ = [
+    "CohortCoverage",
+    "CohortResult",
+    "CohortStageProvenance",
     "Adapter",
     "AdapterResult",
     "AsyncAdapter",
@@ -59,6 +68,7 @@ __all__ = [
     "MergeEngine",
     "RowCapableAdapter",
     "execute_entity",
+    "run_cohort",
     "run_semi_join",
     "to_async_adapter",
     "to_async_merge_engine",

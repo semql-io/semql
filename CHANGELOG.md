@@ -7,6 +7,23 @@ packages version in lockstep. Format loosely follows
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-10-23
+
+### Added
+
+- Single-hop `CohortQuery` specifications and `compile_cohort_query` select a
+  bounded unique-member relation, retain selection-time attributes, and compile
+  independently authorized named measurements and NULL-preserving comparisons.
+- `semql_engine.run_cohort` validates membership before dependent I/O, binds exact
+  composite identities, preserves missing members and child column metadata, and
+  exposes row-match presence/coverage plus stage provenance. Execution is staged
+  for same- and cross-backend queries; no snapshot or finalized-metric rollup is
+  implied.
+- JSON-safe `DecimalLiteral` filter values preserve exact decimal member keys
+  without converting them to floating point.
+- Opt-in cohort generation contracts reuse TOOL/STRICT nested-query profiles.
+  The default `PlannerResponse` remains unchanged.
+
 ## [0.13.0] - 2026-10-23
 
 ### Added

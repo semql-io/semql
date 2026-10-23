@@ -33,6 +33,17 @@ from semql.analysis import (
 from semql.autoplan import AutoPlan, CrossSourceDecision, autoplan
 from semql.bindings import BindingRequirement
 from semql.catalog import Catalog
+from semql.cohort import (
+    COHORT_PLAN_VERSION,
+    Cohort,
+    CohortColumn,
+    CohortComparison,
+    CohortMeasurement,
+    CohortMetric,
+    CohortPlan,
+    CohortQuery,
+    compile_cohort_query,
+)
 from semql.compile import MAX_UNGROUPED_ROWS, ColumnMeta, CompiledQuery, compile_query
 from semql.cost import BudgetExceededError, CostEstimate, QueryBudget, estimate_cost
 from semql.diff import CatalogDiff, Change, ChangeKind, diff_catalogs
@@ -213,6 +224,7 @@ from semql.semijoin import (
 from semql.spec import (
     BoolExpr,
     CompareWindow,
+    DecimalLiteral,
     Filter,
     FilterOp,
     InlineDerived,
@@ -316,6 +328,7 @@ __all__ = [
     "CubeSource",
     "DerivedTable",
     "DimTypeLiteral",
+    "DecimalLiteral",
     "DEFAULT_REGISTRY",
     "Dimension",
     "Entity",
@@ -408,6 +421,15 @@ __all__ = [
     "SemiJoinBinding",
     "SemiJoinPlan",
     "compile_semi_join_query",
+    "COHORT_PLAN_VERSION",
+    "Cohort",
+    "CohortColumn",
+    "CohortComparison",
+    "CohortMeasurement",
+    "CohortMetric",
+    "CohortPlan",
+    "CohortQuery",
+    "compile_cohort_query",
     "PhysicalTable",
     "Provenance",
     "RawSQL",

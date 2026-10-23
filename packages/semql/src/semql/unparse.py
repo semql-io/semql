@@ -47,6 +47,7 @@ from semql.refs import cube_of, is_qualified
 from semql.spec import (
     BoolExpr,
     CompareWindow,
+    DecimalLiteral,
     Filter,
     SemanticQuery,
     TimeWindow,
@@ -374,10 +375,15 @@ def _boolexpr_dims(node: BoolExpr | Filter) -> list[str]:
     return out
 
 
-def _render_value(value: str | int | float | bool) -> str:
+def _render_value(value: str | int | float | bool | DecimalLiteral) -> str:
     """Render a scalar literal as SQL. ``bool`` is checked before ``int``
     because ``bool`` is an ``int`` subclass — a paid flag must emit ``TRUE``,
     not ``1``."""
+    if isinstance(value, DecimalLiteral):
+        raise UnparseError(
+            "Exact decimal filters have no lossless semantic-SQL representation. "
+            "Use SemanticQuery directly."
+        )
     if isinstance(value, bool):
         return "TRUE" if value else "FALSE"
     if isinstance(value, (int, float)):

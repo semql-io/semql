@@ -96,6 +96,10 @@ path = "semql.errors"
 layer = "foundation"
 
 [[modules]]
+path = "semql.cohort"
+layer = "app"
+
+[[modules]]
 path = "semql.federate"
 layer = "app"
 

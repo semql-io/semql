@@ -42,6 +42,14 @@ from semql import (
     compile_federated_query,
     compile_query,
 )
+from semql.cohort import (
+    Cohort,
+    CohortComparison,
+    CohortMeasurement,
+    CohortMetric,
+    CohortQuery,
+    compile_cohort_query,
+)
 from semql.compile import CompiledQuery
 from semql.model import DimTypeLiteral
 from semql.parse import parse_sql_statement
@@ -49,6 +57,7 @@ from semql.spec import PartitionRank, RankOrder
 from semql.unparse import query_to_sql
 from semql_engine import AdapterResult, DBAPIAdapter, DuckDBAdapter, DuckDBMergeEngine, Engine
 from semql_engine.adapter import Adapter
+from semql_engine.cohort import run_cohort
 from testcontainers.core.container import DockerContainer
 from testcontainers.core.wait_strategies import ExecWaitStrategy, HttpWaitStrategy
 
@@ -1205,3 +1214,190 @@ def test_partitioned_ranking_runs_after_rollup_reaggregation(backend: _Backend) 
         assert [(row["region"], float(row["amount"]), int(row["n"])) for row in rows] == [
             ("A", 60.0, 3)
         ]
+
+
+@pytest.fixture(scope="module")
+def cohort_catalog(backend: _Backend) -> Catalog:
+    table = f"{backend.prefix}cohort_facts"
+    if backend.dialect == Dialect.CLICKHOUSE:
+        backend.setup(
+            f"CREATE TABLE {table} (store String, region String, period String, owner String, "
+            "conversions Nullable(Float64), visits Nullable(Float64)) ENGINE=Memory"
+        )
+    else:
+        backend.setup(
+            f"CREATE TABLE {table} (store VARCHAR, region VARCHAR, period VARCHAR, owner VARCHAR, "
+            "conversions DOUBLE PRECISION, visits DOUBLE PRECISION)"
+        )
+    backend.setup(
+        f"INSERT INTO {table} VALUES "
+        "('A','West','prior','reader',90,100),"
+        "('B','West','prior','reader',80,100),"
+        "('C','East','prior','reader',1,1),"
+        "('D','East','prior','reader',50,100),"
+        "('E','North','prior','reader',7,10),"
+        "('F','North','prior','reader',6,10),"
+        "('J','South','prior','reader',1,2),"
+        "('K','Nulls','prior','reader',1,2),"
+        "('A','East','current','reader',20,100),"
+        "('B','West','current','reader',95,100),"
+        "('C','East','current','reader',8,10),"
+        "('D','East','current','reader',99,100),"
+        "('F','North','current','reader',9,10),"
+        "('J','South','current','reader',0,0),"
+        "('K','Nulls','current','reader',NULL,NULL),"
+        "('A','West','prior','other',1000,1000),"
+        "('A','East','current','other',1000,1000)"
+    )
+    return Catalog(
+        [
+            Cube(
+                name="cohort_facts",
+                table=table,
+                alias="c",
+                dialect=backend.dialect,
+                security_sql="{c}.owner = {ctx.viewer_id}",
+                dimensions=[
+                    Dimension(name="store", sql="{c}.store", type="string"),
+                    Dimension(name="region", sql="{c}.region", type="string"),
+                    Dimension(name="period", sql="{c}.period", type="string"),
+                ],
+                measures=[
+                    Measure(name="conversions", sql="{c}.conversions", agg="sum"),
+                    Measure(name="visits", sql="{c}.visits", agg="sum"),
+                    Measure(name="observations", sql="*", agg="count"),
+                ],
+            )
+        ]
+    )
+
+
+def _cohort_request(source_cube: str, measurement_cube: str) -> CohortQuery:
+    def stage(cube: str, period: str, *, select: bool = False) -> SemanticQuery:
+        return SemanticQuery(
+            dimensions=[f"{cube}.region", f"{cube}.store"] if select else [f"{cube}.store"],
+            measures=[f"{cube}.conversions", f"{cube}.visits", f"{cube}.observations"],
+            derived_measures=[
+                InlineDerived(
+                    name="rate",
+                    op="ratio",
+                    operands=[f"{cube}.conversions", f"{cube}.visits"],
+                )
+            ],
+            filters=[Filter(dimension=f"{cube}.period", op="eq", values=[period])],
+            rank=(
+                PartitionRank(
+                    partition_by=[f"{cube}.region"],
+                    order_by=[RankOrder(field="rate", direction="desc")],
+                    count=1,
+                )
+                if select
+                else None
+            ),
+        )
+
+    return CohortQuery(
+        cohort=Cohort(
+            source=stage(source_cube, "prior", select=True),
+            member_keys=[f"{source_cube}.store"],
+            attributes=[f"{source_cube}.region"],
+            max_members=20,
+        ),
+        measurements=[
+            CohortMeasurement(
+                name=period,
+                query=stage(measurement_cube, period),
+                key_mapping={f"{source_cube}.store": f"{measurement_cube}.store"},
+            )
+            for period in ("prior", "current")
+        ],
+        comparisons=[
+            CohortComparison(
+                name="delta",
+                left=CohortMetric(measurement="current", column="rate"),
+                right=CohortMetric(measurement="prior", column="rate"),
+                op="difference",
+            )
+        ],
+    )
+
+
+def test_cohort_preserves_frozen_members_attribution_and_missingness(
+    backend: _Backend, cohort_catalog: Catalog
+) -> None:
+    plan = compile_cohort_query(
+        _cohort_request("cohort_facts", "cohort_facts"),
+        cohort_catalog.as_dict(),
+        viewer=AuthContext(viewer_id="reader"),
+    )
+    engine = Engine()
+    engine.register(backend.dialect, backend.adapter)
+    result = run_cohort(plan, engine)
+    rows = [dict(zip(result.columns, row, strict=True)) for row in result.rows]
+    by_store = {str(row["selection.store"]): row for row in rows}
+    assert set(by_store) == {"A", "C", "E", "J", "K"}
+    assert by_store["A"]["selection.region"] == "West"
+    assert float(by_store["A"]["current.rate"]) == pytest.approx(0.2)
+    assert float(by_store["C"]["current.rate"]) == pytest.approx(0.8)
+    assert float(by_store["A"]["comparison.delta"]) == pytest.approx(-0.7)
+    assert by_store["E"]["current.observations"] is None
+    assert by_store["E"]["comparison.delta"] is None
+    assert int(by_store["J"]["current.observations"]) == 1
+    assert float(by_store["J"]["current.visits"]) == 0
+    assert by_store["J"]["current.rate"] is None
+    assert int(by_store["K"]["current.observations"]) == 1
+    assert by_store["K"]["current.rate"] is None
+    total_conversions = sum(float(by_store[store]["current.conversions"]) for store in ("A", "C"))
+    total_visits = sum(float(by_store[store]["current.visits"]) for store in ("A", "C"))
+    assert total_conversions / total_visits == pytest.approx(28 / 110)
+    assert total_conversions / total_visits != pytest.approx(0.5)
+
+
+def test_cohort_cross_backend_selection_and_measurement(
+    backend: _Backend, cohort_catalog: Catalog
+) -> None:
+    if backend.dialect == Dialect.DUCKDB:
+        pytest.skip("cross-backend cell requires a real external selection backend")
+    with duckdb.connect() as connection:
+        connection.execute(
+            "CREATE TABLE current_facts(store VARCHAR, region VARCHAR, period VARCHAR, "
+            "owner VARCHAR, conversions DOUBLE, visits DOUBLE)"
+        )
+        connection.execute(
+            "INSERT INTO current_facts VALUES "
+            "('A','West','prior','reader',90,100),"
+            "('C','East','prior','reader',1,1),"
+            "('E','North','prior','reader',7,10),"
+            "('J','South','prior','reader',1,2),"
+            "('K','Nulls','prior','reader',1,2),"
+            "('A','East','current','reader',20,100),"
+            "('C','East','current','reader',8,10),"
+            "('J','South','current','reader',0,0),"
+            "('K','Nulls','current','reader',NULL,NULL),"
+            "('A','East','current','other',1000,1000)"
+        )
+        source_cube = cohort_catalog.as_dict()["cohort_facts"]
+        measurement_cube = source_cube.model_copy(
+            update={
+                "name": "current_facts",
+                "table": "current_facts",
+                "dialect": Dialect.DUCKDB,
+            }
+        )
+        catalog = Catalog([source_cube, measurement_cube])
+        plan = compile_cohort_query(
+            _cohort_request("cohort_facts", "current_facts"),
+            catalog.as_dict(),
+            viewer=AuthContext(viewer_id="reader"),
+        )
+        engine = Engine()
+        engine.register(backend.dialect, backend.adapter)
+        engine.register(Dialect.DUCKDB, DuckDBAdapter(connection))
+        result = run_cohort(plan, engine)
+        rows = [dict(zip(result.columns, row, strict=True)) for row in result.rows]
+        by_store = {str(row["selection.store"]): row for row in rows}
+        assert set(by_store) == {"A", "C", "E", "J", "K"}
+        assert by_store["A"]["selection.region"] == "West"
+        assert float(by_store["A"]["current.rate"]) == pytest.approx(0.2)
+        assert float(by_store["C"]["comparison.delta"]) == pytest.approx(-0.2)
+        assert by_store["E"]["current.observations"] is None
