@@ -1037,11 +1037,15 @@ Grammar (anything outside this set is rejected with a precise error):
   `JOIN cube2` (an `ON` clause is accepted but IGNORED — the catalog is
   the single source of truth for how cubes relate). Cubes with no
   catalog join path are refused rather than joined literally.
-- `WHERE` — predicates combined with `AND` / `OR` (parenthesize `OR`).
-  Operators: `=`, `!=`, `IN (...)`, `NOT IN (...)`, `>`, `>=`, `<`,
-  `<=`, `LIKE`, `IS NULL`, `IS NOT NULL`.
-- `WHERE cube.time_dim BETWEEN '<start>' AND '<end>'` — a time window
-  (half-open `[start, end)`; bind ISO-8601 timestamps).
+- `WHERE` — predicates combined with `AND` / `OR` / `NOT`; parentheses
+  preserve nested grouping. Operators: `=`, `!=`, `IN (...)`, `NOT IN (...)`,
+  `>`, `>=`, `<`, `<=`, `IS NULL`, `IS NOT NULL`. Comparison values must be
+  literals, not columns, expressions, subqueries, or NULL; use `IS NULL`
+  for NULL tests. SQL `LIKE` / `NOT LIKE` are not supported; use the JSON
+  `SemanticQuery` path for escaped, case-insensitive `contains`.
+- `WHERE cube.time_dim BETWEEN '<start>' AND '<end>'` — one top-level,
+  AND-composed time window (half-open `[start, end)`; ISO-8601 timestamps).
+  Do not nest it under `OR` / `NOT` or use it for numeric ranges.
 - `DATE_TRUNC('<grain>', cube.time_dim)` in `SELECT` — bucket the window
   by grain (`day` / `week` / `month` / …). Pair it with a matching
   `BETWEEN` on the same time dimension.

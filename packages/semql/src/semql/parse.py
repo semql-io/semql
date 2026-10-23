@@ -64,6 +64,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from math import isfinite
 from typing import Any, Literal, cast, get_args
 
 import sqlglot
@@ -89,10 +90,8 @@ _AGG_FUNCS = frozenset(
 # the same literal set the ``TimeWindow.granularity`` field accepts.
 _GRAINS = frozenset(get_args(GranularityLiteral))
 
-# Logical negation of a filter op, for unwrapping a wrapping ``NOT``.
-# ``contains`` (LIKE) has no negated counterpart in the FilterOp set, so
-# it's intentionally absent — a negated LIKE is left as-is rather than
-# silently inverted to the wrong op.
+# Logical negation of representable leaf operators. Compound predicates keep
+# their structure as a BoolExpr(op="not"); LIKE is not representable.
 _NEGATE_OP: dict[str, str] = {
     "eq": "neq",
     "neq": "eq",
@@ -156,7 +155,6 @@ def _op_from_sql(op: exp.Expression) -> str | None:
         exp.GTE: "gte",
         exp.LT: "lt",
         exp.LTE: "lte",
-        exp.Like: "contains",
         exp.Is: None,  # special — see _unpack_is
     }
     return mapping.get(type(op))  # type: ignore[arg-type]
@@ -172,28 +170,6 @@ def _unpack_is(op: exp.Is) -> tuple[str | None, list[object]]:
     if is_null and is_not:
         return "not_null", []
     return None, []
-
-
-def _values_from_sql(node: exp.Expression | list[object] | None) -> list[object]:
-    """Extract a flat list of literal values from a SQL expression.
-
-    Handles three shapes:
-      - a single ``Literal`` — one value.
-      - an ``In`` / ``Tuple`` node — multiple values via ``.expressions``.
-      - a list of expressions — flattened.
-    """
-    if node is None:
-        return []
-    if isinstance(node, list):
-        out: list[Any] = []
-        for e in node:
-            out.extend(_values_from_sql(cast(exp.Expression, e)))
-        return out
-    if isinstance(node, exp.Tuple):
-        return _values_from_sql(node.expressions)
-    if isinstance(node, exp.Literal):
-        return [node.this]
-    return [_literal_value(node)]
 
 
 def _literal_value(node: exp.Expression) -> str | int | float | bool | None:
@@ -629,7 +605,7 @@ def parse_sql_statement(
     # --- WHERE / HAVING / GROUP BY / ORDER BY / LIMIT / OFFSET ---
     where_tree = ast.args.get("where")
     if where_tree is not None:
-        time_dim, filters, where = _parse_where(where_tree, ctx, resolved_refs)
+        time_dim, filters, where = _parse_where(where_tree, ctx, resolved_refs, errors)
 
     # A ``DATE_TRUNC`` bucket in SELECT sets the granularity on the time
     # window the ``BETWEEN`` produced. The two must name the same dimension;
@@ -696,6 +672,7 @@ def parse_sql_statement(
             measures=measures,
             dimensions=dimensions,
             filters=filters,
+            where=where,
             having=having,
             time_dim=time_dim,
             errors=errors,
@@ -743,86 +720,134 @@ def _column_name(node: exp.Expression) -> str | None:
     return None
 
 
+def _unparen(node: exp.Expression) -> exp.Expression:
+    while isinstance(node, exp.Paren):
+        node = node.this
+    return node
+
+
+def _conjuncts(node: exp.Expression) -> list[exp.Expression]:
+    """Flatten only AND, never a different Boolean operator."""
+    node = _unparen(node)
+    if isinstance(node, exp.And):
+        return [*_conjuncts(node.this), *_conjuncts(node.expression)]
+    return [node]
+
+
 def _parse_where(
     where_tree: exp.Where,
     ctx: ResolveCtx,
     resolved: dict[str, str],
+    errors: list[str],
 ) -> tuple[TimeWindow | None, list[Filter], BoolExpr | None]:
-    """Split a WHERE clause into time-window, flat filters, and a where-tree.
-
-    A simple ``a = b AND c = d`` is implicit-AND — flat filters.
-    A parenthetical OR becomes a BoolExpr. ``BETWEEN`` over a
-    single field becomes a TimeWindow.
-    """
-    predicate = where_tree.this
+    """Extract only top-level conjunctive windows and preserve other subtrees."""
     flat: list[Filter] = []
-    tree: BoolExpr | None = None
+    trees: list[BoolExpr] = []
     time_dim: TimeWindow | None = None
+    window_count = 0
+    for pred in _conjuncts(where_tree.this):
+        try:
+            if isinstance(pred, exp.Between):
+                window_count += 1
+                if window_count > 1:
+                    raise ValueError("Multiple BETWEEN windows are not supported.")
+                time_dim = _parse_time_window(pred, ctx, resolved)
+            else:
+                converted = _parse_predicate(pred, ctx, resolved)
+                if isinstance(converted, Filter):
+                    flat.append(converted)
+                else:
+                    trees.append(converted)
+        except ValueError as exc:
+            errors.append(f"WHERE {pred.sql()!r}: {exc}")
+    tree = None
+    if len(trees) == 1:
+        tree = trees[0]
+    elif trees:
+        tree = BoolExpr(op="and", children=list(trees))
+    return time_dim, flat, tree
 
-    if isinstance(predicate, exp.And):
-        for child in _bool_children(predicate):
-            td, fs, wt = _classify_predicate(child, ctx, resolved)
-            if td is not None:
-                time_dim = td
-            if wt is not None:
-                # OR-containing subtree — promote to a where-tree.
-                tree = _merge_where_tree(tree, wt)
-            flat.extend(fs)
-        return time_dim, flat, tree
 
-    td, fs, wt = _classify_predicate(predicate, ctx, resolved)
-    return td, fs, wt
+def _predicate_value(node: exp.Expression) -> str | int | float | bool:
+    """Read a scalar literal, never stringify an unevaluated SQL expression."""
+    node = _unparen(node)
+    if isinstance(node, exp.Neg):
+        operand = _unparen(node.this)
+        if not isinstance(operand, exp.Literal) or operand.is_string:
+            raise ValueError("Comparison values must be scalar literals.")
+        value = _literal_value(operand)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError("Negated comparison values must be numeric literals.")
+        value = -value
+    elif isinstance(node, (exp.Literal, exp.Boolean)):
+        value = _literal_value(node)
+    elif isinstance(node, exp.Null):
+        raise ValueError("NULL comparison values are not supported; use IS NULL or IS NOT NULL.")
+    else:
+        raise ValueError("Comparison values must be scalar literals, not SQL expressions.")
+    if value is None or (isinstance(value, float) and not isfinite(value)):
+        raise ValueError("Comparison values must be finite non-NULL scalar literals.")
+    return value
 
 
-def _classify_predicate(
+def _parse_time_window(
+    pred: exp.Between,
+    ctx: ResolveCtx,
+    resolved: dict[str, str],
+) -> TimeWindow:
+    ref = ctx.resolve(_unparen(pred.this))
+    if ref is None:
+        raise ValueError("BETWEEN needs an unambiguous time-dimension reference.")
+    if pred.args.get("not"):
+        raise ValueError("NOT BETWEEN cannot be represented as a time window.")
+    if pred.args.get("symmetric"):
+        raise ValueError("BETWEEN SYMMETRIC is not supported.")
+    if ctx.catalog is not None:
+        cube_name, _, name = ref.rpartition(".")
+        cube = ctx.catalog.get(cube_name)
+        if cube is None or not any(d.name == name for d in cube.time_dimensions):
+            raise ValueError(f"BETWEEN requires a catalog time dimension; got {ref!r}.")
+    low = _predicate_value(pred.args["low"])
+    high = _predicate_value(pred.args["high"])
+    if not isinstance(low, str) or not isinstance(high, str):
+        raise ValueError("BETWEEN time-window bounds must be string literals.")
+    resolved[local_name(ref)] = ref
+    return TimeWindow(dimension=ref, range=(low, high))
+
+
+def _parse_predicate(
     pred: exp.Expression,
     ctx: ResolveCtx,
     resolved: dict[str, str],
-) -> tuple[TimeWindow | None, list[Filter], BoolExpr | None]:
-    """Classify one predicate: time-window, flat filter, or where-tree node."""
+    *,
+    having: bool = False,
+) -> BoolExpr | Filter:
+    """Convert a complete subtree or reject it; never discard Boolean children."""
+    pred = _unparen(pred)
+    if isinstance(pred, (exp.And, exp.Or)):
+        return BoolExpr(
+            op="and" if isinstance(pred, exp.And) else "or",
+            children=[
+                _parse_predicate(pred.this, ctx, resolved, having=having),
+                _parse_predicate(pred.expression, ctx, resolved, having=having),
+            ],
+        )
+    if isinstance(pred, exp.Not):
+        inner = _parse_predicate(pred.this, ctx, resolved, having=having)
+        if isinstance(inner, Filter):
+            return inner.model_copy(update={"op": _NEGATE_OP[inner.op]})
+        if inner.op == "not":
+            return inner.children[0]
+        return BoolExpr(op="not", children=[inner])
     if isinstance(pred, exp.Between):
-        # ``dim BETWEEN low AND high`` → TimeWindow.
-        ref = ctx.resolve(pred.this)
-        if ref is None:
-            return None, [], None
-        low = _literal_value(pred.args["low"])
-        high = _literal_value(pred.args["high"])
-        resolved[local_name(ref)] = ref
-        td = TimeWindow(dimension=ref, range=(str(low), str(high)))
-        return td, [], None
-    if isinstance(pred, exp.Paren):
-        # Strip parens, recurse.
-        return _classify_predicate(pred.this, ctx, resolved)
-    if isinstance(pred, (exp.Or, exp.And)):
-        if isinstance(pred, exp.Or):
-            # An OR anywhere in the WHERE becomes a where-tree.
-            return None, [], _build_bool_tree(pred, ctx, resolved)
-        # AND of mixed predicates — recurse and assemble.
-        flat: list[Filter] = []
-        tree: BoolExpr | None = None
-        time_dim: TimeWindow | None = None
-        for c in _bool_children(pred):
-            time_dim, tree, flat = _merge_classified(
-                time_dim, tree, flat, _classify_predicate(c, ctx, resolved)
-            )
-        return time_dim, flat, tree
-    # ``NOT (...)`` — sqlglot wraps ``NOT IN`` and ``IS NOT NULL`` as an
-    # ``exp.Not`` around the inner comparison (the ``not`` flag is NOT set
-    # on the In/Is node itself). Unwrap and negate, or the predicate is
-    # silently dropped — see ``_NEGATE_OP``.
-    negate = False
-    op_node = pred
-    if isinstance(op_node, exp.Not):
-        op_node = op_node.this
-        negate = True
-        if isinstance(op_node, exp.Paren):
-            op_node = op_node.this
-    # Plain comparison.
-    if isinstance(
-        op_node, (exp.EQ, exp.NEQ, exp.GT, exp.GTE, exp.LT, exp.LTE, exp.In, exp.Like, exp.Is)
-    ):
-        return _comparison_to_filter(op_node, ctx, resolved, negate=negate)
-    return None, [], None
+        raise ValueError("BETWEEN is supported only as a top-level WHERE conjunction, not OR/NOT.")
+    if isinstance(pred, (exp.Like, exp.ILike)):
+        raise ValueError(
+            "LIKE/NOT LIKE predicates cannot be represented faithfully and are unsupported."
+        )
+    if not isinstance(pred, (exp.EQ, exp.NEQ, exp.GT, exp.GTE, exp.LT, exp.LTE, exp.In, exp.Is)):
+        raise ValueError(f"Unsupported predicate {pred.sql()!r}.")
+    return _comparison_to_filter(pred, ctx, resolved, having=having)
 
 
 def _comparison_to_filter(
@@ -830,159 +855,47 @@ def _comparison_to_filter(
     ctx: ResolveCtx,
     resolved: dict[str, str],
     *,
-    negate: bool = False,
-) -> tuple[TimeWindow | None, list[Filter], BoolExpr | None]:
-    """Convert a comparison node to a Filter (or zero filters).
-
-    ``negate`` flips the op (``in`` → ``not_in``, ``is_null`` →
-    ``not_null``, etc.) when the node came from a wrapping ``NOT``."""
-    if isinstance(op_node, exp.Is):
-        op_str, values = _unpack_is(op_node)
-    else:
-        op_str = _op_from_sql(op_node)
-        if op_str is None:
-            return None, [], None
-        if op_str in ("in", "not_in"):
-            # sqlglot stores IN's list as ``.expressions`` (a list of
-            # Literals), not ``.expression`` (which is None for IN).
-            values = _values_from_sql(op_node.expressions)
-        elif op_str == "contains":
-            # LIKE — extract the pattern.
-            values = _values_from_sql(op_node.expression)
-        else:
-            values = [_literal_value(op_node.expression)]
-    # Comparison nodes have the column on ``.left``; IN has it on
-    # ``.this``.
-    col_node = op_node.left if hasattr(op_node, "left") else op_node.this
-    # HAVING ``SUM(revenue) > 1000`` — the LHS is an aggregate wrapping
-    # the measure column. Unwrap it so the filter targets the measure;
-    # otherwise the predicate has no column name and is dropped.
+    having: bool,
+) -> Filter:
+    col_node = _unparen(op_node.this)
     agg_wrapper: exp.AggFunc | exp.Anonymous | None = None
-    if isinstance(col_node, (exp.AggFunc, exp.Anonymous)):
+    if having and (
+        isinstance(col_node, exp.AggFunc)
+        or isinstance(col_node, exp.Anonymous)
+        and _agg_func_name(col_node) in _AGG_FUNCS
+    ):
         agg_wrapper = col_node
         col_node = col_node.this
     dim = ctx.resolve(col_node) if col_node is not None else None
-    if dim is None and isinstance(agg_wrapper, exp.Count):
-        # HAVING ``COUNT(*) > N`` — the inner is ``*``, not a column, so
-        # it resolves to the cube's row-count measure, exactly like a
-        # ``SELECT COUNT(*)`` projection. Without this the predicate is
-        # silently dropped.
+    if dim is None and isinstance(agg_wrapper, exp.Count) and isinstance(col_node, exp.Star):
         dim = _count_measure_ref(ctx.catalog, ctx)
     if dim is None:
-        return None, [], None
-    resolved[local_name(dim)] = dim
-    if op_str is None:
-        return None, [], None
-    if negate:
-        # A wrapping ``NOT`` flips the op. ``contains`` has no negated
-        # form (no ``not_contains`` in FilterOp), so it's left unchanged.
-        op_str = _NEGATE_OP.get(op_str, op_str)
-    return (
-        None,
-        [
-            Filter(
-                dimension=dim,
-                op=cast(
-                    Literal[
-                        "eq",
-                        "neq",
-                        "in",
-                        "not_in",
-                        "gt",
-                        "lt",
-                        "gte",
-                        "lte",
-                        "contains",
-                        "is_null",
-                        "not_null",
-                    ],
-                    op_str,
-                ),
-                values=cast(list[str | int | float | bool], values),
-            )
-        ],
-        None,
-    )
-
-
-def _bool_children(pred: exp.Expression) -> list[exp.Expression]:
-    """Return the children of a binary boolean op (AND / OR) as a list.
-
-    sqlglot models AND/OR as binary trees (``this`` / ``expression``),
-    not n-ary. Walk the tree to flatten to a list — left-leaning
-    recursion so we preserve left-to-right order.
-    """
-    if isinstance(pred, (exp.And, exp.Or)):
-        return _bool_children(pred.this) + _bool_children(pred.expression)
-    return [pred]
-
-
-def _build_bool_tree(
-    pred: exp.Expression,
-    ctx: ResolveCtx,
-    resolved: dict[str, str],
-) -> BoolExpr:
-    """Build a BoolExpr from a sqlglot OR / AND subtree."""
-    if isinstance(pred, exp.Or):
-        op = "or"
-    elif isinstance(pred, exp.And):
-        op = "and"
+        raise ValueError(
+            "Missing, ambiguous, or unsupported predicate field reference; use cube.field."
+        )
+    if isinstance(op_node, exp.Is):
+        op_str, values = _unpack_is(op_node)
+        if op_str is None:
+            raise ValueError("Only IS NULL and IS NOT NULL predicates are supported.")
     else:
-        # Leaf: wrap in a single-child tree for consistency.
-        op = "or"
-        pred = exp.Or(this=pred, expression=pred.copy())
-    children: list[BoolExpr | Filter] = []
-    for c in _bool_children(pred):
-        if isinstance(c, (exp.Or, exp.And)):
-            children.append(_build_bool_tree(c, ctx, resolved))
+        op_str = _op_from_sql(op_node)
+        if op_str is None:
+            raise ValueError(f"Unsupported comparison {op_node.sql()!r}.")
+        if isinstance(op_node, exp.In):
+            if op_node.args.get("query") is not None or not op_node.expressions:
+                raise ValueError("IN requires a nonempty list of non-NULL scalar literals.")
+            values = [_predicate_value(value) for value in op_node.expressions]
         else:
-            _, fs, _ = _classify_predicate(c, ctx, resolved)
-            if fs:
-                children.extend(fs)
-    if len(children) < 2:
-        # BoolExpr requires >= 2 children; if we couldn't classify
-        # at least 2, return a single filter unwrapped (caller
-        # re-classifies).
-        if children:
-            return children[0]  # type: ignore[return-value]
-        raise ValueError("Cannot build BoolExpr with empty children.")
-    return BoolExpr(op=cast(Literal["and", "or", "not"], op), children=children)
-
-
-def _merge_classified(
-    time_dim: TimeWindow | None,
-    tree: BoolExpr | None,
-    flat: list[Filter],
-    classified: tuple[TimeWindow | None, list[Filter], BoolExpr | None],
-) -> tuple[TimeWindow | None, BoolExpr | None, list[Filter]]:
-    """Merge one classified predicate into the running accumulator.
-
-    The standalone helper exists to give mypy a fresh scope — the
-    inlined destructure version tripped mypy's loop-narrowing on
-    re-assignment across iterations.
-    """
-    td, fs, wt = classified
-    new_time: TimeWindow | None = time_dim
-    if td is not None:
-        new_time = td
-    new_tree: BoolExpr | None = tree
-    if wt is not None:
-        new_tree = _merge_where_tree(tree, wt)
-    new_flat: list[Filter] = list(flat)
-    new_flat.extend(fs)
-    return new_time, new_tree, new_flat
-
-
-def _merge_where_tree(
-    existing: BoolExpr | None,
-    new: BoolExpr,
-) -> BoolExpr:
-    """AND-compose a new BoolExpr subtree into an existing one."""
-    if existing is None:
-        return new
-    if existing.op == "and":
-        return BoolExpr(op="and", children=[*existing.children, new])
-    return BoolExpr(op="and", children=[existing, new])
+            values = [_predicate_value(op_node.expression)]
+    resolved[local_name(dim)] = dim
+    return Filter(
+        dimension=dim,
+        op=cast(
+            Literal["eq", "neq", "in", "not_in", "gt", "lt", "gte", "lte", "is_null", "not_null"],
+            op_str,
+        ),
+        values=cast(list[str | int | float | bool], values),
+    )
 
 
 def _parse_having(
@@ -991,25 +904,20 @@ def _parse_having(
     resolved: dict[str, str],
     errors: list[str],
 ) -> list[Filter]:
-    out: list[Filter] = []
-    pred = having_node.this
-    if isinstance(pred, exp.Or) or pred.find(exp.Or) is not None:
-        # ``having`` is an implicit-AND ``list[Filter]`` — it has no OR
-        # representation (unlike WHERE, which gets a BoolExpr tree). Refuse
-        # rather than silently flatten ``a OR b`` into ``a AND b``.
-        errors.append(
-            "HAVING does not support OR — it is an implicit-AND list of "
-            "measure filters. Split the query or move the condition to WHERE."
-        )
-        return out
-    if isinstance(pred, exp.And):
-        for c in _bool_children(pred):
-            _, fs, _ = _classify_predicate(c, ctx, resolved)
-            out.extend(fs)
-    else:
-        _, fs, _ = _classify_predicate(pred, ctx, resolved)
-        out.extend(fs)
-    return out
+    def flatten(node: BoolExpr | Filter) -> list[Filter]:
+        if isinstance(node, Filter):
+            return [node]
+        if node.op != "and":
+            raise ValueError(
+                "HAVING supports only an implicit-AND list of measure filters, not OR/compound NOT."
+            )
+        return [leaf for child in node.children for leaf in flatten(child)]
+
+    try:
+        return flatten(_parse_predicate(having_node.this, ctx, resolved, having=True))
+    except ValueError as exc:
+        errors.append(f"HAVING {having_node.this.sql()!r}: {exc}")
+        return []
 
 
 def _parse_order(
@@ -1074,6 +982,7 @@ def _validate_refs(
     measures: list[str],
     dimensions: list[str],
     filters: list[Filter],
+    where: BoolExpr | None,
     having: list[Filter],
     time_dim: TimeWindow | None,
     errors: list[str],
@@ -1090,7 +999,8 @@ def _validate_refs(
         cube_name, _, field = ref.rpartition(".")
         cube = catalog.get(cube_name)
         if cube is None:
-            return  # unknown cube already flagged in the FROM pass
+            errors.append(f"Unknown cube in reference {ref!r} in {clause}.")
+            return
         if not _cube_has_field(cube, field):
             errors.append(f"Unknown field {ref!r} in {clause}.")
 
@@ -1100,6 +1010,14 @@ def _validate_refs(
         check(d, "SELECT")
     for f in filters:
         check(f.dimension, "WHERE")
+    if where is not None:
+        stack: list[BoolExpr | Filter] = [where]
+        while stack:
+            node = stack.pop()
+            if isinstance(node, Filter):
+                check(node.dimension, "WHERE")
+            else:
+                stack.extend(node.children)
     for h in having:
         check(h.dimension, "HAVING")
     if time_dim is not None:

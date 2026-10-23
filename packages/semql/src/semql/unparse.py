@@ -32,7 +32,9 @@ output, and falls back to a generic ``SUM(<ref>)`` marker without one.
 Features with no surface in the parser's grammar are **flagged** (an
 :class:`UnparseError` is raised) rather than silently dropped: ``segments``,
 ``ungrouped``, ``derived_measures``, ``semi_joins``, ``left_joins``,
-``compare`` mode ``'explicit'``, and ``time_dimension.fill_nulls_with``.
+``compare`` mode ``'explicit'``, ``time_dimension.fill_nulls_with``, and
+``contains`` filters (whose escaped, case-insensitive substring semantics are
+not SQL ``LIKE``).
 """
 
 from __future__ import annotations
@@ -78,7 +80,6 @@ _SCALAR_OP_SQL: dict[str, str] = {
     "gte": ">=",
     "lt": "<",
     "lte": "<=",
-    "contains": "LIKE",
 }
 
 
@@ -385,6 +386,11 @@ def _render_filter(f: Filter, *, lhs: str | None = None) -> str:
     """Render one ``Filter`` as a SQL predicate. ``lhs`` overrides the
     left-hand side (used for HAVING, where the LHS is an aggregate marker)."""
     left = lhs if lhs is not None else f.dimension
+    if f.op == "contains":
+        raise UnparseError(
+            "contains has no semantic-SQL representation: SQL LIKE does not preserve "
+            "its escaped, case-insensitive substring semantics. Use SemanticQuery directly."
+        )
     if f.op == "is_null":
         return f"{left} IS NULL"
     if f.op == "not_null":

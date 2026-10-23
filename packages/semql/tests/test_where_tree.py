@@ -15,6 +15,9 @@ doesn't actually constrain the column.
 
 from __future__ import annotations
 
+from dataclasses import replace
+
+import duckdb
 import pytest
 from semql import (
     BoolExpr,
@@ -25,8 +28,12 @@ from semql import (
     Dimension,
     Filter,
     Measure,
+    Segment,
     SemanticQuery,
 )
+from semql.compile import compile_plan
+from semql.logical import Predicate, to_logical_plan
+from semql.spec import FilterOp
 
 
 def _orders_cube() -> Cube:
@@ -43,6 +50,232 @@ def _orders_cube() -> Cube:
             Dimension(name="amount", sql="{o}.amount", type="number"),
         ],
     )
+
+
+def _boolean_orders_cube() -> Cube:
+    return Cube(
+        name="orders",
+        dialect=Dialect.DUCKDB,
+        table="orders",
+        alias="o",
+        measures=[Measure(name="count", sql="*", agg="count", unit="count")],
+        dimensions=[
+            Dimension(name="id", sql="{o}.id", type="number"),
+            Dimension(name="region", sql="{o}.region", type="string"),
+            Dimension(name="status", sql="{o}.status", type="string"),
+            Dimension(name="plan", sql="{o}.plan", type="string"),
+            Dimension(name="amount", sql="{o}.amount", type="number"),
+        ],
+        segments=[Segment(name="paid", sql="{o}.status = 'paid'")],
+    )
+
+
+def _boolean_rows() -> list[tuple[int, str | None, str | None, str | None, int | None]]:
+    return [
+        (1, "us", "paid", "basic", 10),
+        (2, "us", "open", "basic", 20),
+        (3, "eu", "paid", "enterprise", 30),
+        (4, "eu", "open", "basic", 40),
+        (5, None, "paid", "enterprise", 50),
+        (6, "us", None, "enterprise", None),
+        (7, "ca", "paid", None, 70),
+        (8, None, None, None, None),
+    ]
+
+
+def _execute_membership(catalog: Catalog, query: SemanticQuery) -> list[int]:
+    compiled = catalog.compile(query)
+    with duckdb.connect(":memory:") as connection:
+        connection.execute(
+            "CREATE TABLE orders(id INTEGER, region VARCHAR, status VARCHAR, "
+            "plan VARCHAR, amount INTEGER)"
+        )
+        connection.executemany("INSERT INTO orders VALUES (?, ?, ?, ?, ?)", _boolean_rows())
+        return sorted(
+            row[0] for row in connection.execute(compiled.sql, compiled.params).fetchall()
+        )
+
+
+def _filter(field: str, op: FilterOp, value: str | int) -> Filter:
+    return Filter(dimension=f"orders.{field}", op=op, values=[value])
+
+
+@pytest.mark.parametrize(
+    ("tree", "oracle"),
+    [
+        (
+            BoolExpr(
+                op="and",
+                children=[
+                    _filter("region", "eq", "us"),
+                    BoolExpr(
+                        op="or",
+                        children=[
+                            _filter("status", "eq", "paid"),
+                            _filter("plan", "eq", "enterprise"),
+                        ],
+                    ),
+                ],
+            ),
+            "region = 'us' AND (status = 'paid' OR plan = 'enterprise')",
+        ),
+        (
+            BoolExpr(
+                op="or",
+                children=[
+                    _filter("region", "eq", "us"),
+                    BoolExpr(
+                        op="and",
+                        children=[
+                            _filter("status", "eq", "paid"),
+                            _filter("plan", "eq", "enterprise"),
+                        ],
+                    ),
+                ],
+            ),
+            "region = 'us' OR (status = 'paid' AND plan = 'enterprise')",
+        ),
+        (
+            BoolExpr(
+                op="not",
+                children=[
+                    BoolExpr(
+                        op="or",
+                        children=[
+                            _filter("region", "eq", "us"),
+                            BoolExpr(
+                                op="and",
+                                children=[
+                                    _filter("status", "eq", "paid"),
+                                    _filter("plan", "eq", "enterprise"),
+                                ],
+                            ),
+                        ],
+                    )
+                ],
+            ),
+            "NOT (region = 'us' OR (status = 'paid' AND plan = 'enterprise'))",
+        ),
+        (
+            BoolExpr(
+                op="not",
+                children=[
+                    BoolExpr(
+                        op="not",
+                        children=[
+                            BoolExpr(
+                                op="or",
+                                children=[
+                                    _filter("region", "eq", "us"),
+                                    _filter("status", "eq", "paid"),
+                                ],
+                            )
+                        ],
+                    )
+                ],
+            ),
+            "region = 'us' OR status = 'paid'",
+        ),
+    ],
+)
+def test_boolean_tree_membership_matches_independent_duckdb_sql(
+    tree: BoolExpr, oracle: str
+) -> None:
+    catalog = Catalog([_boolean_orders_cube()])
+    actual = _execute_membership(
+        catalog,
+        SemanticQuery(dimensions=["orders.id"], where=tree),
+    )
+    with duckdb.connect(":memory:") as connection:
+        connection.execute(
+            "CREATE TABLE orders(id INTEGER, region VARCHAR, status VARCHAR, "
+            "plan VARCHAR, amount INTEGER)"
+        )
+        connection.executemany("INSERT INTO orders VALUES (?, ?, ?, ?, ?)", _boolean_rows())
+        expected = sorted(
+            row[0] for row in connection.execute(f"SELECT id FROM orders WHERE {oracle}").fetchall()
+        )
+    assert actual == expected
+
+
+def test_boolean_tree_membership_composes_with_flat_filter_and_segment() -> None:
+    catalog = Catalog([_boolean_orders_cube()])
+    tree = BoolExpr(
+        op="or",
+        children=[
+            BoolExpr(
+                op="and",
+                children=[_filter("region", "eq", "us"), _filter("plan", "eq", "basic")],
+            ),
+            _filter("region", "eq", "eu"),
+        ],
+    )
+    actual = _execute_membership(
+        catalog,
+        SemanticQuery(
+            dimensions=["orders.id"],
+            filters=[_filter("amount", "gt", 15)],
+            segments=["orders.paid"],
+            where=tree,
+        ),
+    )
+    with duckdb.connect(":memory:") as connection:
+        connection.execute(
+            "CREATE TABLE orders(id INTEGER, region VARCHAR, status VARCHAR, "
+            "plan VARCHAR, amount INTEGER)"
+        )
+        connection.executemany("INSERT INTO orders VALUES (?, ?, ?, ?, ?)", _boolean_rows())
+        expected = sorted(
+            row[0]
+            for row in connection.execute(
+                "SELECT id FROM orders WHERE amount > 15 AND status = 'paid' "
+                "AND ((region = 'us' AND plan = 'basic') OR region = 'eu')"
+            ).fetchall()
+        )
+    assert actual == expected
+
+
+def test_compile_plan_preserves_compound_not_grouping() -> None:
+    catalog = Catalog([_boolean_orders_cube()])
+    query = SemanticQuery(dimensions=["orders.id"])
+    plan = to_logical_plan(query, catalog.as_dict())
+    tree = BoolExpr(
+        op="not",
+        children=[
+            BoolExpr(
+                op="or",
+                children=[
+                    _filter("region", "eq", "us"),
+                    BoolExpr(
+                        op="and",
+                        children=[
+                            _filter("status", "eq", "paid"),
+                            _filter("plan", "eq", "enterprise"),
+                        ],
+                    ),
+                ],
+            )
+        ],
+    )
+    plan = replace(plan, filters=[Predicate(tree)])
+    compiled = compile_plan(plan, catalog.as_dict())
+    with duckdb.connect(":memory:") as connection:
+        connection.execute(
+            "CREATE TABLE orders(id INTEGER, region VARCHAR, status VARCHAR, "
+            "plan VARCHAR, amount INTEGER)"
+        )
+        connection.executemany("INSERT INTO orders VALUES (?, ?, ?, ?, ?)", _boolean_rows())
+        actual = sorted(
+            row[0] for row in connection.execute(compiled.sql, compiled.params).fetchall()
+        )
+        expected = sorted(
+            row[0]
+            for row in connection.execute(
+                "SELECT id FROM orders WHERE NOT "
+                "(region = 'us' OR (status = 'paid' AND plan = 'enterprise'))"
+            ).fetchall()
+        )
+    assert actual == expected
 
 
 # ---------------------------------------------------------------------------
@@ -212,38 +445,6 @@ def test_not_tree_emits_not_in_sql() -> None:
     )
     assert "NOT" in out.sql.upper()
     assert "us" in out.params.values()
-
-
-def test_nested_or_of_and_compiles_with_precedence() -> None:
-    """``(region=us AND status=paid) OR plan=enterprise`` — the AND
-    binds tighter than the OR, so parentheses must be emitted around
-    the inner AND."""
-    cat = Catalog([_orders_cube()])
-    out = cat.compile(
-        SemanticQuery(
-            measures=["orders.count"],
-            where=BoolExpr(
-                op="or",
-                children=[
-                    BoolExpr(
-                        op="and",
-                        children=[
-                            Filter(dimension="orders.region", op="eq", values=["us"]),
-                            Filter(dimension="orders.status", op="eq", values=["paid"]),
-                        ],
-                    ),
-                    Filter(dimension="orders.plan", op="eq", values=["enterprise"]),
-                ],
-            ),
-        )
-    )
-    assert " OR " in out.sql
-    # Precedence is correct iff there's an explicit paren grouping the AND.
-    # sqlglot emits parens for nested boolean groups by default.
-    assert "AND" in out.sql.upper()
-    assert "us" in out.params.values()
-    assert "paid" in out.params.values()
-    assert "enterprise" in out.params.values()
 
 
 def test_where_composes_with_flat_filters_via_and() -> None:

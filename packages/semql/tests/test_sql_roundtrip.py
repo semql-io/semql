@@ -200,7 +200,6 @@ CASES: list[str] = [
     "SELECT region, SUM(revenue) FROM orders WHERE amount <= 100 GROUP BY region",
     "SELECT region, SUM(revenue) FROM orders WHERE region IN ('EMEA', 'APAC') GROUP BY region",
     "SELECT region, SUM(revenue) FROM orders WHERE region NOT IN ('EMEA', 'APAC') GROUP BY region",
-    "SELECT region, SUM(revenue) FROM orders WHERE region LIKE 'EM%' GROUP BY region",
     "SELECT region, SUM(revenue) FROM orders WHERE status IS NULL GROUP BY region",
     "SELECT region, SUM(revenue) FROM orders WHERE status IS NOT NULL GROUP BY region",
     "SELECT region, SUM(revenue) FROM orders WHERE is_paid = true GROUP BY region",

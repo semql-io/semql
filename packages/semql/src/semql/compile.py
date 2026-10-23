@@ -45,7 +45,7 @@ from dataclasses import dataclass
 from dataclasses import field as dc_field
 from dataclasses import replace as _dc_replace
 from itertools import chain
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 import sqlglot
 from sqlglot import exp
@@ -847,7 +847,7 @@ def _filter_node(
     if op == "is_null":
         return exp.Is(this=field, expression=exp.Null())
     if op == "not_null":
-        return exp.Not(this=exp.Is(this=field, expression=exp.Null()))
+        return exp.not_(exp.Is(this=field, expression=exp.Null()), copy=False)
 
     try:
         f.validate_for_type(field_type)
@@ -871,7 +871,7 @@ def _filter_node(
     if op == "in":
         return exp.In(this=field, expressions=in_args)
     if op == "not_in":
-        return exp.Not(this=exp.In(this=field, expressions=in_args))
+        return exp.not_(exp.In(this=field, expressions=in_args), copy=False)
 
     raise CompileError(f"Unsupported filter op: {op!r}")  # pragma: no cover
 
@@ -888,12 +888,10 @@ def _compile_where_tree(
         return leaf_to_node(expr)
     children_nodes = [_compile_where_tree(c, leaf_to_node) for c in expr.children]
     if expr.op == "not":
-        return exp.Not(this=children_nodes[0])
-    combiner: type[exp.Expression] = exp.And if expr.op == "and" else exp.Or
-    result = children_nodes[0]
-    for n in children_nodes[1:]:
-        result = combiner(this=result, expression=n)
-    return result
+        return exp.not_(children_nodes[0], copy=False)
+    combiner = exp.and_ if expr.op == "and" else exp.or_
+    # SQLGlot's Condition stub omits its runtime Expression inheritance.
+    return cast(exp.Expression, combiner(*children_nodes, copy=False))
 
 
 # SQL reserved words that must be quoted when used as bare identifiers.
@@ -2033,9 +2031,7 @@ class _CompileEnv:
         if not predicates:
             return source
 
-        where_expr = predicates[0]
-        for p in predicates[1:]:
-            where_expr = exp.And(this=where_expr, expression=p)
+        where_expr = exp.and_(*predicates, copy=False)
 
         inner = (
             exp.Select()
@@ -2732,7 +2728,9 @@ def _emit_compare_query(env: _CompileEnv) -> CompiledQuery:
                 exp.column(jd, table="prior"),
                 value_types[jd],
             )
-            on_expr = eq if on_expr is None else exp.And(this=on_expr, expression=eq)
+            on_expr = (
+                eq if on_expr is None else cast(exp.Expression, exp.and_(on_expr, eq, copy=False))
+            )
         outer = outer.join(exp.to_table("prior"), on=on_expr, join_type="full outer", copy=False)
     else:
         # No dims, no time bucket — cross product of single rows.

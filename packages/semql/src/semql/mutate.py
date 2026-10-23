@@ -27,7 +27,7 @@ not enforcing raw scope on a write would be worse than refusing.
 from __future__ import annotations
 
 import re
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import sqlglot
 from pydantic import BaseModel, ConfigDict, Field
@@ -140,10 +140,8 @@ def _resolve_table(cube: Cube, context: dict[str, str] | None, viewer: AuthConte
 
 
 def _and(conds: list[exp.Expression]) -> exp.Expression:
-    cond = conds[0]
-    for extra in conds[1:]:
-        cond = exp.And(this=cond, expression=extra)
-    return cond
+    # SQLGlot's Condition stub omits its runtime Expression inheritance.
+    return cast(exp.Expression, exp.and_(*conds, copy=False))
 
 
 def _assert_single_dml(sql: str, dialect_name: str, operation: Op) -> None:
