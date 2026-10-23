@@ -44,6 +44,7 @@ from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from dataclasses import field as dc_field
 from dataclasses import replace as _dc_replace
+from decimal import Decimal
 from itertools import chain
 from typing import Any, Literal, cast
 
@@ -120,6 +121,7 @@ from semql.safe import SAFE_SQL_IDENTIFIER_RE
 from semql.spec import (
     BoolExpr,
     CompareWindow,
+    DecimalLiteral,
     Filter,
     InlineDerived,
     SemanticQuery,
@@ -869,7 +871,10 @@ def _filter_node(
     if op == "contains":
         return strategy.emit_contains(field, str(f.values[0]), bind)
 
-    placeholders: list[exp.Placeholder] = [bind(v, field_type) for v in f.values]
+    placeholders: list[exp.Placeholder] = [
+        bind(Decimal(value.value) if isinstance(value, DecimalLiteral) else value, field_type)
+        for value in f.values
+    ]
 
     if op in _FILTER_BINOPS:
         return _FILTER_BINOPS[op](this=field, expression=placeholders[0])

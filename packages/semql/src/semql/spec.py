@@ -10,6 +10,7 @@ from __future__ import annotations
 import uuid as _uuid
 from collections.abc import Mapping, Sequence
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
 from typing import TYPE_CHECKING, Annotated, Any, Literal, cast
 
 from pydantic import ConfigDict, Field, model_validator
@@ -128,6 +129,23 @@ class TimeWindow(_QueryInput):
         return self
 
 
+class DecimalLiteral(_QueryInput):
+    """Exact finite decimal filter value with a JSON-safe string payload."""
+
+    kind: Literal["decimal"] = "decimal"
+    value: str = Field(strict=True)
+
+    @model_validator(mode="after")
+    def _finite(self) -> DecimalLiteral:
+        try:
+            number = Decimal(self.value)
+        except InvalidOperation:
+            raise ValueError("DecimalLiteral requires a finite decimal value.") from None
+        if not number.is_finite():
+            raise ValueError("DecimalLiteral requires a finite decimal value.")
+        return self
+
+
 class Filter(_QueryInput):
     dimension: str = Field(
         description="Qualified dimension name (e.g. 'orders.region') the predicate applies to.",
@@ -137,8 +155,8 @@ class Filter(_QueryInput):
             "Operator: eq, neq, in, not_in, gt, lt, gte, lte, contains, is_null, not_null."
         ),
     )
-    values: Sequence[str | int | float | bool] = Field(
-        default_factory=lambda: list[str | int | float | bool](),
+    values: Sequence[str | int | float | bool | DecimalLiteral] = Field(
+        default_factory=lambda: list[str | int | float | bool | DecimalLiteral](),
         description=(
             "Predicate arguments — one for scalar ops, many for in/not_in, empty for is_null."
         ),
@@ -162,11 +180,13 @@ class Filter(_QueryInput):
             )
         for v in self.values:
             if dim_type == "number":
-                if isinstance(v, bool) or not isinstance(v, (int, float)):
+                if isinstance(v, bool) or not isinstance(v, (int, float, DecimalLiteral)):
                     raise ValueError(
                         f"Filter on numeric dimension {self.dimension!r} got "
                         f"non-numeric value {v!r}."
                     )
+                if isinstance(v, DecimalLiteral):
+                    continue
             elif dim_type == "bool":
                 if not isinstance(v, bool):
                     raise ValueError(
@@ -717,6 +737,7 @@ def rank_shape_errors(query: SemanticQuery) -> tuple[str, ...]:
 __all__ = [
     "BoolExpr",
     "CompareWindow",
+    "DecimalLiteral",
     "Filter",
     "FilterOp",
     "InlineDerived",

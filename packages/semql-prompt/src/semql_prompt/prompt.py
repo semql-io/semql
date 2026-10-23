@@ -1628,6 +1628,22 @@ def _generator_output_guidance(
                     "report the unsupported shape in the outcome instead of raw fallback.",
                 )
             )
+    if model_name == "CohortQuery":
+        lines.extend(
+            (
+                "Select the cohort once from its source query, then measure those same members.",
+                "Declare the complete member key and retain selection-time attributes explicitly.",
+                "Each measurement maps every source key to a selected measurement dimension and "
+                "must return at most one row per member.",
+                "Selection-time attributes and measurement-time attributes are different meanings; "
+                "never silently substitute one for the other.",
+                "Missing measurements remain NULL; never fill absent evidence with zero.",
+                "Compare only explicitly named compatible numeric measurement outputs. Do not "
+                "sum finalized member ratios, distinct counts, or other non-additive metrics.",
+                "Cohorts are single-hop, bounded, and require unique non-NULL unmasked keys. "
+                "Do not propose nested cohorts, arbitrary dependencies, or snapshot guarantees.",
+            )
+        )
     for removal in projection.removed_features:
         if removal.feature in {"where", "semi_joins"}:
             lines.append(f"This contract does not express `{removal.feature}`; do not emit it.")
