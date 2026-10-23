@@ -14,25 +14,29 @@ are collected as raw strings; with it, they're validated against
 the catalog and unknown references produce diagnostics.
 
 Operator mapping:
-  = → eq, != / <> → neq, IN / NOT IN, >, >=, <, <=, LIKE → contains,
-  IS NULL / IS NOT NULL.
+  =, != / <>, IN / NOT IN, >, >=, <, <=, IS NULL / IS NOT NULL.
 
-Constructs: SELECT / FROM (cube inferred from refs) / WHERE
-(implicit AND; parenthetical OR → ``where: BoolExpr``) / GROUP BY /
-HAVING / ORDER BY / LIMIT / OFFSET / BETWEEN → ``time_dimension`` /
-``COMPARE TO prior_period`` → ``compare``.
+LIKE / NOT LIKE are rejected because escaped case-insensitive contains does
+not preserve SQL LIKE semantics.
 
-Strict mode (default) raises on unknown refs; lenient collects
-warnings and continues.
+Constructs: SELECT / FROM (cube inferred from refs) / WHERE (implicit AND
+for simple filters; nested mixed operators use ``where: BoolExpr``) /
+GROUP BY / HAVING / ORDER BY / LIMIT / OFFSET / BETWEEN →
+``time_dimension`` / ``COMPARE TO prior_period`` → ``compare``.
+
+Strict mode (default) raises on parse errors; lenient mode returns them in
+``parse_errors``.
 """
 
 from __future__ import annotations
+
+from typing import Any
 
 import pytest
 from semql.compile import compile_query
 from semql.errors import CompileError
 from semql.parse import ParseError, ParserDecision, parse_sql_statement
-from semql.spec import SemanticQuery
+from semql.spec import BoolExpr, Filter, SemanticQuery
 
 CONTEXT = {"schema": "test_schema"}
 
@@ -526,6 +530,11 @@ INVALID_PARSE_CASES: list[tuple[str, str]] = [
         "SELECT region, COUNT(*) AS n FROM orders GROUP BY region "
         "HAVING COUNT(*) > 5 OR COUNT(*) < 1",
     ),
+    (
+        "having_compound_not",
+        "SELECT region, COUNT(*) FROM orders GROUP BY region "
+        "HAVING NOT (COUNT(*) > 5 AND COUNT(*) < 10)",
+    ),
 ]
 
 
@@ -596,43 +605,6 @@ def test_required_filter_cube_refused_at_compile(catalog: dict) -> None:
 # the fix, the predicate / measure / order key was silently dropped or
 # emitted as wrong SQL (the same class as the ORDER-BY-aggregate bug).
 # ---------------------------------------------------------------------------
-
-
-def test_not_in_is_not_dropped(catalog: dict) -> None:
-    """``NOT IN`` parses as ``exp.Not`` wrapping ``In``; it must become a
-    ``not_in`` filter, not vanish."""
-    out = parse_sql_statement(
-        "SELECT region, SUM(revenue) FROM orders WHERE region NOT IN ('a', 'b') GROUP BY region",
-        catalog=catalog,
-    )
-    assert any(
-        f.dimension == "orders.region" and f.op == "not_in" and f.values == ["a", "b"]
-        for f in out.query.filters
-    ), out.query.filters
-
-
-def test_is_not_null_is_not_dropped(catalog: dict) -> None:
-    """``IS NOT NULL`` parses as ``exp.Not`` wrapping ``Is``; it must
-    become a ``not_null`` filter, not vanish."""
-    out = parse_sql_statement(
-        "SELECT region, SUM(revenue) FROM orders WHERE status IS NOT NULL GROUP BY region",
-        catalog=catalog,
-    )
-    assert any(f.dimension == "orders.status" and f.op == "not_null" for f in out.query.filters), (
-        out.query.filters
-    )
-
-
-def test_not_wrapped_comparison_negates_operator(catalog: dict) -> None:
-    """``NOT (x = y)`` and ``NOT x > y`` flip the operator rather than drop."""
-    out = parse_sql_statement(
-        "SELECT region, SUM(revenue) FROM orders "
-        "WHERE NOT (status = 'paid') AND NOT amount > 100 GROUP BY region",
-        catalog=catalog,
-    )
-    ops = {(f.dimension, f.op) for f in out.query.filters}
-    assert ("orders.status", "neq") in ops, ops
-    assert ("orders.amount", "lte") in ops, ops
 
 
 def test_boolean_literal_becomes_bool_not_string(catalog: dict) -> None:
@@ -708,3 +680,189 @@ def test_compare_with_measure_alias_compiles_consistently(catalog: dict) -> None
     assert "SUM(o.amount) AS revenue" in sql
     # The user alias is NOT applied to the CTE column (would dangle).
     assert "AS rev " not in sql and not sql.endswith("AS rev")
+
+
+def _sql_truth_not(value: bool | None) -> bool | None:
+    return None if value is None else not value
+
+
+def _sql_truth_and(left: bool | None, right: bool | None) -> bool | None:
+    if left is False or right is False:
+        return False
+    return None if left is None or right is None else True
+
+
+def _sql_truth_or(left: bool | None, right: bool | None) -> bool | None:
+    if left is True or right is True:
+        return True
+    return None if left is None or right is None else False
+
+
+def _eval_where(node: BoolExpr | Filter, row: dict[str, Any]) -> bool | None:
+    if isinstance(node, Filter):
+        value = row[node.dimension.rpartition(".")[2]]
+        if node.op == "is_null":
+            return value is None
+        if node.op == "not_null":
+            return value is not None
+        if value is None:
+            return None
+        target = node.values[0]
+        if node.op in ("eq", "neq", "gt", "gte", "lt", "lte"):
+            result = {
+                "eq": lambda: value == target,
+                "neq": lambda: value != target,
+                "gt": lambda: value > target,
+                "gte": lambda: value >= target,
+                "lt": lambda: value < target,
+                "lte": lambda: value <= target,
+            }[node.op]()
+            return bool(result)
+        if node.op in ("in", "not_in"):
+            result = value in node.values
+            return not result if node.op == "not_in" else result
+        raise AssertionError(f"unexpected parser op: {node.op}")
+    if node.op == "not":
+        return _sql_truth_not(_eval_where(node.children[0], row))
+    values = [_eval_where(child, row) for child in node.children]
+    combine = _sql_truth_and if node.op == "and" else _sql_truth_or
+    result = values[0]
+    for value in values[1:]:
+        result = combine(result, value)
+    return result
+
+
+@pytest.mark.parametrize(
+    "predicate",
+    [
+        "status = 'paid' AND region = 'west' OR status = 'trial'",
+        "(status = 'paid' OR region = 'west') AND amount > 10",
+        "NOT (status = 'paid' OR amount > 10)",
+        "NOT NOT (status = 'paid' OR amount > 10)",
+        "NOT status = 'paid' AND NOT (region IN ('west', 'north'))",
+        "status IS NULL OR (status IS NOT NULL AND amount <= 10)",
+        "NOT (status = 'paid' AND (region = 'west' OR amount >= 10))",
+        "amount > -10",
+    ],
+)
+def test_boolean_tree_preserves_sql_membership_with_nulls(predicate: str) -> None:
+    """Compare an independent three-valued tree evaluator to DuckDB SQL."""
+    duckdb = pytest.importorskip("duckdb")
+    rows = [
+        (1, "paid", "west", 5),
+        (2, "trial", "east", 20),
+        (3, "paid", "east", 15),
+        (4, None, "west", 10),
+        (5, "trial", None, None),
+        (6, None, None, 30),
+        (7, "other", "north", 10),
+    ]
+    decision = parse_sql_statement(f"SELECT id FROM orders WHERE {predicate}")
+    if decision.query.where is None:
+        assert decision.query.filters
+        root = (
+            decision.query.filters[0]
+            if len(decision.query.filters) == 1
+            else BoolExpr(op="and", children=list(decision.query.filters))
+        )
+    elif decision.query.filters:
+        root = BoolExpr(op="and", children=[*decision.query.filters, decision.query.where])
+    else:
+        root = decision.query.where
+    expected = {
+        row[0]
+        for row in rows
+        if _eval_where(root, {"id": row[0], "status": row[1], "region": row[2], "amount": row[3]})
+        is True
+    }
+    with duckdb.connect(":memory:") as connection:
+        connection.execute(
+            "CREATE TABLE orders(id INTEGER, status VARCHAR, region VARCHAR, amount INTEGER)"
+        )
+        connection.executemany("INSERT INTO orders VALUES (?, ?, ?, ?)", rows)
+        actual = {
+            record[0]
+            for record in connection.execute(f"SELECT id FROM orders WHERE {predicate}").fetchall()
+        }
+    assert expected == actual
+
+
+@pytest.mark.parametrize(
+    "predicate",
+    [
+        "status LIKE 'p%'",
+        "status NOT LIKE 'p%'",
+        "status = NULL",
+        "status IN ('paid', NULL)",
+        "status = LOWER('PAID')",
+        "status = (SELECT 'paid')",
+        "status = region",
+        "status IN (region)",
+        "status IN (SELECT status FROM orders)",
+        "COALESCE(status, 'missing') = 'missing'",
+        "status IS TRUE",
+        "status ILIKE 'p%'",
+        "status BETWEEN 'a' AND 'z'",
+        "created_at NOT BETWEEN '2026-01-01' AND '2026-02-01'",
+        "NOT (created_at BETWEEN '2026-01-01' AND '2026-02-01')",
+        "(created_at BETWEEN '2026-01-01' AND '2026-02-01') OR status = 'paid'",
+        "created_at BETWEEN '2026-01-01' AND '2026-02-01' "
+        "AND created_at BETWEEN '2026-02-01' AND '2026-03-01'",
+        "amount BETWEEN 1 AND 5",
+    ],
+)
+@pytest.mark.parametrize(
+    "wrapper", ["{}", "NOT ({})", "status = 'paid' AND ({})", "status = 'paid' OR ({})"]
+)
+def test_unsupported_predicates_fail_strict_and_remain_diagnostic_lenient(
+    predicate: str, wrapper: str, catalog: dict
+) -> None:
+    sql = f"SELECT region FROM orders WHERE {wrapper.format(predicate)}"
+    with pytest.raises(ParseError):
+        parse_sql_statement(sql, catalog=catalog)
+    decision = parse_sql_statement(sql, catalog=catalog, strict=False)
+    assert decision.parse_errors, sql
+
+
+@pytest.mark.parametrize(
+    "predicate",
+    [
+        "bogus = 1 OR status = 'paid'",
+        "NOT (bogus = 1)",
+    ],
+)
+def test_unknown_where_reference_inside_tree_is_validated(predicate: str, catalog: dict) -> None:
+    with pytest.raises(ParseError, match="Unknown field"):
+        parse_sql_statement(f"SELECT region FROM orders WHERE {predicate}", catalog=catalog)
+    decision = parse_sql_statement(
+        f"SELECT region FROM orders WHERE {predicate}", catalog=catalog, strict=False
+    )
+    assert any("Unknown field" in error for error in decision.parse_errors)
+
+
+def test_parenthesized_having_conjunction_remains_measure_filter_list(catalog: dict) -> None:
+    decision = parse_sql_statement(
+        "SELECT region, COUNT(*) FROM orders GROUP BY region "
+        "HAVING (COUNT(*) >= 2 AND (COUNT(*) < 10))",
+        catalog=catalog,
+    )
+    assert {(item.op, tuple(item.values)) for item in decision.query.having} == {
+        ("gte", (2,)),
+        ("lt", (10,)),
+    }
+
+
+@pytest.mark.parametrize(
+    "predicate",
+    [
+        "COUNT(*) > 1 OR COUNT(*) < 10",
+        "NOT (COUNT(*) > 1 AND COUNT(*) < 10)",
+        "COUNT(*) IN (SELECT COUNT(*) FROM orders)",
+        "COUNT(*) > NULL",
+    ],
+)
+def test_unrepresentable_having_is_diagnostic(predicate: str, catalog: dict) -> None:
+    sql = f"SELECT region, COUNT(*) FROM orders GROUP BY region HAVING {predicate}"
+    with pytest.raises(ParseError):
+        parse_sql_statement(sql, catalog=catalog)
+    assert parse_sql_statement(sql, catalog=catalog, strict=False).parse_errors

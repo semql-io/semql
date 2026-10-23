@@ -119,9 +119,6 @@
 # name: test_sql_fixture_compiles_to_snapshot[SELECT region, SUM(revenue) FROM orders WHERE region IN ('EMEA', 'APAC') GROUP BY region]
   'SELECT o.region AS region, SUM(o.amount) AS revenue FROM prod.orders AS o WHERE o.deleted_at IS NULL AND o.region IN (%(p0)s, %(p1)s) GROUP BY region'
 # ---
-# name: test_sql_fixture_compiles_to_snapshot[SELECT region, SUM(revenue) FROM orders WHERE region LIKE 'EM%' GROUP BY region]
-  'SELECT o.region AS region, SUM(o.amount) AS revenue FROM prod.orders AS o WHERE o.deleted_at IS NULL AND o.region ILIKE %(p0)s GROUP BY region'
-# ---
 # name: test_sql_fixture_compiles_to_snapshot[SELECT region, SUM(revenue) FROM orders WHERE region NOT IN ('EMEA', 'APAC') GROUP BY region]
   'SELECT o.region AS region, SUM(o.amount) AS revenue FROM prod.orders AS o WHERE o.deleted_at IS NULL AND NOT o.region IN (%(p0)s, %(p1)s) GROUP BY region'
 # ---

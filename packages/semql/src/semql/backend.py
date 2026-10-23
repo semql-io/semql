@@ -40,7 +40,7 @@ from __future__ import annotations
 
 import functools
 from collections.abc import Callable
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Protocol, cast, runtime_checkable
 
 import sqlglot
 from sqlglot import TokenType as _TT
@@ -410,7 +410,8 @@ class PostgresDialect(_StdSqlDialect):
             this=exp.Anonymous(this="COALESCE", expressions=[left.copy(), sentinel.copy()]),
             expression=exp.Anonymous(this="COALESCE", expressions=[right.copy(), sentinel.copy()]),
         )
-        return exp.And(this=nulls_equal, expression=values_equal)
+        # SQLGlot's Condition stub omits its runtime Expression inheritance.
+        return cast(exp.Expression, exp.and_(nulls_equal, values_equal, copy=False))
 
 
 class DuckDBDialect(_StdSqlDialect):

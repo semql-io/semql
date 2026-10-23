@@ -14,12 +14,15 @@ import duckdb
 import pytest
 from semql import (
     AuthContext,
+    BoolExpr,
     Catalog,
     CompileError,
     Cube,
     Dialect,
     Dimension,
+    Filter,
     Measure,
+    ScopePredicate,
     SemanticQuery,
 )
 
@@ -61,6 +64,70 @@ def _orders_with_security() -> Cube:
         measures=[Measure(name="count", sql="*", agg="count", unit="count")],
         dimensions=[Dimension(name="region", sql="{o}.region", type="string")],
     )
+
+
+@pytest.mark.parametrize("policy_source", ["security_sql", "scope"])
+def test_or_security_expression_stays_inside_tenancy_isolation(policy_source: str) -> None:
+    policy_sql = "{e}.owner_id = 'alice' OR {e}.public = TRUE"
+
+    def visible_rows(_cube: Cube, _viewer: AuthContext) -> ScopePredicate:
+        return ScopePredicate(sql=policy_sql)
+
+    cube = Cube(
+        name="events",
+        dialect=Dialect.DUCKDB,
+        table="events",
+        alias="e",
+        tenancy="discriminator",
+        tenancy_columns=["tenant_id"],
+        security_sql=policy_sql if policy_source == "security_sql" else None,
+        scope="visible_rows" if policy_source == "scope" else None,
+        measures=[Measure(name="count", sql="*", agg="count", unit="count")],
+        dimensions=[
+            Dimension(name="id", sql="{e}.id", type="number"),
+            Dimension(name="region", sql="{e}.region", type="string"),
+        ],
+    )
+    query = SemanticQuery(
+        dimensions=["events.id"],
+        where=BoolExpr(
+            op="or",
+            children=[
+                Filter(dimension="events.region", op="eq", values=["us"]),
+                Filter(dimension="events.region", op="eq", values=["eu"]),
+            ],
+        ),
+    )
+    compiled = Catalog([cube], scope_fns={"visible_rows": visible_rows}).compile(
+        query, viewer=AuthContext(viewer_id="alice", tenant="acme")
+    )
+    rows = [
+        (1, "acme", "alice", False, "us"),
+        (2, "acme", "bob", True, "eu"),
+        (3, "acme", "bob", False, "us"),
+        (4, "other", "alice", False, "us"),
+        (5, "other", "bob", True, "eu"),
+        (6, "acme", "alice", False, "ca"),
+        (7, "acme", "bob", True, "ca"),
+    ]
+    with duckdb.connect(":memory:") as connection:
+        connection.execute(
+            "CREATE TABLE events(id INTEGER, tenant_id VARCHAR, owner_id VARCHAR, "
+            "public BOOLEAN, region VARCHAR)"
+        )
+        connection.executemany("INSERT INTO events VALUES (?, ?, ?, ?, ?)", rows)
+        actual = sorted(
+            row[0] for row in connection.execute(compiled.sql, compiled.params).fetchall()
+        )
+        expected = sorted(
+            row[0]
+            for row in connection.execute(
+                "SELECT id FROM events WHERE tenant_id = 'acme' "
+                "AND (owner_id = 'alice' OR public = TRUE) "
+                "AND (region = 'us' OR region = 'eu')"
+            ).fetchall()
+        )
+    assert actual == expected == [1, 2]
 
 
 def test_security_sql_predicate_appears_in_compiled_sql() -> None:

@@ -23,6 +23,7 @@ import psycopg
 import pytest
 from semql import (
     AuthContext,
+    BoolExpr,
     Catalog,
     CatalogContext,
     CompareWindow,
@@ -43,6 +44,8 @@ from semql import (
 )
 from semql.compile import CompiledQuery
 from semql.model import DimTypeLiteral
+from semql.parse import parse_sql_statement
+from semql.unparse import query_to_sql
 from semql_engine import AdapterResult, DBAPIAdapter, DuckDBAdapter, DuckDBMergeEngine, Engine
 from semql_engine.adapter import Adapter
 from testcontainers.core.container import DockerContainer
@@ -319,6 +322,122 @@ def backend(request: pytest.FixtureRequest) -> collections.abc.Iterator[_Backend
 
 def _url_host(host: str) -> str:
     return f"[{host}]" if ":" in host and not host.startswith("[") else host
+
+
+@pytest.mark.parametrize("entrypoint", ["semantic-query", "semantic-sql"])
+@pytest.mark.parametrize(
+    ("predicate", "expected_ids"),
+    [
+        (
+            BoolExpr(
+                op="or",
+                children=[
+                    BoolExpr(
+                        op="and",
+                        children=[
+                            Filter(dimension="events.region", op="eq", values=["A"]),
+                            Filter(dimension="events.amount", op="gt", values=[15]),
+                        ],
+                    ),
+                    BoolExpr(
+                        op="and",
+                        children=[
+                            Filter(dimension="events.region", op="eq", values=["B"]),
+                            Filter(dimension="events.amount", op="lt", values=[50]),
+                        ],
+                    ),
+                ],
+            ),
+            [2, 3],
+        ),
+        (
+            BoolExpr(
+                op="and",
+                children=[
+                    BoolExpr(
+                        op="or",
+                        children=[
+                            Filter(dimension="events.amount", op="gt", values=[15]),
+                            Filter(dimension="events.region", op="eq", values=["Z"]),
+                        ],
+                    ),
+                    Filter(dimension="events.region", op="eq", values=["A"]),
+                ],
+            ),
+            [2, 3],
+        ),
+        (
+            BoolExpr(
+                op="not",
+                children=[
+                    BoolExpr(
+                        op="and",
+                        children=[
+                            BoolExpr(
+                                op="or",
+                                children=[
+                                    Filter(dimension="events.amount", op="gt", values=[15]),
+                                    Filter(dimension="events.region", op="eq", values=["Z"]),
+                                ],
+                            ),
+                            Filter(dimension="events.region", op="eq", values=["A"]),
+                        ],
+                    )
+                ],
+            ),
+            [1, 4, 5],
+        ),
+        (
+            BoolExpr(
+                op="not",
+                children=[Filter(dimension="events.amount", op="gt", values=[15])],
+            ),
+            [1],
+        ),
+        (
+            BoolExpr(
+                op="or",
+                children=[
+                    Filter(dimension="events.amount", op="is_null"),
+                    BoolExpr(
+                        op="and",
+                        children=[
+                            Filter(dimension="events.region", op="eq", values=["A"]),
+                            Filter(dimension="events.amount", op="lte", values=[10]),
+                        ],
+                    ),
+                ],
+            ),
+            [1, 5],
+        ),
+    ],
+    ids=["or-of-and", "and-of-or", "nested-not", "not-with-null", "null-or-conjunction"],
+)
+def test_boolean_predicates_preserve_row_membership(
+    backend: _Backend, predicate: BoolExpr, expected_ids: list[int], entrypoint: str
+) -> None:
+    cube = Cube(
+        name="events",
+        table=f"{backend.prefix}events",
+        alias="e",
+        dialect=backend.dialect,
+        dimensions=[
+            Dimension(name="id", sql="{e}.id", type="number"),
+            Dimension(name="region", sql="{e}.region", type="string"),
+            Dimension(name="amount", sql="{e}.amount", type="number"),
+        ],
+    )
+    catalog = Catalog([cube])
+    query = SemanticQuery(
+        dimensions=["events.id"],
+        where=predicate,
+        limit=100,
+        order=[("events.id", "asc")],
+    )
+    if entrypoint == "semantic-sql":
+        query = parse_sql_statement(query_to_sql(query), catalog.as_dict()).query
+    compiled = catalog.compile(query)
+    assert [int(row["id"]) for row in backend.rows(compiled)] == expected_ids
 
 
 def test_aggregate_numeric_membership_and_hidden_operands(backend: _Backend) -> None:

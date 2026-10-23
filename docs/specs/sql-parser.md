@@ -57,7 +57,7 @@ class ParserDecision(BaseModel):
 | `WHERE dim = 'value'` | `filters` (implicit AND) |
 | `WHERE dim IN ('a', 'b')` | `filters` with `in` operator |
 | `WHERE dim > 10` | `filters` with `gt` operator |
-| `WHERE (a = 1 OR b = 2)` | `where` (BoolExpr tree) |
+| `WHERE (a = 1 OR b = 2)`; nested `AND` / `OR` / `NOT` | `where` (BoolExpr tree, preserving grouping) |
 | `GROUP BY dim1, dim2` | `dimensions` (deduplicated) |
 | `HAVING SUM(measure) > 100` | `having` filters |
 | `ORDER BY dim DESC, measure ASC` | `order` |
@@ -75,9 +75,29 @@ class ParserDecision(BaseModel):
 | `IN (...)` | `in` |
 | `NOT IN (...)` | `not_in` |
 | `>`, `>=`, `<`, `<=` | `gt`, `gte`, `lt`, `lte` |
-| `LIKE '%foo%'` | `contains` |
 | `IS NULL` | `is_null` |
 | `IS NOT NULL` | `not_null` |
+
+Boolean predicates preserve nested parentheses and SQL three-valued logic.
+Only literal comparison operands and literal `IN` lists are accepted; column
+comparisons, expression operands, NULL-valued comparisons/lists, subqueries,
+and unsupported predicate operators produce parse errors rather than being
+silently omitted or converted to strings. Use `IS NULL` / `IS NOT NULL` for
+NULL tests. Unknown references are checked inside Boolean subtrees too.
+
+`LIKE` / `NOT LIKE` are rejected: SQL pattern/case semantics are not equivalent
+to SemQL's escaped, case-insensitive `contains` operator. Use `SemanticQuery`
+directly for `contains`; `query_to_sql` raises `UnparseError` for that operator.
+
+`BETWEEN` retains the semantic-SQL time-window convention: one top-level,
+AND-composed half-open `[start, end)` window, not SQL's inclusive upper bound.
+It cannot be moved out of an `OR` or `NOT`, repeated, or used as a numeric
+range. Express numeric ranges with ordinary comparisons.
+
+`HAVING` remains a conjunction of measure filters. Parenthesized conjunctions
+and supported negated leaf comparisons are accepted; conditions requiring a
+Boolean HAVING tree are rejected explicitly.
+
 
 ## Parser Implementation
 
@@ -111,7 +131,7 @@ def parse_sql_statement(
 ## Error Handling
 
 - **Unknown cube**: Fatal error → `parse_errors`
-- **Unknown field**: Fatal in strict mode; warning in lenient
+- **Unknown field**: Recorded in `parse_errors`; strict mode raises, lenient mode returns diagnostics
 - **Invalid operator**: Syntax error
 - **Unsupported syntax**: Clear error message listing what's supported
 

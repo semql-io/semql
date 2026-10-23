@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from typing import Any
 
+import duckdb
 import pytest
 from semql.backend import (
     ClickHouseDialect,
@@ -121,6 +122,33 @@ def test_clickhouse_emit_contains_passes_value_literally() -> None:
 
 
 # ---------------------------------------------------------------------------
+
+
+def test_postgres_null_safe_equality_composes_with_outer_boolean_predicate() -> None:
+    strategy = PostgresDialect()
+    null_safe = strategy.emit_null_safe_eq(
+        exp.column("left_key"),
+        exp.column("right_key"),
+        "number",
+    )
+    combined = null_safe.and_(
+        exp.EQ(this=exp.column("keep_row"), expression=exp.Boolean(this=True)),
+        copy=False,
+    )
+    sql = render(exp.Select().select("id").from_("null_rows").where(combined), Dialect.POSTGRES)
+    with duckdb.connect(":memory:") as connection:
+        connection.execute(
+            "CREATE TABLE null_rows(id INTEGER, left_key INTEGER, "
+            "right_key INTEGER, keep_row BOOLEAN)"
+        )
+        connection.executemany(
+            "INSERT INTO null_rows VALUES (?, ?, ?, ?)",
+            [(1, None, None, False), (2, 1, 2, True), (3, 4, 4, True)],
+        )
+        actual = connection.execute(sql).fetchall()
+    assert actual == [(3,)]
+
+
 # emit_source() — vanilla cube vs META cube
 # ---------------------------------------------------------------------------
 

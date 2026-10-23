@@ -25,6 +25,7 @@ from __future__ import annotations
 import pytest
 from semql.parse import parse_sql_statement
 from semql.spec import (
+    BoolExpr,
     CompareWindow,
     Filter,
     InlineDerived,
@@ -96,6 +97,24 @@ def test_roundtrip_nested_or_and_tree() -> None:
     q = _parse(sql)
     assert q.where is not None and q.where.op == "and"
     assert _parse(query_to_sql(q, CATALOG.as_dict())) == q
+
+
+@pytest.mark.parametrize("placement", ["filters", "where", "having"])
+def test_contains_without_faithful_sql_representation_is_rejected(placement: str) -> None:
+    leaf = Filter(dimension="orders.region", op="contains", values=["EM%_"])
+    query = SemanticQuery(
+        measures=["orders.revenue"],
+        filters=[leaf] if placement == "filters" else [],
+        where=BoolExpr(
+            op="or",
+            children=[leaf, Filter(dimension="orders.status", op="eq", values=["paid"])],
+        )
+        if placement == "where"
+        else None,
+        having=[leaf] if placement == "having" else [],
+    )
+    with pytest.raises(UnparseError, match="contains"):
+        query_to_sql(query, CATALOG.as_dict())
 
 
 def test_roundtrip_offset_and_multi_alias() -> None:

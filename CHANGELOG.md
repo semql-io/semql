@@ -7,6 +7,26 @@ packages version in lockstep. Format loosely follows
 
 ## [Unreleased]
 
+## [0.11.1] - 2026-10-23
+
+### Fixed
+
+- Semantic SQL parsing preserves nested AND/OR grouping and compound NOT
+  instead of flattening or silently discarding predicates (#13).
+- Compiled Boolean predicates preserve SQL precedence through normalization,
+  direct plan emission, policy-isolation predicates, and null-safe comparison
+  helpers (#14).
+- AND-composing tenant isolation with an OR-based `security_sql` or ScopeFn
+  policy now groups the policy correctly, preventing rows from other tenants
+  from satisfying its disjunctive branch.
+- Unknown references inside Boolean trees and unsupported predicate operands
+  now produce parse diagnostics. HAVING rejects unrepresentable Boolean
+  structure; BETWEEN extraction cannot discard or relocate windows.
+- Semantic SQL rejects LIKE/NOT LIKE instead of treating SQL patterns as
+  escaped, case-insensitive substring filters. `query_to_sql` likewise rejects
+  `contains`; use `SemanticQuery` directly for that operator. The parser prompt
+  and SQL grammar documentation describe the supported boundary.
+
 ## [0.11.0] - 2026-10-04
 
 ### Added
