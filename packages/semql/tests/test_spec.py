@@ -8,9 +8,21 @@ silently-wrong SQL.
 
 from __future__ import annotations
 
+from typing import Any, cast
+
 import pytest
 from pydantic import BaseModel, ValidationError
-from semql.spec import CompareWindow, Filter, SemanticQuery, SemiJoin, TimeWindow
+from semql.spec import (
+    BoolExpr,
+    CompareWindow,
+    Filter,
+    InlineDerived,
+    SavedQuery,
+    SemanticQuery,
+    SemanticQueryDefaults,
+    SemiJoin,
+    TimeWindow,
+)
 
 # ---------------------------------------------------------------------------
 # Value-object invariants: every spec type is frozen.
@@ -420,3 +432,97 @@ def test_spec_schema_descriptions_are_under_120_chars() -> None:
             assert len(desc) <= 120, (
                 f"{model_cls.__name__}.{name} description is {len(desc)} chars; cap is 120."
             )
+
+
+def test_query_collections_are_deeply_immutable_and_detached() -> None:
+    measures = ["orders.revenue"]
+    values = ["north"]
+    filters = [Filter(dimension="orders.region", op="eq", values=values)]
+    where_children = [
+        Filter(dimension="orders.region", op="eq", values=values),
+        Filter(dimension="orders.region", op="neq", values=["south"]),
+    ]
+    aliases = {"sales": "orders.revenue"}
+    query = SemanticQuery(
+        measures=measures,
+        filters=filters,
+        where=BoolExpr(op="and", children=where_children),
+        aliases=aliases,
+    )
+
+    measures.append("orders.cost")
+    values.append("south")
+    filters.clear()
+    where_children.pop()
+    aliases["sales"] = "orders.cost"
+
+    assert query.measures == ["orders.revenue"]
+    assert query.filters[0].values == ["north"]
+    assert query.where is not None and len(query.where.children) == 2
+    assert query.aliases == {"sales": "orders.revenue"}
+    assert query.model_dump()["measures"] == ["orders.revenue"]
+    assert isinstance(query.model_dump()["aliases"], dict)
+
+    # Bypass static read-only types to exercise runtime mutation rejection.
+    with pytest.raises((AttributeError, TypeError)):
+        cast(Any, query.measures).append("orders.cost")
+    with pytest.raises((AttributeError, TypeError)):
+        cast(Any, query.filters[0].values).append("south")
+    with pytest.raises((AttributeError, TypeError)):
+        cast(Any, query.where.children).pop()
+    with pytest.raises((AttributeError, TypeError)):
+        cast(Any, query.aliases)["sales"] = "orders.cost"
+
+
+def test_saved_query_and_defaults_detach_nested_values() -> None:
+    roles = ["analyst"]
+    query = SemanticQuery(measures=["orders.revenue"])
+    saved = SavedQuery(name="revenue", query=query, required_roles=roles)
+    roles.append("admin")
+    assert saved.required_roles == ["analyst"]
+    with pytest.raises((AttributeError, TypeError)):
+        cast(Any, saved.required_roles).append("admin")
+
+    defaults = SemanticQueryDefaults(
+        time_window=TimeWindow(
+            dimension="orders.created_at",
+            range=("2026-01-01", "2026-02-01"),
+        )
+    )
+    assert defaults.time_window is not None
+    with pytest.raises(ValidationError):
+        defaults.model_copy(
+            update={
+                "time_window": {
+                    "dimension": "orders.created_at",
+                    "range": ["2026-02-01"],
+                }
+            }
+        )
+
+
+def test_frozen_model_copy_revalidates_query_shapes() -> None:
+    query = SemanticQuery(measures=["orders.revenue"])
+    with pytest.raises(ValidationError, match="ungrouped=True is incompatible"):
+        query.model_copy(update={"ungrouped": True})
+
+    predicate = BoolExpr(
+        op="and",
+        children=[
+            Filter(dimension="orders.region", op="eq", values=["north"]),
+            Filter(dimension="orders.region", op="eq", values=["south"]),
+        ],
+    )
+    with pytest.raises(ValidationError, match="requires at least two children"):
+        predicate.model_copy(update={"children": [predicate.children[0]]})
+
+    derived = InlineDerived(name="ratio", op="ratio", operands=["orders.a", "orders.b"])
+    with pytest.raises(ValidationError, match="exactly two operands"):
+        derived.model_copy(update={"operands": ["orders.a"]})
+
+
+def test_validated_query_copy_remains_supported() -> None:
+    query = SemanticQuery(measures=["orders.revenue"])
+    changed = query.model_copy(update={"dimensions": ["orders.region"]})
+    assert changed.measures == ["orders.revenue"]
+    assert changed.dimensions == ["orders.region"]

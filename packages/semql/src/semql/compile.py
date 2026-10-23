@@ -90,6 +90,7 @@ from semql.errors import (
 from semql.introspect import PolicyFn, ScopeFn, viewer_sees
 from semql.logical import (
     FAN_OUT_SENSITIVE_AGGS,
+    ColumnRef,
     LogicalPlan,
     apply_rollup_to_plan,
     find_join_path_detailed,
@@ -3346,8 +3347,9 @@ def compile_plan(
       emitted SQL matches the spec-tree path
       (see ``test_logb_ii_plan_driven_compile``).
 
-    The plan is *trusted verbatim*: ``_CompileEnv`` emits from this
-    plan and does not re-lower it.  A matching ``SemanticQuery`` is
+    Physical plan choices are trusted: ``_CompileEnv`` emits from this
+    plan and does not re-lower it. Catalog authorization and field masks
+    are restored before emission. A matching ``SemanticQuery`` is
     re-derived from the plan's fields only to run the pre-flight
     checks (``_validate_query_invariants``, ``_check_lifecycle``,
     auth / visibility) and to populate the resolution caches — it is
@@ -3468,6 +3470,70 @@ def compile_plan(
             for j in plan.joins
         ]
         plan = _dc_replace(plan, scans=canonical_scans, joins=canonical_joins)
+
+    # Projection fields also reach emission directly, independently of the
+    # scan/join cubes and the catalog-resolved metadata. Restore only their
+    # security policy: replacing the whole field would discard legitimate
+    # optimizer SQL rewrites. Canonicalize every occurrence, including fields
+    # used by compare-mode inner SELECTs, before the projection visibility gate.
+    canonical_columns: list[ColumnRef] = []
+    for col in plan.project.columns:
+        trusted_cube = catalog.get(col.cube.name)
+        # Inline-derived outputs have no catalog field and are emitted from
+        # the reconstructed query's validated operands, not ColumnRef.field.
+        if (
+            trusted_cube is not None
+            and col.kind == "computed"
+            and col.field is None
+            and any(derived.name == col.field_name for derived in derived_measures)
+        ):
+            canonical_columns.append(col)
+            continue
+        trusted_field = (
+            next(
+                (
+                    field
+                    for field in chain(
+                        trusted_cube.measures,
+                        trusted_cube.dimensions,
+                        trusted_cube.time_dimensions,
+                    )
+                    if field.name == col.field_name
+                ),
+                None,
+            )
+            if trusted_cube is not None
+            else None
+        )
+        expected_kind = "measure" if col.kind == "computed" else col.kind
+        if (
+            trusted_field is None
+            or col.field is None
+            or col.field.name != trusted_field.name
+            or col.field.kind != expected_kind
+            or trusted_field.kind != expected_kind
+        ):
+            raise UnknownIdentifierError(
+                f"Unknown field {col.field_name!r} on cube {col.cube.name!r}.",
+                kind="field",
+                name=col.field_name,
+                cube=col.cube.name,
+                hint=None,
+            )
+        field_security: dict[str, Any] = {"required_roles": trusted_field.required_roles}
+        if isinstance(trusted_field, (Measure, Dimension)):
+            field_security.update(
+                mask_roles=trusted_field.mask_roles,
+                mask_value=trusted_field.mask_value,
+            )
+        canonical_columns.append(
+            _dc_replace(
+                col,
+                cube=_restore_security(col.cube),
+                field=col.field.model_copy(update=field_security),
+            )
+        )
+    plan = _dc_replace(plan, project=_dc_replace(plan.project, columns=canonical_columns))
 
     # Re-authorize every projected field against the viewer
     # (SEMQL-COMPILEPLAN-PROJECTION-AUTH). The field-hide gate

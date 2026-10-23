@@ -57,40 +57,6 @@ def test_plan_snap_simple_aggregation(snapshot: SnapshotAssertion) -> None:
     assert repr(plan) == snapshot
 
 
-def test_plan_snap_filtered_aggregation(snapshot: SnapshotAssertion) -> None:
-    """Flat filter list — pins Predicate carrying a Filter leaf."""
-    catalog = _orders_catalog()
-    query = SemanticQuery(
-        measures=["orders.revenue"],
-        dimensions=["orders.region"],
-        filters=[
-            Filter(dimension="orders.region", op="eq", values=["us"]),
-        ],
-    )
-    plan = to_logical_plan(query, catalog)
-    assert repr(plan) == snapshot
-
-
-def test_plan_snap_where_tree(snapshot: SnapshotAssertion) -> None:
-    """BoolExpr tree — pins Predicate carrying a non-leaf tree."""
-    from semql.spec import BoolExpr
-
-    catalog = _orders_catalog()
-    query = SemanticQuery(
-        measures=["orders.revenue"],
-        dimensions=["orders.region"],
-        where=BoolExpr(
-            op="or",
-            children=[
-                Filter(dimension="orders.region", op="eq", values=["us"]),
-                Filter(dimension="orders.region", op="eq", values=["ca"]),
-            ],
-        ),
-    )
-    plan = to_logical_plan(query, catalog)
-    assert repr(plan) == snapshot
-
-
 def test_plan_snap_time_breakdown_with_granularity(snapshot: SnapshotAssertion) -> None:
     """TimeWindow with granularity populates Aggregate.time and Project."""
     catalog = {

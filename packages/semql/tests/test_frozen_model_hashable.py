@@ -206,18 +206,17 @@ def test_nested_immutable_model_values_round_trip_through_json() -> None:
     assert hash(rebuilt) == hash(context)
 
 
-def test_hash_rejects_mutable_models_and_unsupported_nested_values() -> None:
+def test_query_models_are_hashable_and_immutable_when_nested() -> None:
     from semql.spec import SavedQuery, SemanticQuery
 
     query = SemanticQuery(measures=["orders.revenue"])
     saved = SavedQuery(name="revenue", query=query)
     context = AuthContext(viewer_id="u", attrs={"saved_query": saved})
+    before_hash = hash(context)
 
-    with pytest.raises(TypeError, match="mutable model"):
-        hash(context)
-    query.measures.append("orders.cost")
-    with pytest.raises(TypeError, match="mutable model"):
-        hash(context)
+    with pytest.raises((AttributeError, TypeError)):
+        cast(Any, query.measures).append("orders.cost")
+    assert hash(context) == before_hash
 
     class MutableTag:
         pass

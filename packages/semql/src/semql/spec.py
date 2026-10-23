@@ -8,10 +8,11 @@ naming the offending field.
 from __future__ import annotations
 
 import uuid as _uuid
+from collections.abc import Mapping, Sequence
 from datetime import datetime
-from typing import TYPE_CHECKING, Annotated, Any, Literal
+from typing import TYPE_CHECKING, Annotated, Any, Literal, cast
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import Field, model_validator
 
 # ``parse_instant`` is a pure leaf utility — it lives in
 # :mod:`semql.instant` so the catalog model (which needs it for
@@ -20,7 +21,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 # it from ``semql.spec`` historically.
 from semql._grounding import validate_keywords, validate_questions
 from semql.instant import parse_instant
-from semql.model import GranularityLiteral
+from semql.model import FrozenModel, GranularityLiteral
 
 if TYPE_CHECKING:
     # The cycle here is real: ``rewrite.py`` needs ``Filter`` /
@@ -49,8 +50,7 @@ FilterOp = Literal[
 ]
 
 
-class TimeWindow(BaseModel):
-    model_config = ConfigDict(frozen=True)
+class TimeWindow(FrozenModel):
     dimension: str = Field(
         description=(
             "Qualified time-dimension name (e.g. 'orders.created_at') the window restricts."
@@ -103,8 +103,7 @@ class TimeWindow(BaseModel):
         return self
 
 
-class Filter(BaseModel):
-    model_config = ConfigDict(frozen=True)
+class Filter(FrozenModel):
     dimension: str = Field(
         description="Qualified dimension name (e.g. 'orders.region') the predicate applies to.",
     )
@@ -113,7 +112,7 @@ class Filter(BaseModel):
             "Operator: eq, neq, in, not_in, gt, lt, gte, lte, contains, is_null, not_null."
         ),
     )
-    values: list[str | int | float | bool] = Field(
+    values: Sequence[str | int | float | bool] = Field(
         default_factory=lambda: list[str | int | float | bool](),
         description=(
             "Predicate arguments — one for scalar ops, many for in/not_in, empty for is_null."
@@ -178,7 +177,7 @@ class Filter(BaseModel):
                 )
 
 
-class BoolExpr(BaseModel):
+class BoolExpr(FrozenModel):
     """Recursive boolean predicate tree over ``Filter`` leaves.
 
     ``filters`` (the flat list on ``SemanticQuery``) is implicit-AND;
@@ -187,11 +186,10 @@ class BoolExpr(BaseModel):
     exactly one child; ``and`` / ``or`` take two or more.
     """
 
-    model_config = ConfigDict(frozen=True)
     op: Literal["and", "or", "not"] = Field(
         description="Combinator: 'and' / 'or' (>=2 children) or 'not' (exactly one child).",
     )
-    children: list[BoolExpr | Filter] = Field(
+    children: Sequence[BoolExpr | Filter] = Field(
         description="Sub-expressions: nested BoolExpr nodes or Filter leaves.",
     )
 
@@ -205,11 +203,10 @@ class BoolExpr(BaseModel):
         return self
 
 
-class CompareWindow(BaseModel):
+class CompareWindow(FrozenModel):
     """`previous_period` derives the prior window from the TimeWindow's
     range (same duration, immediately prior). `explicit` requires `range`."""
 
-    model_config = ConfigDict(frozen=True)
     mode: Literal["previous_period", "explicit"] = Field(
         default="previous_period",
         description=(
@@ -225,7 +222,7 @@ class CompareWindow(BaseModel):
 InlineDerivedOp = Literal["ratio", "sum", "diff"]
 
 
-class InlineDerived(BaseModel):
+class InlineDerived(FrozenModel):
     """Ad-hoc derived measure composed from existing catalog measures.
 
     Covers the exploratory shape an LLM or human reaches for in chat:
@@ -261,14 +258,13 @@ class InlineDerived(BaseModel):
     hatch.
     """
 
-    model_config = ConfigDict(frozen=True)
     name: str = Field(
         description="Output column name for the derived measure.",
     )
     op: InlineDerivedOp = Field(
         description="Composition: 'ratio' (num/den), 'sum' (a+b+...), or 'diff' (a-b).",
     )
-    operands: list[str] = Field(
+    operands: Sequence[str] = Field(
         description=(
             "Qualified measure refs ('cube.measure'); may span cubes the "
             "join graph connects unambiguously and fan-safely."
@@ -304,7 +300,7 @@ class InlineDerived(BaseModel):
         return self
 
 
-class SemiJoin(BaseModel):
+class SemiJoin(FrozenModel):
     """Cross-backend semi-join: restrict an outer dimension to the value
     set produced by an inner query, shipped as a literal value list — never
     a cross-backend join.
@@ -326,7 +322,6 @@ class SemiJoin(BaseModel):
     rather than silently coercing the value list.
     """
 
-    model_config = ConfigDict(frozen=True)
     dimension: str = Field(
         description="Qualified outer dimension to constrain, e.g. 'activity.employee_id'.",
     )
@@ -363,15 +358,14 @@ class SemiJoin(BaseModel):
         return self
 
 
-class SemanticQuery(BaseModel):
-    model_config = ConfigDict(frozen=True)
-    measures: list[str] = Field(
+class SemanticQuery(FrozenModel):
+    measures: Sequence[str] = Field(
         default_factory=list,
         description=(
             "Qualified measure refs to aggregate (e.g. 'orders.revenue'); each grouped per its agg."
         ),
     )
-    dimensions: list[str] = Field(
+    dimensions: Sequence[str] = Field(
         default_factory=list,
         description="Qualified dimension refs to group by (e.g. 'orders.region').",
     )
@@ -381,11 +375,11 @@ class SemanticQuery(BaseModel):
             "Time window restricting rows; supplies the time bucket when granularity is set."
         ),
     )
-    segments: list[str] = Field(
+    segments: Sequence[str] = Field(
         default_factory=list,
         description=("Named pre-defined predicates as 'cube.segment'; AND-composed with filters."),
     )
-    filters: list[Filter] = Field(
+    filters: Sequence[Filter] = Field(
         default_factory=lambda: list[Filter](),
         description="Flat list of predicates; combined with implicit AND.",
     )
@@ -395,7 +389,7 @@ class SemanticQuery(BaseModel):
             "Boolean predicate tree (use for OR / NOT); AND-composed with the filters list."
         ),
     )
-    having: list[Filter] = Field(
+    having: Sequence[Filter] = Field(
         default_factory=lambda: list[Filter](),
         description=(
             "Post-aggregation filters on measure values; references a measure also in 'measures'."
@@ -407,7 +401,7 @@ class SemanticQuery(BaseModel):
             "Adds <measure>_current / <measure>_prior / _delta / _pct_change columns per measure."
         ),
     )
-    order: list[tuple[str, Literal["asc", "desc"]]] = Field(
+    order: Sequence[tuple[str, Literal["asc", "desc"]]] = Field(
         default_factory=lambda: list[tuple[str, Literal["asc", "desc"]]](),
         description="(field, 'asc'|'desc') pairs; field may be a measure or dimension name.",
     )
@@ -427,20 +421,20 @@ class SemanticQuery(BaseModel):
             "Row-listing mode (no GROUP BY); incompatible with measures; needs explicit limit."
         ),
     )
-    derived_measures: list[InlineDerived] = Field(
+    derived_measures: Sequence[InlineDerived] = Field(
         default_factory=lambda: list[InlineDerived](),
         description=(
             "Ad-hoc derived measures (ratio/sum/diff) composed inline from catalog measures."
         ),
     )
-    semi_joins: list[SemiJoin] = Field(
+    semi_joins: Sequence[SemiJoin] = Field(
         default_factory=lambda: list[SemiJoin](),
         description=(
             "Cross-backend semi-joins: restrict a dimension to the value set of an inner "
             "query, shipped as a value list (no join). AND-composed with filters/where."
         ),
     )
-    left_joins: list[str] = Field(
+    left_joins: Sequence[str] = Field(
         default_factory=list,
         description=(
             "Cubes to LEFT JOIN instead of INNER; pair with op='is_null' for absent-row queries."
@@ -454,7 +448,7 @@ class SemanticQuery(BaseModel):
     # must be unique (Pydantic dict semantics), must resolve to a
     # declared field, and must not collide with existing output
     # column names (compile error).
-    aliases: dict[str, str] = Field(
+    aliases: Mapping[str, str] = Field(
         default_factory=dict,
         description=(
             "Output column aliases; ``{output_name: qualified_ref}``. "
@@ -550,7 +544,7 @@ class SemanticQuery(BaseModel):
         return _rewrite(self, op)
 
 
-class SavedQuery(BaseModel):
+class SavedQuery(FrozenModel):
     """A pre-baked :class:`SemanticQuery` registered on a Catalog.
 
     Saved queries cover the "give me the standard quarterly revenue
@@ -574,19 +568,18 @@ class SavedQuery(BaseModel):
     ``deprecated`` causes the compiler to refuse the saved query.
     """
 
-    model_config = ConfigDict(frozen=True)
     name: str
     query: SemanticQuery
     description: str = ""
     owner: str | None = None
-    required_roles: list[str] = []
+    required_roles: Sequence[str] = Field(default_factory=list)
     # Fully-baked NL questions this saved query answers — same shape
     # rules as ``Cube.questions``. Surface in the MCP tool description
     # so external agents pick the right saved query by capability.
-    questions: list[str] = []
+    questions: Sequence[str] = Field(default_factory=list)
     # Free-text search tokens — same acronym-preserving normalisation
     # as ``Cube.keywords``.
-    keywords: list[str] = []
+    keywords: Sequence[str] = Field(default_factory=list)
     # One-line "why this exists": "operational dashboard", "weekly
     # ops report", "on-call latency check". Free-form.
     purpose: str = ""
@@ -597,15 +590,24 @@ class SavedQuery(BaseModel):
     # Successor pointer surfaced in the deprecation error message.
     replacement: str | None = None
 
+    @model_validator(mode="before")
+    @classmethod
+    def _normalise_keywords(cls, data: Any) -> Any:  # noqa: ANN401 — Pydantic raw input
+        if not isinstance(data, dict):
+            return data
+        fields = cast("dict[str, Any]", data)
+        if not fields.get("keywords"):
+            return fields
+        return {
+            **fields,
+            "keywords": validate_keywords(
+                "SavedQuery", str(fields.get("name", "")), fields["keywords"]
+            ),
+        }
+
     @model_validator(mode="after")
     def _check_grounding(self) -> SavedQuery:
-        validate_questions("SavedQuery", self.name, self.questions)
-        normalised = validate_keywords("SavedQuery", self.name, self.keywords)
-        # Frozen model — bypass via object.__setattr__ since
-        # model_copy(update=...) inside an after-validator would
-        # re-trigger validation and recurse.
-        if normalised != self.keywords:
-            object.__setattr__(self, "keywords", normalised)
+        validate_questions("SavedQuery", self.name, list(self.questions))
         if self.stability != "deprecated" and self.replacement is not None:
             raise ValueError(
                 f"SavedQuery {self.name!r}: ``replacement`` may only "
@@ -620,7 +622,7 @@ class SavedQuery(BaseModel):
 SemiJoin.model_rebuild()
 
 
-class SemanticQueryDefaults(BaseModel):
+class SemanticQueryDefaults(FrozenModel):
     """Declarative compile defaults applied before compile hooks.
 
     Merge priority (highest wins): query's own value > per-call
@@ -631,7 +633,6 @@ class SemanticQueryDefaults(BaseModel):
     to opt in without filling anything; omit to get current behaviour.
     """
 
-    model_config = ConfigDict(frozen=True)
     limit: int | None = None
     time_window: TimeWindow | None = None
     granularity: GranularityLiteral | None = None

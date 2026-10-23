@@ -7,6 +7,25 @@ packages version in lockstep. Format loosely follows
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-10-23
+
+### Fixed
+
+- Query specs now recursively freeze their collections, including filters,
+  Boolean children, derived operands, aliases, and saved-query roles. Validated
+  copies reject invalid query shapes instead of bypassing model invariants.
+- `compile_plan` restores projection roles and masking policy from the trusted
+  catalog before authorization and emission, so forged field policy cannot
+  expose raw values while reporting masked metadata. Physical optimizer
+  expressions, source rewrites, and aliases remain supported.
+
+### Changed
+
+- Query/spec collection attributes are read-only `Sequence`/`Mapping` values.
+  List/dict constructor inputs and serialized arrays/objects remain supported;
+  use validated `model_copy(update=...)` or query rewrites instead of in-place
+  mutation. All eight packages advance together to `0.12.0`.
+
 ## [0.11.1] - 2026-10-23
 
 ### Fixed

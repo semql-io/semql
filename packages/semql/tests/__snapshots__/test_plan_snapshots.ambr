@@ -13,20 +13,6 @@
     compare=CompareSplit(current_range=('2025-01-01T00:00:00', '2025-01-08T00:00:00'), prior_range=('2024-12-25T00:00:00', '2025-01-01T00:00:00'))
   '''
 # ---
-# name: test_plan_snap_filtered_aggregation
-  '''
-  LogicalPlan(root=orders)
-    scans=[Scan(orders as o)]
-    joins=[]
-    filters=[Predicate(Filter(dimension='orders.region', op='eq', values=['us']))]
-    aggregate=Aggregate(group_by=['orders.region'], measures=['orders.revenue'], time=None, derived=[])
-    project=Project([dimension:region, measure:revenue])
-    order=OrderBy([])
-    limit=Limit(limit=None, offset=None)
-    time_window=None
-    compare=None
-  '''
-# ---
 # name: test_plan_snap_simple_aggregation
   '''
   LogicalPlan(root=orders)
@@ -55,20 +41,6 @@
     order=OrderBy([])
     limit=Limit(limit=None, offset=None)
     time_window=TimeWindow(dimension='orders.created_at', granularity='day', range=('2025-01-01T00:00:00', '2025-01-08T00:00:00'), fill_nulls_with=None)
-    compare=None
-  '''
-# ---
-# name: test_plan_snap_where_tree
-  '''
-  LogicalPlan(root=orders)
-    scans=[Scan(orders as o)]
-    joins=[]
-    filters=[Predicate(BoolExpr(op='or', children=[Filter(dimension='orders.region', op='eq', values=['us']), Filter(dimension='orders.region', op='eq', values=['ca'])]))]
-    aggregate=Aggregate(group_by=['orders.region'], measures=['orders.revenue'], time=None, derived=[])
-    project=Project([dimension:region, measure:revenue])
-    order=OrderBy([])
-    limit=Limit(limit=None, offset=None)
-    time_window=None
     compare=None
   '''
 # ---

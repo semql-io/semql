@@ -453,7 +453,10 @@ def broken_pair(draw: st.DrawFn) -> tuple[Catalog, SemanticQuery, str]:
     catalog, q = draw(catalog_and_query())
     cubes = [c for c in catalog.as_dict().values() if c.dialect is not Dialect.META]
     a_cube = cubes[0]
-    breakage = draw(st.sampled_from(["unknown_measure", "unknown_dimension", "filter_on_measure"]))
+    breakages = ["unknown_dimension", "filter_on_measure"]
+    if not q.ungrouped:
+        breakages.append("unknown_measure")
+    breakage = draw(st.sampled_from(breakages))
 
     if breakage == "unknown_measure":
         q = q.model_copy(

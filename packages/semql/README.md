@@ -116,6 +116,24 @@ Duplicate semantic projections reject. To display a metric twice, reuse its
 output in presentation. `compile_plan()` is a privileged host/optimizer entry
 point, not a client-facing alternative to `SemanticQuery`.
 
+### Immutable query specs
+
+Query specs and saved queries use read-only `Sequence`/`Mapping` collections,
+including nested filter values, Boolean children, derived operands, and aliases.
+Constructors still accept lists and dictionaries, detach caller-owned containers,
+and serialize to ordinary arrays and objects.
+
+From `0.12.0`, replace in-place mutations with validated copies or query rewrites:
+
+```python
+updated = query.model_copy(
+    update={"filters": [*query.filters, Filter(dimension="orders.region", op="eq", values=["west"])]}
+)
+```
+
+Copies revalidate model invariants. Materialize `list(query.measures)` or
+`dict(query.aliases)` only when a downstream API needs its own mutable container.
+
 ### Query cost budgets
 
 `estimate_cost(query, catalog.as_dict(), views=catalog.views)` sums the declared

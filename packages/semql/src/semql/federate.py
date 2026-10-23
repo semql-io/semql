@@ -1182,7 +1182,10 @@ def _route_where_tree(
             new_where: BoolExpr | Filter = _clauses_to_boolexpr(clauses_for_p)
             if sub_q.where is not None:
                 new_where = BoolExpr(op="and", children=[sub_q.where, new_where])
-            sub_q_updates["where"] = new_where
+            if isinstance(new_where, Filter):
+                sub_q_updates["filters"] = [*sub_q.filters, new_where]
+            else:
+                sub_q_updates["where"] = new_where
         new_dim_columns = dict(p.dim_columns)
         if dims_for_p:
             existing_dims = list(sub_q.dimensions)
@@ -1240,7 +1243,10 @@ def _route_where_distributive(
             new_where: BoolExpr | Filter = _clauses_to_boolexpr(clauses_for_p)
             if sub_q.where is not None:
                 new_where = BoolExpr(op="and", children=[sub_q.where, new_where])
-            sub_q_updates["where"] = new_where
+            if isinstance(new_where, Filter):
+                sub_q_updates["filters"] = [*sub_q.filters, new_where]
+            else:
+                sub_q_updates["where"] = new_where
         new_dim_columns = dict(p.dim_columns)
         if dims_for_p:
             existing_dims = list(sub_q.dimensions)

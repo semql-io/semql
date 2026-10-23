@@ -7,6 +7,7 @@ import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from itertools import chain
 from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
 
 from semql.dialect import dialect_for as sqlglot_dialect_for
@@ -124,7 +125,7 @@ class AuditHook(BaseCompileHook):
 
     def _extract_cubes(self, query: SemanticQuery) -> list[str]:
         cubes: set[str] = set()
-        for ref in query.measures + query.dimensions:
+        for ref in chain(query.measures, query.dimensions):
             if is_qualified(ref):
                 cubes.add(cube_of(ref))
         for f in query.filters:

@@ -34,7 +34,7 @@ class QualifiedRef(str):
     """A ``cube.field`` reference.
 
     A ``str`` subclass: it equals its source text and drops into any place a
-    ref string is expected (``SemanticQuery.measures`` is ``list[str]``),
+    ref string is expected (``SemanticQuery.measures`` is a sequence of strings),
     while exposing the validated ``cube`` / ``field`` halves. Construction
     raises :class:`~semql.errors.ResolveError` on a malformed ref, so a bad
     ref fails loudly at the boundary instead of silently degrading at a

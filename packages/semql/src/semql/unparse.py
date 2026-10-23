@@ -39,6 +39,8 @@ not SQL ``LIKE``).
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 from semql.errors import SemQLError
 from semql.model import AggLiteral, Cube
 from semql.refs import cube_of, is_qualified
@@ -344,7 +346,7 @@ class _Serializer:
 # ---------------------------------------------------------------------------
 
 
-def _reverse_aliases(aliases: dict[str, str]) -> dict[str, str]:
+def _reverse_aliases(aliases: Mapping[str, str]) -> dict[str, str]:
     """Map each referenced field to one output alias.
 
     ``aliases`` is ``{output_name: qualified_ref}``; the serializer needs the
