@@ -277,6 +277,63 @@ def test_apply_prompt_augmentation_accepts_compilable_scoped_example_and_fixed_g
     assert "### payroll" not in result.text
 
 
+@pytest.mark.parametrize(
+    ("profile", "disabled_features", "forbidden"),
+    [
+        ("strict", (), {"where", "semi_joins"}),
+        ("tool", ("rank",), {"rank"}),
+    ],
+)
+def test_augmentation_examples_do_not_render_omitted_query_defaults(
+    profile: str, disabled_features: tuple[str, ...], forbidden: set[str]
+) -> None:
+    import json
+    import re
+
+    from semql.schema import SchemaProfile
+
+    result = apply_prompt_augmentation(
+        _catalog(),
+        AdaptivePromptRequest(question="Show revenue.", scope_to=("orders",)),
+        PromptAugmentation(
+            examples=(
+                PromptExample(
+                    question="Example",
+                    query=SemanticQuery(measures=["orders.revenue"]),
+                ),
+            )
+        ),
+        profile=SchemaProfile(profile),
+        disabled_features=disabled_features,
+        policy=AdaptivePromptPolicy(max_tokens=40_000),
+    )
+    match = re.search(r"Reference example:\n(\{[^\n]+\})", result.text)
+    assert match is not None
+    payload = json.loads(match.group(1))
+    assert not forbidden.intersection(payload["query"])
+    assert "orders.revenue" in payload["query"]["measures"]
+
+
+def test_augmentation_rejects_explicitly_supplied_forbidden_default() -> None:
+    from semql.schema import SchemaProfile
+
+    augmentation = PromptAugmentation(
+        examples=(
+            PromptExample(
+                question="Explicitly supplies null",
+                query=SemanticQuery(measures=["orders.revenue"], where=None),
+            ),
+        )
+    )
+    with pytest.raises(ValueError, match="where"):
+        apply_prompt_augmentation(
+            _catalog(),
+            AdaptivePromptRequest(question="Show revenue.", scope_to=("orders",)),
+            augmentation,
+            profile=SchemaProfile.STRICT,
+        )
+
+
 def _assert_generic_example_rejection(
     augmentation: PromptAugmentation,
     *,

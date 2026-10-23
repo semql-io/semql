@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import datetime
+
+import duckdb
 import pytest
 from semql import (
     Catalog,
+    CompareWindow,
     Cube,
     Dialect,
     Dimension,
@@ -418,3 +422,104 @@ def test_render_omits_unconfirmed_measure_alternatives() -> None:
     )
     assert "orders.revenue" in rendered
     assert "secret.salary" not in rendered
+
+
+@pytest.mark.parametrize("having_ref", ["revenue", "net", "double_revenue"])
+def test_continuation_having_output_references_execute(having_ref: str) -> None:
+    query = SemanticQuery(
+        dimensions=["orders.region"],
+        measures=["orders.revenue"],
+        aliases={"net": "orders.revenue"} if having_ref == "net" else {},
+        derived_measures=(
+            [InlineDerived(name="double_revenue", op="sum", operands=["orders.revenue"] * 2)]
+            if having_ref == "double_revenue"
+            else []
+        ),
+        having=[Filter(dimension=having_ref, op="gt", values=[100])],
+    )
+    state = _state().model_copy(
+        update={
+            "baseline": QueryPlan(steps=[QueryStep(query=query, intent="headline")]),
+            "decisions": (),
+        }
+    )
+    rendered = render_continuation(
+        state,
+        catalog=_catalog(),
+        viewer=None,
+        current_authorized_cubes=("orders",),
+        current_visibility_revision="vis-7",
+    )
+    assert having_ref in rendered
+    result = accept_continuation(
+        state,
+        _response(query),
+        catalog=_catalog(),
+        current_authorized_cubes=("orders",),
+        current_visibility_revision="vis-7",
+    )
+    assert result.accepted
+    with duckdb.connect() as connection:
+        connection.execute("CREATE TABLE orders(region VARCHAR, amount INTEGER)")
+        connection.execute("INSERT INTO orders VALUES ('A', 60), ('A', 70), ('B', 20)")
+        compiled = result.compiled[0]
+        assert connection.execute(compiled.sql, compiled.params).fetchall() == (
+            [("A", 130, 260)] if having_ref == "double_revenue" else [("A", 130)]
+        )
+
+
+@pytest.mark.parametrize("output_ref", ["created_at_day", "compare.revenue.delta", "revenue_delta"])
+def test_continuation_generated_output_references_execute(output_ref: str) -> None:
+    window = TimeWindow(
+        dimension="orders.created_at",
+        granularity="day" if output_ref == "created_at_day" else None,
+        range=("2026-01-01", "2026-02-01"),
+    )
+    query = SemanticQuery(
+        measures=["orders.revenue"],
+        time_dimension=window,
+        rank=(
+            PartitionRank(order_by=[RankOrder(field="revenue", direction="desc")], count=1)
+            if output_ref == "created_at_day"
+            else None
+        ),
+        order=[(output_ref, "asc")],
+        compare=None if output_ref == "created_at_day" else CompareWindow(mode="previous_period"),
+        having=(
+            []
+            if output_ref == "created_at_day"
+            else [Filter(dimension=output_ref, op="gt", values=[0])]
+        ),
+    )
+    state = _state().model_copy(
+        update={
+            "baseline": QueryPlan(steps=[QueryStep(query=query, intent="headline")]),
+            "decisions": (),
+        }
+    )
+    render_continuation(
+        state,
+        catalog=_catalog(),
+        viewer=None,
+        current_authorized_cubes=("orders",),
+        current_visibility_revision="vis-7",
+    )
+    result = accept_continuation(
+        state,
+        _response(query),
+        catalog=_catalog(),
+        current_authorized_cubes=("orders",),
+        current_visibility_revision="vis-7",
+    )
+    assert result.accepted
+    with duckdb.connect() as connection:
+        connection.execute("CREATE TABLE orders(amount INTEGER, created_at TIMESTAMP)")
+        connection.execute(
+            "INSERT INTO orders VALUES (5, '2025-12-01'), (20, '2026-01-01'), (10, '2026-01-02')"
+        )
+        compiled = result.compiled[0]
+        assert connection.execute(compiled.sql, compiled.params).fetchall() == (
+            [(datetime.datetime(2026, 1, 1), 20)]
+            if output_ref == "created_at_day"
+            else [(30, 5, 25, 500.0)]
+        )

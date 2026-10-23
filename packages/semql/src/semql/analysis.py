@@ -734,11 +734,21 @@ def build_analysis(
         for node in nodes
         if node.catalog_ref is not None and node.kind in {"aggregate", "dimension", "time"}
     }
+    nodes_by_id = {node.node_id: node for node in nodes}
+    output_refs = {
+        nodes_by_id[output.node_id].catalog_ref: output.node_id
+        for output in outputs
+        if nodes_by_id[output.node_id].catalog_ref is not None
+    }
+    output_refs.update(zip(query.dimensions, grain_ids, strict=False))
+    output_refs.update((ref, ids[ref]) for ref in query.measures)
+    if query.time_dimension is not None and query.time_dimension.granularity is not None:
+        output_refs[query.time_dimension.dimension] = grain_ids[-1]
     order: list[tuple[str, str]] = []
     unresolved_order = False
     for name, direction in query.order:
         ref = query.aliases.get(name, name)
-        order_node_id = alias_to_node.get(name) or ref_to_node.get(ref)
+        order_node_id = alias_to_node.get(name) or output_refs.get(ref) or ref_to_node.get(ref)
         if order_node_id is None:
             unresolved_order = True
             break
@@ -810,15 +820,6 @@ def build_analysis(
     complete = result_complete and scope_coverage == "complete"
     ranking: SemanticRanking | None = None
     if query.rank is not None:
-        nodes_by_id = {node.node_id: node for node in nodes}
-        output_refs = {
-            nodes_by_id[output.node_id].catalog_ref: output.node_id
-            for output in outputs
-            if nodes_by_id[output.node_id].catalog_ref is not None
-        }
-        output_refs.update(zip(query.dimensions, grain_ids, strict=False))
-        if query.time_dimension is not None and query.time_dimension.granularity is not None:
-            output_refs[query.time_dimension.dimension] = grain_ids[-1]
 
         def ranking_node(ref: str) -> str:
             canonical = query.aliases.get(ref, ref)

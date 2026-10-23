@@ -72,22 +72,23 @@ def _match_values(
     if not needle:
         return (), None, 0
     label_for = labels or {}
+    distinct_values = dict.fromkeys(values)
     exact = tuple(
         value
-        for value in values
+        for value in distinct_values
         if value.casefold() == needle or label_for.get(value, "").casefold() == needle
     )
     if exact:
         return exact[:max_candidates], "exact", len(exact)
     substring = tuple(
         value
-        for value in values
+        for value in distinct_values
         if needle in value.casefold() or needle in label_for.get(value, "").casefold()
     )
     if substring:
         return substring[:max_candidates], "substring", len(substring)
     scored: list[tuple[float, str]] = []
-    for value in values:
+    for value in distinct_values:
         score = SequenceMatcher(None, needle, value.casefold()).ratio()
         if value in label_for:
             score = max(score, SequenceMatcher(None, needle, label_for[value].casefold()).ratio())

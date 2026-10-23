@@ -7,6 +7,8 @@ packages version in lockstep. Format loosely follows
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-10-23
+
 ### Added
 
 - The planner's default structured response is `PlannerResponse` with four
@@ -32,6 +34,17 @@ packages version in lockstep. Format loosely follows
 - Partitioned ranking defaults nulls to last and runs before final global caps.
   Comparison, dense-time fill, and multi-backend federation remain unsupported;
   semantic SQL parsing does not round-trip ranking.
+
+### Fixed
+
+- Ranking resolves view-qualified measure/time references and final ordering
+  against grouped outputs, including dimension synonyms and output aliases.
+- Continuation accepts canonical generated-output references without treating
+  them as catalog fields, and rejects conflicting duplicate context results.
+- Lookup certainty counts distinct canonical keys rather than duplicate values.
+- Profiled LangChain tools export complete schemas and validate supplied fields
+  before default expansion; saved-query tools bind their own query. Repair
+  examples preserve omitted fields, and exported saved-query schemas are isolated.
 
 ## [0.12.0] - 2026-10-23
 

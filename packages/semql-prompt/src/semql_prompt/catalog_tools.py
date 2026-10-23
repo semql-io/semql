@@ -7,10 +7,12 @@ public surface (``catalog.as_dict()``, ``catalog.policy``,
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from collections.abc import Callable
+from copy import deepcopy
+from typing import TYPE_CHECKING, Any, Literal
 
-from pydantic import BaseModel, GetJsonSchemaHandler
-from pydantic_core import CoreSchema
+from pydantic.json_schema import GenerateJsonSchema, JsonSchemaMode
+from semql._schema import profile_schema
 from semql.model import AuthContext, ResolutionContext
 from semql.schema import SchemaProfile, SemanticFeature, project_schema
 
@@ -30,7 +32,7 @@ if TYPE_CHECKING:
     from semql.hooks import CubePromptHook
     from semql.model import Cube
     from semql.retrieve import Retriever
-    from semql.spec import SavedQuery
+    from semql.spec import SavedQuery, SemanticQuery
 
 
 def planner_prompt(
@@ -268,7 +270,7 @@ def to_openai_tools(
                 "function": {
                     "name": f"saved_{saved_query.name}",
                     "description": render_saved_query_tool_description(saved_query),
-                    "parameters": schema,
+                    "parameters": deepcopy(schema),
                 },
             }
         )
@@ -278,7 +280,7 @@ def to_openai_tools(
 def _profiled_query_model(
     profile: SchemaProfile,
     disabled_features: tuple[SemanticFeature | str, ...],
-) -> type[BaseModel]:
+) -> type[SemanticQuery]:
     from pydantic import ConfigDict, model_validator
     from semql.spec import SemanticQuery
 
@@ -291,7 +293,7 @@ def _profiled_query_model(
         return SemanticQuery
 
     class ProfiledSemanticQuery(SemanticQuery):
-        model_config = ConfigDict(frozen=True, extra="forbid")
+        model_config = ConfigDict(frozen=True, extra="forbid", title="SemanticQuery")
 
         @model_validator(mode="before")
         @classmethod
@@ -300,10 +302,32 @@ def _profiled_query_model(
             return value
 
         @classmethod
-        def __get_pydantic_json_schema__(
-            cls, core_schema: CoreSchema, handler: GetJsonSchemaHandler
+        def model_json_schema(
+            cls,
+            by_alias: bool = True,
+            ref_template: str = "#/$defs/{model}",
+            schema_generator: type[GenerateJsonSchema] = GenerateJsonSchema,
+            mode: JsonSchemaMode = "validation",
+            *,
+            union_format: Literal["any_of", "primitive_type_array"] = "any_of",
         ) -> dict[str, Any]:
-            return projection.schema
+            # Project only after Pydantic has assembled the complete reference
+            # graph, including recursive queries inside semi-joins.
+            canonical = super().model_json_schema(
+                by_alias=by_alias,
+                ref_template=ref_template,
+                schema_generator=schema_generator,
+                mode=mode,
+                union_format=union_format,
+            )
+            removed = frozenset(projection.disabled_features)
+            if projection.profile == SchemaProfile.STRICT:
+                removed |= frozenset(("where", "semi_joins"))
+            return profile_schema(
+                canonical,
+                removed_properties=removed,
+                strict=projection.profile == SchemaProfile.STRICT,
+            )
 
     return ProfiledSemanticQuery
 
@@ -323,6 +347,8 @@ def to_langchain_tools(
     via the shared :func:`_visible_tool_targets`."""
     from typing import cast
 
+    from semql.spec import SemanticQuery
+
     try:
         from langchain_core.tools import StructuredTool  # type: ignore[import-not-found]
     except ImportError:
@@ -332,19 +358,18 @@ def to_langchain_tools(
         ) from None
     structured_tool_cls = cast(Any, StructuredTool)
 
-    from semql.spec import SemanticQuery
-
     input_model = _profiled_query_model(profile, disabled_features)
     cubes, saved = _visible_tool_targets(catalog, viewer=viewer, only_exposed=only_exposed)
     tools: list[object] = []
     for cube in cubes:
-        _cube_ref = cube
 
-        def _run(query: SemanticQuery, *, _c: object = _cube_ref) -> dict[str, object]:
-            compiled = catalog.compile(query, viewer=viewer)
+        def _run(**query: object) -> dict[str, object]:
+            # args_schema has enforced the profile before LangChain expands
+            # defaults into keyword arguments. Reconstruct the canonical query.
+            compiled = catalog.compile(SemanticQuery.model_validate(query), viewer=viewer)
             return {"sql": compiled.sql, "params": compiled.params}
 
-        _run.__annotations__["query"] = input_model
+        _run.__annotations__ = {}
 
         tools.append(
             structured_tool_cls.from_function(
@@ -357,15 +382,19 @@ def to_langchain_tools(
             )
         )
     for sq in saved:
-        _sq_ref = sq
 
-        def _run_saved(*, _q: SavedQuery = _sq_ref) -> dict[str, object]:
-            compiled = catalog.compile(_q.query, viewer=viewer)
-            return {"sql": compiled.sql, "params": compiled.params}
+        def _saved_runner(query: SemanticQuery) -> Callable[[], dict[str, object]]:
+            def _run_saved() -> dict[str, object]:
+                compiled = catalog.compile(query, viewer=viewer)
+                return {"sql": compiled.sql, "params": compiled.params}
+
+            return _run_saved
+
+        run_saved = _saved_runner(sq.query)
 
         tools.append(
             structured_tool_cls.from_function(
-                func=_run_saved,
+                func=run_saved,
                 name=f"saved_{sq.name}",
                 description=render_saved_query_tool_description(sq),
             )

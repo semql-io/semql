@@ -3246,6 +3246,7 @@ def _emit_simple_query(env: _CompileEnv) -> CompiledQuery:
         )
 
     rank_order_hidden: dict[str, str] = {}
+    ranked_output_refs: dict[str, str] = {}
     if q.rank is not None:
         selected: dict[str, str] = {}
         for (cube, field), name in zip(env.dim_fields, env.dim_col_names, strict=True):
@@ -3260,7 +3261,12 @@ def _emit_simple_query(env: _CompileEnv) -> CompiledQuery:
             selected[f"{env.time_cube.name}.{env.time_dim.name}"] = env.alias_map.get(
                 time_col_name, time_col_name
             )
+            if q.time_dimension is not None:
+                selected[q.time_dimension.dimension] = env.alias_map.get(
+                    time_col_name, time_col_name
+                )
         selected.update({item.name: item.name for item in q.derived_measures})
+        ranked_output_refs.update(selected)
         window_columns = list(columns)
         used_rank_names = set(window_columns)
         for ref, _direction in env.plan.order.keys:
@@ -3293,6 +3299,13 @@ def _emit_simple_query(env: _CompileEnv) -> CompiledQuery:
                     f"Ranking reference {ref!r} must name a selected grouped output."
                 )
             return name
+
+        ranked_output_refs.update(
+            {
+                ref: selected.get(q.aliases.get(ref, ref), selected.get(ref, ref))
+                for ref in (*q.dimensions, *q.measures)
+            }
+        )
 
         partition_names = [rank_output(ref) for ref in q.rank.partition_by]
         grouping_refs = {f"{cube.name}.{field.name}" for cube, field in env.dim_fields}
@@ -3499,12 +3512,24 @@ def _emit_simple_query(env: _CompileEnv) -> CompiledQuery:
     qualified_to_output: dict[str, str] = {}
     for (dim_cube, d), col_name in zip(env.dim_fields, env.dim_col_names, strict=True):
         qualified_to_output[f"{dim_cube.name}.{d.name}"] = env.alias_map.get(col_name, col_name)
+        for synonym in d.aliases:
+            qualified_to_output[f"{dim_cube.name}.{synonym}"] = env.alias_map.get(
+                col_name, col_name
+            )
+    for ref, col_name in zip(q.dimensions, env.dim_col_names, strict=True):
+        qualified_to_output[ref] = env.alias_map.get(col_name, col_name)
+    for ref, col_name in zip(q.measures, measure_col_names, strict=True):
+        qualified_to_output[ref] = env.alias_map.get(col_name, col_name)
     for (m_cube, m), col_name in zip(env.measure_fields, measure_col_names, strict=True):
         qualified_to_output[f"{m_cube.name}.{m.name}"] = env.alias_map.get(col_name, col_name)
     if env.time_cube is not None and env.time_dim is not None and time_col_name is not None:
         qualified_to_output[f"{env.time_cube.name}.{env.time_dim.name}"] = env.alias_map.get(
             time_col_name, time_col_name
         )
+        if q.time_dimension is not None:
+            qualified_to_output[q.time_dimension.dimension] = env.alias_map.get(
+                time_col_name, time_col_name
+            )
 
     for ref, direction in env.plan.order.keys:
         if ref.startswith("compare."):
@@ -3516,11 +3541,30 @@ def _emit_simple_query(env: _CompileEnv) -> CompiledQuery:
         hidden_order_name = rank_order_hidden.get(ref) if q.rank is not None else None
         if hidden_order_name is not None:
             order_target: exp.Expression = exp.column(hidden_order_name, table="_semql_ranked")
-        # Qualified ref to a selected field → its output-column alias.
+        elif q.rank is not None:
+            ranked_name = ranked_output_refs.get(ref)
+            if ranked_name is None:
+                ranked_name = qualified_to_output.get(ref)
+            if ranked_name is None:
+                ranked_name = ranked_output_refs.get(q.aliases.get(ref, ref))
+            if ranked_name is None:
+                try:
+                    ranked_cube, ranked_field = _resolve_field(ref, env.catalog)
+                except CompileError:
+                    ranked_name = None
+                else:
+                    ranked_name = ranked_output_refs.get(f"{ranked_cube.name}.{ranked_field.name}")
+            if ranked_name is not None:
+                order_target = exp.column(ranked_name, table="_semql_ranked")
+            elif ref in measure_alias_map or ref in columns:
+                order_target = exp.column(ref, table="_semql_ranked")
+            else:
+                raise CompileError(
+                    f"ORDER BY {ref!r}: must reference a selected ranked output "
+                    "or an unprojected measure."
+                )
         elif ref in qualified_to_output:
             order_target = exp.column(qualified_to_output[ref])
-        # Alias key / bare name — already in the columns list or the
-        # measure alias map, so order by the output column directly.
         elif ref in measure_alias_map or ref in columns:
             order_target = exp.column(ref)
         else:
@@ -3532,11 +3576,6 @@ def _emit_simple_query(env: _CompileEnv) -> CompiledQuery:
                     f"a known cube.field. ({exc})"
                 ) from exc
             if isinstance(fld, Measure):
-                # Ordering by an *unprojected* measure: emit its aggregate
-                # (``SUM(o.amount)``), never the raw inner column. A GROUP BY
-                # query rejects a bare column in ORDER BY with a
-                # NOT_AN_AGGREGATE-class error — the same failure the
-                # projected-measure branch above guards against.
                 order_target = env.build_measure_expr(owner_cube, fld)
             else:
                 order_target = env.parse(fld.sql)

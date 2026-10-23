@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any, cast
 
+# jsonschema supplies no inline typing; validate the actual provider schema.
+from jsonschema import Draft202012Validator  # type: ignore[import-untyped]
 from semql import AuthContext, Catalog, Cube, Dialect, Dimension
 from semql.schema import SchemaProfile, SemanticFeature
 from semql_prompt.bedrock import to_bedrock_converse_tools
@@ -202,3 +204,56 @@ def test_continuation_is_required_context_not_budget_trimmable() -> None:
     assert not result.fits
     assert "## REQUIRED CONTINUATION" in result.text
     assert result.token_count == len(result.text)
+
+
+def test_profiled_langchain_schema_generation_preserves_registered_refs_and_shape() -> None:
+    # Exercise provider argument models even without the optional LangChain runtime.
+    from semql_prompt.catalog_tools import (
+        _profiled_query_model,  # pyright: ignore[reportPrivateUsage]
+    )
+
+    strict_model = _profiled_query_model(SchemaProfile.STRICT, ())
+    strict_schema = strict_model.model_json_schema()
+    Draft202012Validator.check_schema(strict_schema)
+    semantic = _semantic_query_schema(strict_schema)
+    assert "where" not in semantic["properties"]
+    assert "semi_joins" not in semantic["properties"]
+    assert strict_schema["type"] == "object"
+    assert "measures" in semantic["properties"]
+    try:
+        strict_model.model_validate({"where": None})
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("strict profiled model accepted an explicitly omitted feature")
+
+
+def test_disabled_rank_profiled_schema_keeps_recursive_tool_shape() -> None:
+    # Exercise provider argument models even without the optional LangChain runtime.
+    from semql_prompt.catalog_tools import (
+        _profiled_query_model,  # pyright: ignore[reportPrivateUsage]
+    )
+
+    model = _profiled_query_model(SchemaProfile.TOOL, (SemanticFeature.RANK,))
+    schema = model.model_json_schema()
+    Draft202012Validator.check_schema(schema)
+    semantic = _semantic_query_schema(schema)
+    assert "rank" not in semantic["properties"]
+    assert "semi_joins" in semantic["properties"]
+    assert "where" in semantic["properties"]
+    assert schema["$defs"]["SemiJoin"]["properties"]["source"]["$ref"].endswith("/SemanticQuery")
+
+    try:
+        model.model_validate(
+            {
+                "rank": {
+                    "partition_by": ["orders.region"],
+                    "order_by": [{"field": "orders.revenue", "direction": "desc"}],
+                    "count": 1,
+                }
+            }
+        )
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("rank-disabled profiled model accepted rank")

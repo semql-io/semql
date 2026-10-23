@@ -116,6 +116,9 @@ class ContinuationState(ContinuationModel):
         requests = {request.request_id: request.decision_id for request in self.context_requests}
         if len(requests) != len(self.context_requests):
             raise ValueError("continuation context request IDs must be unique")
+        result_ids = [result.request_id for result in self.context_results]
+        if len(result_ids) != len(set(result_ids)):
+            raise ValueError("continuation context results must be unique per request")
         if any(
             requests.get(result.request_id) != result.decision_id for result in self.context_results
         ):
@@ -185,23 +188,23 @@ def _all_query_refs(query: SemanticQuery) -> tuple[list[str], set[str]]:
     refs = [*query.measures, *query.dimensions, *query.segments]
     cube_refs = set(query.left_joins)
     aliases = dict(query.aliases)
-    derived_names = {item.name for item in query.derived_measures}
-    selected_by_name: dict[str, list[str]] = {}
-    for ref in refs:
-        if "." in ref:
-            selected_by_name.setdefault(ref.rsplit(".", 1)[-1], []).append(ref)
 
     def normalize_output_ref(ref: str) -> str | None:
-        if "." in ref:
-            return ref
         if ref in aliases:
             return aliases[ref]
-        if ref in derived_names:
+        # Bare names and comparison facets refer to generated outputs, not
+        # catalog fields. Their source inputs are collected separately below;
+        # the compiler validates output existence before acceptance.
+        if "." not in ref or (query.compare is not None and ref.startswith("compare.")):
             return None
-        matches = selected_by_name.get(ref, [])
-        return matches[0] if len(matches) == 1 else ref
+        return ref
 
-    refs.extend(item.dimension for item in (*query.filters, *query.having))
+    refs.extend(item.dimension for item in query.filters)
+    refs.extend(
+        resolved
+        for item in query.having
+        if (resolved := normalize_output_ref(item.dimension)) is not None
+    )
     if query.time_dimension is not None:
         refs.append(query.time_dimension.dimension)
     refs.extend(aliases.values())

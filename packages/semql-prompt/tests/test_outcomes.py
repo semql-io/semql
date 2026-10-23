@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 from semql import QueryPlan
+from semql_prompt.continuation import ContinuationState
 from semql_prompt.outcomes import (
     CannotPlan,
     ContextRequest,
@@ -136,3 +137,33 @@ def test_cannot_plan_requires_safe_nonempty_diagnostics() -> None:
         {"diagnostics": [{"code": "invalid", "reason": "select * from customers"}]}
     )
     assert result.diagnostics[0].reason == "contract_violation"
+
+
+@pytest.mark.parametrize("host_state", [False, True])
+def test_duplicate_context_results_reject_contradictory_evidence(host_state: bool) -> None:
+    requests = [
+        {"request_id": "r1", "decision_id": "d1", "kind": "lookup", "target": "orders.region"}
+    ]
+    results = [
+        {"request_id": "r1", "decision_id": "d1", "status": "not_found", "complete": True},
+        {"request_id": "r1", "decision_id": "d1", "status": "unavailable", "complete": False},
+    ]
+    with pytest.raises(ValidationError):
+        if host_state:
+            ContinuationState.model_validate(
+                {
+                    "request_id": "turn",
+                    "revision": 1,
+                    "baseline": {
+                        "steps": [
+                            {"query": {"dimensions": ["orders.region"]}, "intent": "headline"}
+                        ]
+                    },
+                    "authorized_cubes": ["orders"],
+                    "visibility_revision": "v1",
+                    "context_requests": requests,
+                    "context_results": results,
+                }
+            )
+        else:
+            NeedContext.model_validate({"requests": requests, "results": results})

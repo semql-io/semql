@@ -16,6 +16,8 @@ to_langchain_tools(catalog, *, viewer, policy) -> list[StructuredTool]  (soft im
 
 from __future__ import annotations
 
+from typing import Any, cast
+
 import pytest
 from semql import (
     AuthContext,
@@ -249,6 +251,81 @@ def test_openai_tools_expose_saved_queries_with_role_gating() -> None:
         for t in to_openai_tools(cat, viewer=AuthContext(viewer_id="u", roles=["admin"]))
     }
     assert "saved_admin_report" in admin
+
+
+def test_openai_parameter_schemas_do_not_alias_across_saved_queries() -> None:
+    from semql import SemanticQuery
+    from semql.spec import SavedQuery
+
+    catalog = Catalog(
+        [_cube()],
+        saved_queries=[
+            SavedQuery(name="first", query=SemanticQuery()),
+            SavedQuery(name="second", query=SemanticQuery()),
+        ],
+    )
+    tools = to_openai_tools(catalog)
+    first, second = (
+        tool["function"] for tool in tools if tool["function"]["name"].startswith("saved_")
+    )
+    first["parameters"]["properties"]["limit"]["x-test-mutation"] = {"nested": []}
+    assert "x-test-mutation" not in second["parameters"]["properties"]["limit"]
+
+
+@pytest.mark.parametrize("profile", ["tool", "strict"])
+def test_langchain_tools_generate_schema_and_invoke_public_contract(profile: str) -> None:
+    pytest.importorskip("langchain_core")
+    import duckdb
+
+    # jsonschema supplies no inline typing; validate the actual provider schema.
+    from jsonschema import Draft202012Validator  # type: ignore[import-untyped]
+    from semql import SavedQuery, SemanticQuery
+    from semql.schema import SchemaProfile
+
+    catalog = Catalog(
+        [
+            Cube(
+                name="orders",
+                dialect=Dialect.DUCKDB,
+                table="orders",
+                alias="o",
+                measures=[Measure(name="revenue", sql="{o}.amount", agg="sum")],
+                dimensions=[Dimension(name="region", sql="{o}.region", type="string")],
+            )
+        ],
+        saved_queries=[
+            SavedQuery(name="total", query=SemanticQuery(measures=["orders.revenue"])),
+            SavedQuery(
+                name="regions",
+                query=SemanticQuery(
+                    measures=["orders.revenue"],
+                    dimensions=["orders.region"],
+                    order=[("orders.region", "asc")],
+                ),
+            ),
+        ],
+    )
+    # The optional adapter deliberately returns opaque objects without importing
+    # LangChain into the package's public type surface.
+    exported = cast(list[Any], to_langchain_tools(catalog, profile=SchemaProfile(profile)))
+    tools = {tool.name: tool for tool in exported}
+    cube_tool = tools["query_orders"]
+    payload = {"measures": ["orders.revenue"]}
+    validator = cast(Any, Draft202012Validator(cube_tool.args_schema.model_json_schema()))
+    validator.validate(payload)
+    if profile == "strict":
+        with pytest.raises(ValueError, match="where"):
+            cube_tool.invoke({**payload, "where": None})
+    with duckdb.connect() as connection:
+        connection.execute("CREATE TABLE orders(region VARCHAR, amount INTEGER)")
+        connection.execute("INSERT INTO orders VALUES ('A', 10), ('A', 20), ('B', 5)")
+        for name, arguments, expected in [
+            ("query_orders", payload, [(35,)]),
+            ("saved_total", {}, [(35,)]),
+            ("saved_regions", {}, [("A", 30), ("B", 5)]),
+        ]:
+            compiled = tools[name].invoke(arguments)
+            assert connection.execute(compiled["sql"], compiled["params"]).fetchall() == expected
 
 
 def test_visible_tool_targets_is_the_shared_decision() -> None:

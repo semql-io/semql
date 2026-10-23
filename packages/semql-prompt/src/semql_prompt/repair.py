@@ -318,8 +318,9 @@ def apply_prompt_augmentation(
         profile,
         disabled_features=disabled_features,
     )
-    projection.validate_payload(augmentation.model_dump(mode="json", exclude_unset=True))
-    proposal = PromptAugmentation.model_validate(augmentation.model_dump())
+    supplied = augmentation.model_dump(mode="json", exclude_unset=True)
+    projection.validate_payload(supplied)
+    proposal = PromptAugmentation.model_validate(supplied)
     baseline = build_adaptive_prompt(
         catalog,
         request,

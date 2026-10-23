@@ -1,9 +1,8 @@
 # Planner, schema-profile, continuation, and ranking migration
 
-This change tightens semantic query inputs and changes the query generator's
+Version 0.13.0 tightens semantic query inputs and changes the query generator's
 outer response contract. Update integrations before relying on the new
-planner, continuation, or ranking behavior. It does not imply a package-version
-change.
+planner, continuation, or ranking behavior.
 
 ## Strict canonical query inputs and plans
 

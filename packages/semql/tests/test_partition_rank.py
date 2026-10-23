@@ -1,11 +1,11 @@
-from __future__ import annotations
+from datetime import datetime
 
 import duckdb
 import pytest
 from pydantic import ValidationError
 from semql.analysis import CatalogContext, compare_analysis
 from semql.compile import CompiledQuery, CompileError, compile_plan, compile_query, explain_plan
-from semql.model import AuthContext, Cube, Dialect, Dimension, Measure
+from semql.model import AuthContext, Cube, Dialect, Dimension, Measure, TimeDimension, View
 from semql.parse import ParseError, parse_sql_statement
 from semql.spec import (
     CompareWindow,
@@ -26,13 +26,19 @@ def _catalog() -> dict[str, Cube]:
         table="sales",
         alias="s",
         dimensions=[
-            Dimension(name="region", sql="{s}.region", type="string"),
+            Dimension(
+                name="region",
+                sql="{s}.region",
+                type="string",
+                aliases=["territory"],
+            ),
             Dimension(name="year", sql="{s}.year", type="number"),
         ],
         measures=[
             Measure(name="revenue", sql="{s}.revenue", agg="sum", unit="currency"),
             Measure(name="cost", sql="{s}.cost", agg="sum", unit="currency"),
         ],
+        time_dimensions=[TimeDimension(name="created_at", sql="{s}.created_at", type="time")],
     )
     return {cube.name: cube}
 
@@ -40,17 +46,18 @@ def _catalog() -> dict[str, Cube]:
 def _execute(compiled: CompiledQuery) -> list[tuple[object, ...]]:
     with duckdb.connect() as connection:
         connection.execute(
-            "CREATE TABLE sales(region VARCHAR, year INTEGER, revenue INTEGER, cost INTEGER)"
+            "CREATE TABLE sales("
+            "region VARCHAR, year INTEGER, revenue INTEGER, cost INTEGER, created_at TIMESTAMP)"
         )
         connection.executemany(
-            "INSERT INTO sales VALUES (?, ?, ?, ?)",
+            "INSERT INTO sales VALUES (?, ?, ?, ?, ?)",
             [
-                ("east", 2024, 5, 1),
-                ("east", 2024, 10, 1),
-                ("east", 2025, 20, 10),
-                ("east", 2026, 20, 8),
-                ("west", 2024, 30, 3),
-                ("west", 2025, None, 4),
+                ("east", 2024, 5, 1, "2026-01-02"),
+                ("east", 2024, 10, 1, "2026-01-05"),
+                ("east", 2025, 20, 10, "2026-01-12"),
+                ("east", 2026, 20, 8, "2026-01-20"),
+                ("west", 2024, 30, 3, "2026-01-03"),
+                ("west", 2025, None, 4, "2026-02-03"),
             ],
         )
         return connection.execute(compiled.sql, compiled.params).fetchall()
@@ -121,6 +128,105 @@ def test_rank_semantics_compare_and_ignore_output_aliases() -> None:
         compare_analysis(base.analysis, changed.analysis, scope="result").outcome.value
         == "different"
     )
+
+
+def test_view_qualified_rank_measure_preserves_semantic_equivalence() -> None:
+    context = CatalogContext(namespace="sales", semantic_revision="r1")
+    views = {
+        "v": View(
+            name="v",
+            fields={"revenue": "sales.revenue", "region": "sales.region"},
+        )
+    }
+    canonical = compile_query(
+        SemanticQuery(
+            measures=["sales.revenue"],
+            dimensions=["sales.region"],
+            rank=PartitionRank(
+                order_by=[RankOrder(field="sales.revenue", direction="desc")],
+                count=1,
+            ),
+        ),
+        _catalog(),
+        catalog_context=context,
+    )
+    view_query = compile_query(
+        SemanticQuery(
+            measures=["v.revenue"],
+            dimensions=["sales.region"],
+            rank=PartitionRank(
+                order_by=[RankOrder(field="v.revenue", direction="desc")],
+                count=1,
+            ),
+        ),
+        _catalog(),
+        views=views,
+        catalog_context=context,
+    )
+    assert compare_analysis(
+        canonical.analysis, view_query.analysis, scope="result"
+    ).outcome.value == ("equivalent")
+    assert _execute(view_query) == [("east", 55)]
+
+
+def test_view_qualified_time_partition_and_final_order_compile() -> None:
+    views = {
+        "v": View(
+            name="v",
+            fields={
+                "revenue": "sales.revenue",
+                "region": "sales.region",
+                "created_at": "sales.created_at",
+            },
+        )
+    }
+    query = SemanticQuery(
+        measures=["v.revenue"],
+        dimensions=["v.region"],
+        time_dimension=TimeWindow(
+            dimension="v.created_at",
+            granularity="day",
+            range=("2026-01-01", "2026-02-01"),
+        ),
+        rank=PartitionRank(
+            partition_by=["v.created_at"],
+            order_by=[RankOrder(field="v.revenue", direction="desc")],
+            count=1,
+        ),
+        order=[("v.region", "asc"), ("v.created_at", "asc")],
+    )
+    compiled = compile_query(query, _catalog(), views=views)
+    assert compiled.columns == ["region", "created_at_day", "revenue"]
+    assert _execute(compiled) == [
+        ("east", datetime(2026, 1, 2), 5),
+        ("east", datetime(2026, 1, 5), 10),
+        ("east", datetime(2026, 1, 12), 20),
+        ("east", datetime(2026, 1, 20), 20),
+        ("west", datetime(2026, 1, 3), 30),
+    ]
+
+
+@pytest.mark.parametrize("use_plan", [False, True])
+@pytest.mark.parametrize("order_ref", ["sales.territory", "area"])
+def test_ranked_final_order_uses_selected_output_alias_and_synonym(
+    use_plan: bool, order_ref: str
+) -> None:
+    query = SemanticQuery(
+        measures=["sales.revenue"],
+        dimensions=["sales.territory"],
+        aliases={"area": "sales.territory"},
+        rank=PartitionRank(
+            order_by=[RankOrder(field="sales.revenue", direction="desc")],
+            count=2,
+        ),
+        order=[(order_ref, "asc")],
+    )
+    catalog = _catalog()
+    if use_plan:
+        compiled = compile_plan(explain_plan(query, catalog), catalog)
+    else:
+        compiled = compile_query(query, catalog)
+    assert _execute(compiled) == [("east", 55), ("west", 30)]
 
 
 def test_grouped_rank_is_post_aggregate_and_pre_global_cap() -> None:

@@ -2,7 +2,7 @@
 
 ## Scope and authorization
 
-Implement GitHub enhancements #15, #17, and #18; #16 is excluded. Open a PR against main. Do not merge, tag, release, or publish. Base: main 187162ce86ac455ce9a803306222d6224fcb78bd. Work in `.worktrees/feat/planner-contracts-ranking` on `feat/planner-contracts-ranking`.
+Implement GitHub enhancements #15, #17, and #18; #16 is excluded. Base: main 187162ce86ac455ce9a803306222d6224fcb78bd. Work in `.worktrees/feat/planner-contracts-ranking` on `feat/planner-contracts-ranking`. Initial authorization covered implementation and PR creation only. After PR #20 opened, the user authorized self-review, a version bump, merge, and publication once all checks pass.
 
 ## Agreed product decisions
 
@@ -10,7 +10,7 @@ Implement GitHub enhancements #15, #17, and #18; #16 is excluded. Open a PR agai
 - Library-enforced continuation locks. The host owns conversation state, retrieval, model calls, authorization, budgets, and termination.
 - Partitioned ranking supports single-backend grouped queries including derived measures. Comparison, dense-time fill, and federated ranking are explicitly unsupported.
 - Exact-N ranking automatically appends remaining grouping keys in a disclosed deterministic order. Boundary-inclusive ties use only score keys, never the appended tie breakers.
-- Canonical semantic query input models reject unknown fields. This is an intentional pre-v1 compatibility break, documented without performing a release/version bump.
+- Canonical semantic query input models reject unknown fields. This is an intentional pre-v1 compatibility break, released with a lockstep minor version bump.
 
 ## Terminology and invariants
 
@@ -57,8 +57,8 @@ Parent owns public export consolidation, shared capability-check integration, RE
 ## Implementation and verification
 
 Implemented the three agreed enhancements on `feat/planner-contracts-ranking`.
-Issue #16 remains excluded. Package versions remain unchanged at `0.12.0`;
-the changes are recorded under Unreleased.
+Issue #16 remains excluded. Following self-review, all eight packages and their
+internal dependency ranges advance from `0.12.0` to `0.13.0`.
 
 - `SchemaProfile`, `SchemaProjection`, and `GenerationContract` pair schemas with
   matching guidance, expose projection losses, and canonically validate nested
@@ -112,3 +112,40 @@ Verification completed locally:
 
 No live model/provider or BigQuery/Snowflake warehouse was used. Local artifact
 builds are verification only, not a release or publication.
+
+## Pre-release self-review
+
+Three independent source reviews and public-API probes found and repaired:
+
+- View-qualified ranking measures/time buckets and synonym-based final ordering.
+- Continuation scope checks incorrectly treating HAVING/comparison/time-output
+  references as catalog fields.
+- Conflicting duplicate context results and repeated canonical lookup values.
+- Pydantic provider-schema reference registration, LangChain argument default
+  expansion, saved-query binding, and mutable shared parameter schemas.
+- Repair-example normalization exposing omitted, profile-forbidden defaults.
+
+The repaired public API probes execute ranked queries through view/time/synonym
+references, accept generated-output continuations, export strict LangChain
+schemas, and preserve profile-compatible examples. Targeted verification,
+versioned full checks, artifact evidence, and release gates are recorded below.
+
+### Version 0.13.0 verification
+
+- Native `just check` with disposable PostgreSQL/ClickHouse conformance enabled:
+  **3,530 passed, 6 skipped, 1 xfailed; 78 snapshots passed**. Ruff, mypy
+  (280 files), Pyright, Tach, core-boundary and frozen-model guards passed.
+- The seven focused regression modules passed **115 tests** with LangChain
+  enabled. After the version bump, optional provider/profile tests passed
+  **30 tests**, including real DuckDB execution of cube and saved-query tools.
+- Ranking, continuation, and repair demos passed at 0.13.0. Public probes also
+  executed view/time/synonym ranking and accepted generated-output continuations.
+- Static API comparison against the original main base reported no breaks in
+  its three inspected modules; behavioral breaks remain documented above.
+- All eight 0.13.0 packages built as wheels and sdists. All 16 artifacts passed
+  Twine; isolated installed-wheel dependency/import/compile/serialization/
+  DuckDB execution smoke passed.
+
+PR #20 must pass checks on the final versioned head before merge. The merge
+commit must pass main CI before tagging and publishing 0.13.0. Publication uses
+the existing OIDC release workflow; no credentials or publishing settings change.

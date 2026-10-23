@@ -99,6 +99,9 @@ class NeedContext(OutcomeModel):
         decisions = [request.decision_id for request in self.requests]
         if len(correlations) != len(self.requests) or len(decisions) != len(set(decisions)):
             raise ValueError("context request and decision identifiers must be unique")
+        result_ids = [result.request_id for result in self.results]
+        if len(result_ids) != len(set(result_ids)):
+            raise ValueError("context results must be unique per request")
         if any(
             correlations.get(result.request_id) != result.decision_id for result in self.results
         ):

@@ -11,6 +11,7 @@ are ``ambiguous`` (a structured refusal carrying candidates), none is
 
 from __future__ import annotations
 
+import pytest
 from semql import Catalog, Cube, Dialect, Dimension, Filter, Join, Lookup, Measure, SemanticQuery
 from semql.lookups import (
     QueryResolution,
@@ -260,3 +261,21 @@ def test_resolution_then_autoplan_injects_semi_join_with_canonical_value() -> No
     assert sj.select == "customers.id"
     # The canonical value (not the free-text "emea") rides into the inner source.
     assert sj.source.filters == [Filter(dimension="customers.region", op="eq", values=["EMEA"])]
+
+
+@pytest.mark.parametrize("query", ["EMEA", "EM", "EMEAx"])
+def test_lookup_certainty_counts_distinct_canonical_keys(query: str) -> None:
+    catalog = Catalog(
+        cubes=list(_catalog()),
+        lookups=[Lookup(dimension="orders.region", values=("EMEA", "EMEA"))],
+    )
+    outcome = resolve_outcome(catalog, "orders.region", query, max_candidates=1)
+    assert outcome.values == ("EMEA",)
+    assert outcome.total_candidates == 1
+    assert outcome.complete and not outcome.truncated
+    if query == "EMEAx":
+        assert outcome.status == "ambiguous"
+        assert not outcome.authoritative
+    else:
+        assert outcome.status == "resolved"
+        assert outcome.authoritative
