@@ -22,6 +22,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from difflib import SequenceMatcher
+from types import MappingProxyType
 from typing import Any, Literal
 
 from semql.analysis import EnrichmentProvenance, SemanticAnalysis
@@ -64,6 +65,39 @@ def materialize(
 # ---------------------------------------------------------------------------
 
 
+def _match_values(
+    values: list[str], labels: dict[str, str] | None, query: str, max_candidates: int
+) -> tuple[tuple[str, ...], Literal["exact", "substring", "fuzzy"] | None, int]:
+    needle = query.strip().casefold()
+    if not needle:
+        return (), None, 0
+    label_for = labels or {}
+    distinct_values = dict.fromkeys(values)
+    exact = tuple(
+        value
+        for value in distinct_values
+        if value.casefold() == needle or label_for.get(value, "").casefold() == needle
+    )
+    if exact:
+        return exact[:max_candidates], "exact", len(exact)
+    substring = tuple(
+        value
+        for value in distinct_values
+        if needle in value.casefold() or needle in label_for.get(value, "").casefold()
+    )
+    if substring:
+        return substring[:max_candidates], "substring", len(substring)
+    scored: list[tuple[float, str]] = []
+    for value in distinct_values:
+        score = SequenceMatcher(None, needle, value.casefold()).ratio()
+        if value in label_for:
+            score = max(score, SequenceMatcher(None, needle, label_for[value].casefold()).ratio())
+        if score >= 0.5:
+            scored.append((score, value))
+    scored.sort(key=lambda item: -item[0])
+    return tuple(value for _, value in scored[:max_candidates]), "fuzzy", len(scored)
+
+
 def resolve(
     catalog: Catalog,
     dimension: str,
@@ -72,69 +106,23 @@ def resolve(
     ctx: ResolutionContext | None = None,
     max_candidates: int = 5,
 ) -> list[str]:
-    """Resolve a free-text ``query`` against the values of ``dimension``.
+    """Return bounded candidates, not evidence of unique authoritative resolution.
 
-    ``dimension`` is the qualified ``cube.dim`` reference the Lookup
-    was registered under. Returns canonical values (the lookup's *keys*,
-    not labels) ranked best-match-first:
-
-    1. Exact case-insensitive match against a canonical value or its
-       label — returns a single-element list.
-    2. Case-insensitive substring matches against canonical values and
-       labels, preserving the lookup's declaration order.
-    3. Fuzzy similarity fallback (``difflib.SequenceMatcher`` ratio
-       against both canonical values and labels), up to
-       ``max_candidates`` results.
-
-    Returns an empty list when nothing matches — callers should treat
-    that as "ask the user to clarify."
-
-    Raises ``KeyError`` when ``dimension`` has no registered ``Lookup``.
+    Use :func:`resolve_outcome` for status, authority, and completeness. A
+    single returned candidate may be fuzzy or drawn from a truncated list.
     """
     if dimension not in catalog.lookups:
         raise KeyError(
             f"No Lookup registered for {dimension!r}. Registered: {sorted(catalog.lookups)}."
         )
-    materialized = materialize(catalog.lookups[dimension], ctx)
-    if materialized is None:
-        # Dynamic lookup with no context — surface as empty rather
-        # than guessing.
+    if max_candidates < 1:
+        raise ValueError("max_candidates must be positive")
+    values_labels = materialize(catalog.lookups[dimension], ctx)
+    if values_labels is None:
         return []
-    values, labels = materialized
-    if not values:
-        return []
-
-    needle = query.strip().lower()
-    if not needle:
-        return []
-
-    label_for: dict[str, str] = labels or {}
-
-    # Tier 1: exact case-insensitive match (against value or label).
-    for v in values:
-        if v.lower() == needle:
-            return [v]
-        if label_for.get(v, "").lower() == needle:
-            return [v]
-
-    # Tier 2: substring match (value or label).
-    substring_hits = [
-        v for v in values if needle in v.lower() or needle in label_for.get(v, "").lower()
-    ]
-    if substring_hits:
-        return substring_hits[:max_candidates]
-
-    # Tier 3: fuzzy similarity over (value or label) — rank by best ratio.
-    scored: list[tuple[float, str]] = []
-    for v in values:
-        best = SequenceMatcher(None, needle, v.lower()).ratio()
-        if v in label_for:
-            best = max(best, SequenceMatcher(None, needle, label_for[v].lower()).ratio())
-        scored.append((best, v))
-    # Keep matches above a modest threshold so we don't return junk
-    # candidates for completely unrelated queries.
-    candidates = sorted(scored, key=lambda s: s[0], reverse=True)
-    return [v for score, v in candidates if score >= 0.5][:max_candidates]
+    values, labels = values_labels
+    matches, _match_kind, _total = _match_values(values, labels, query, max_candidates)
+    return list(matches)
 
 
 # ---------------------------------------------------------------------------
@@ -149,18 +137,22 @@ _RESOLVABLE_OPS: frozenset[FilterOp] = frozenset({"eq", "neq", "in", "not_in"})
 
 @dataclass(frozen=True)
 class ResolutionOutcome:
-    """The result of resolving one free-text value against a dimension's Lookup.
-
-    ``status`` classifies :func:`resolve` output: ``resolved`` (exactly one
-    canonical hit — splice it), ``ambiguous`` (several; a structured refusal
-    carrying the candidates so the caller / LLM re-issues), or ``unresolved``
-    (none). Never an exception — a blocked outcome loses no data."""
+    """One bounded lookup result with explicit authority and completeness."""
 
     dimension: str
     query: str
-    status: Literal["resolved", "ambiguous", "unresolved"]
+    status: Literal["resolved", "ambiguous", "not_found", "unavailable"]
     values: tuple[str, ...] = ()
-    labels: dict[str, str] | None = None
+    labels: Mapping[str, str] | None = None
+    match_kind: Literal["exact", "substring", "fuzzy"] | None = None
+    authoritative: bool = False
+    complete: bool = True
+    truncated: bool = False
+    total_candidates: int = 0
+
+    def __post_init__(self) -> None:
+        if self.labels is not None:
+            object.__setattr__(self, "labels", MappingProxyType(dict(self.labels)))
 
     @property
     def resolved(self) -> bool:
@@ -168,28 +160,11 @@ class ResolutionOutcome:
 
     @property
     def value(self) -> str:
-        """The single canonical value; only valid when ``resolved``."""
-        if self.status != "resolved":
+        if not self.resolved:
             raise ValueError(
-                f"ResolutionOutcome for {self.dimension!r}={self.query!r} is "
-                f"{self.status!r}, not resolved; inspect ``values`` instead."
+                f"Resolution for {self.dimension!r} is {self.status!r}; inspect values."
             )
         return self.values[0]
-
-
-def _labels_for(
-    catalog: Catalog, dimension: str, values: list[str], ctx: ResolutionContext | None
-) -> dict[str, str] | None:
-    """Human labels for ``values``, drawn from the lookup's label map (subset to
-    the candidates). ``None`` when the lookup carries no labels."""
-    materialized = materialize(catalog.lookups[dimension], ctx)
-    if materialized is None:
-        return None
-    _, labels = materialized
-    if not labels:
-        return None
-    sub = {v: labels[v] for v in values if v in labels}
-    return sub or None
 
 
 def resolve_outcome(
@@ -200,18 +175,46 @@ def resolve_outcome(
     ctx: ResolutionContext | None = None,
     max_candidates: int = 5,
 ) -> ResolutionOutcome:
-    """Resolve a free-text ``query`` against ``dimension`` into a typed outcome.
-
-    Wraps :func:`resolve`: zero hits -> ``unresolved``; exactly one ->
-    ``resolved``; several -> ``ambiguous`` (the ranked candidates). Raises
-    ``KeyError`` when ``dimension`` has no registered ``Lookup`` (same contract
-    as :func:`resolve`)."""
-    candidates = resolve(catalog, dimension, query, ctx=ctx, max_candidates=max_candidates)
-    if not candidates:
-        return ResolutionOutcome(dimension, query, "unresolved")
-    labels = _labels_for(catalog, dimension, candidates, ctx)
-    status: Literal["resolved", "ambiguous"] = "resolved" if len(candidates) == 1 else "ambiguous"
-    return ResolutionOutcome(dimension, query, status, tuple(candidates), labels)
+    """Resolve once, preserving certainty before candidate truncation."""
+    if dimension not in catalog.lookups:
+        raise KeyError(
+            f"No Lookup registered for {dimension!r}. Registered: {sorted(catalog.lookups)}."
+        )
+    if max_candidates < 1:
+        raise ValueError("max_candidates must be positive")
+    try:
+        materialized = materialize(catalog.lookups[dimension], ctx)
+    except Exception:
+        return ResolutionOutcome(dimension, query, "unavailable", complete=False)
+    if materialized is None:
+        return ResolutionOutcome(dimension, query, "unavailable", complete=False)
+    values, all_labels = materialized
+    matches, match_kind, total = _match_values(values, all_labels, query, max_candidates)
+    labels = (
+        {value: all_labels[value] for value in matches if value in all_labels} or None
+        if all_labels
+        else None
+    )
+    truncated = total > len(matches)
+    complete = not truncated
+    if total == 0:
+        return ResolutionOutcome(dimension, query, "not_found")
+    authoritative = match_kind != "fuzzy" and total == 1 and not truncated
+    status: Literal["resolved", "ambiguous", "not_found", "unavailable"] = (
+        "resolved" if authoritative else "ambiguous"
+    )
+    return ResolutionOutcome(
+        dimension,
+        query,
+        status,
+        matches,
+        labels,
+        match_kind,
+        authoritative,
+        complete,
+        truncated,
+        total,
+    )
 
 
 @dataclass(frozen=True)

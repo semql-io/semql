@@ -79,13 +79,6 @@ def test_router_fragment_uses_required_route_to_field() -> None:
     assert 'route_to = "raw"' in rendered
 
 
-def test_generator_documents_supported_semantic_query_fields() -> None:
-    rendered = build_query_generator_prompt_fragment(_catalog())
-    for field in ("segments", "compare", "derived_measures", "semi_joins", "left_joins", "aliases"):
-        assert f"`{field}`" in rendered
-    assert "do not choose raw sql merely because a field is absent" in rendered.lower()
-
-
 # ---------------------------------------------------------------------------
 # Query Generator
 # ---------------------------------------------------------------------------

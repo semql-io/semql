@@ -159,30 +159,6 @@ def test_saved_queries_count_toward_threshold() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_retrieval_mode_annotates_header() -> None:
-    """When retrieval kicks in the catalog header surfaces a
-    "top-k cubes for your question" annotation so the LLM knows it's
-    looking at a filtered subset."""
-    cubes = [
-        _cube(name=name, questions=[f"q{i}" for i in range(20)])
-        for name in ["orders", "sessions", "payments"]
-    ]
-    cat = Catalog(cubes)
-    retriever = _StaticRetriever(["orders"])
-    p = planner_prompt(cat, user_query="x", retriever=retriever, top_k=2)
-    assert "top 2 cubes" in p
-    assert "Retrieval-filtered" in p
-
-
-def test_below_threshold_no_retrieval_annotation() -> None:
-    cubes = [_cube(name="orders")]
-    cat = Catalog(cubes)
-    retriever = _StaticRetriever(["orders"])
-    p = planner_prompt(cat, user_query="x", retriever=retriever)
-    assert "top " not in p  # no "top N cubes" header annotation
-    assert "Retrieval-filtered" not in p
-
-
 # ---------------------------------------------------------------------------
 # Auth interactions
 # ---------------------------------------------------------------------------

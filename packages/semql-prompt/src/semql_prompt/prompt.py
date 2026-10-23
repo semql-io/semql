@@ -13,19 +13,25 @@ system prompt alongside role description, data-source context, etc.
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+from pydantic import BaseModel
 from semql.hooks import CubePromptHook
 from semql.introspect import PolicyFn, iter_cubes, viewer_sees
 from semql.model import AuthContext, BaseField, Cube, GlossaryEntry, Lookup, ResolutionContext, View
 from semql.refs import cube_of, parse_qualified_ref
+from semql.schema import SchemaProfile, SchemaProjection, SemanticFeature, project_schema
 
 if TYPE_CHECKING:
+    from semql import Catalog
     from semql.retrieve import Retriever
     from semql.spec import SavedQuery, SemanticQuery
+
+    from semql_prompt.continuation import ContinuationState
 
 
 # --------------------------------------------------------------------------
@@ -777,26 +783,27 @@ def project_tool_descriptions(
     )
 
 
-def to_openai_function(cube: Cube, *, viewer: AuthContext | None = None) -> dict[str, Any]:
-    """Return the OpenAI function-calling dict for one cube.
-
-    The returned dict can be passed directly as an element of the
-    ``tools=`` list in ``client.chat.completions.create()``,
-    ``ChatOpenAI`` / ``ChatAnthropic`` tool-calling, and
-    LlamaIndex / pydantic-ai raw function specs.
-
-    Pass ``viewer`` so role-protected fields on an otherwise-visible cube
-    are filtered out of the rendered description; omitting it (the default)
-    renders every field (SEMQL-PROMPT-FIELD-ROLES-001).
-    """
+def to_openai_function(
+    cube: Cube,
+    *,
+    viewer: AuthContext | None = None,
+    profile: SchemaProfile = SchemaProfile.TOOL,
+    disabled_features: Sequence[SemanticFeature | str] = (),
+) -> dict[str, Any]:
+    """Return one profile-projected OpenAI function tool for a visible cube."""
     from semql.spec import SemanticQuery
 
+    schema = project_schema(
+        SemanticQuery,
+        profile,
+        disabled_features=disabled_features,
+    ).schema
     return {
         "type": "function",
         "function": {
             "name": f"query_{cube.name}",
             "description": render_tool_description(cube, viewer=viewer),
-            "parameters": SemanticQuery.tool_json_schema(),
+            "parameters": schema,
         },
     }
 
@@ -817,6 +824,8 @@ def catalog_prompt_hash(
     glossary: list[GlossaryEntry] | None = None,
     relations: str = "",
     policy: PolicyFn | None = None,
+    profile: SchemaProfile = SchemaProfile.TOOL,
+    disabled_features: Sequence[SemanticFeature | str] = (),
 ) -> str:
     """SHA256 hex digest of the viewer-invariant static catalog segment."""
     # A supplied policy makes every cube potentially viewer-dependent, so
@@ -831,7 +840,11 @@ def catalog_prompt_hash(
         glossary=glossary,
         relations=relations,
     )
-    return hashlib.sha256(segments.static.encode("utf-8")).hexdigest()
+    from semql.spec import SemanticQuery
+
+    projection = project_schema(SemanticQuery, profile, disabled_features=disabled_features)
+    prompt_contract = segments.static + _semantic_query_output_guidance(projection)
+    return hashlib.sha256(prompt_contract.encode("utf-8")).hexdigest()
 
 
 def _human(display_name: str | None) -> str:
@@ -949,7 +962,7 @@ def _render_cube(
 
 
 _RAW_TRIGGERS: tuple[str, ...] = (
-    "Window / rank / lag / lead functions not represented by catalog measures.",
+    "Window / lag / lead functions outside the semantic partitioned-ranking contract.",
     "Recursive CTEs.",
     "Pivots (rows → columns).",
     "Arbitrary physical columns that are not represented by an authorized catalog field.",
@@ -961,39 +974,61 @@ def _raw_triggers_block(header: str) -> str:
     return f"{header}\n{bullets}"
 
 
-_SPEC_CONTRACT = """\
-## Semantic path
-
-Emit a `SemanticQuery` instead of writing SQL. The compiler resolves catalog identifiers,
-enforces authorization, and binds values.
-
-### Query shape
-- `measures`: qualified measure refs; aggregation is defined by the catalog.
-- `dimensions`: qualified dimensions for grouping. In `ungrouped` row mode, omit measures,
-  include an explicit `limit`, and select row dimensions instead.
-- `time_dimension`: `{dimension, range, granularity?, fill_nulls_with?}`. `range` is a
-  half-open ISO-8601 `[start, end)` interval. `fill_nulls_with` requires granularity and
-  cannot be combined with non-time dimensions.
-- `segments`: named `cube.segment` predicates, AND-composed with filters.
-- `filters`: flat AND predicates (`eq`, `neq`, `in`, `not_in`, `gt`, `lt`, `gte`, `lte`,
-  `contains`, `is_null`, `not_null`).
-- `where`: boolean predicate tree for OR/NOT; combines with filters via AND.
-- `having`: post-aggregation measure predicates; reference a requested measure.
-- `compare`: request a prior-window comparison; use only when the comparison period is clear.
-- `derived_measures`: inline `ratio`, `sum`, or `diff` over catalog measures; name operands
-  exactly as listed in the catalog.
-- `semi_joins`: restrict an outer dimension to values projected by an inner query. The
-  inner query must select that dimension; this is AND-only and cannot itself contain
-  semi-joins.
-- `left_joins`: request declared left joins, typically paired with `is_null` to find absent
-  related rows.
-- `aliases`: `{output_name: "cube.field"}` mappings for output-column names.
-- `order`: `(field, asc|desc)` pairs; `limit` caps rows and `offset` supports pagination.
-
-Use only fields shown in the authorized catalog. Preserve required filters and do not infer
-business definitions, units, or date ranges that are not stated or grounded by the catalog.
-If a required meaning is ambiguous, return an empty `steps` list and explain briefly; the
-caller should ask the user to clarify. Never guess a missing field or fabricate a definition."""
+def _spec_contract(projection: SchemaProjection) -> str:
+    """Describe only query features available in the selected representation."""
+    unavailable = {removal.feature for removal in projection.removed_features}
+    lines = [
+        "## Semantic path",
+        "",
+        "Construct `SemanticQuery` payloads within the selected output contract, never SQL. "
+        "The compiler resolves catalog identifiers, enforces authorization, and binds values.",
+        "",
+        "### Query shape",
+        "- `measures`: qualified measure refs; aggregation is defined by the catalog.",
+        "- `dimensions`: qualified grouping dimensions. In `ungrouped` row mode, omit measures, "
+        "include an explicit `limit`, and select row dimensions.",
+        "- `time_dimension`: `{dimension, range, granularity?, fill_nulls_with?}`. "
+        "`range` is a half-open ISO-8601 `[start, end)` interval. Filling requires granularity "
+        "and cannot be combined with non-time dimensions.",
+        "- `segments`: named `cube.segment` predicates, AND-composed with filters.",
+        "- `filters`: flat AND predicates (`eq`, `neq`, `in`, `not_in`, `gt`, `lt`, `gte`, "
+        "`lte`, `contains`, `is_null`, `not_null`).",
+    ]
+    if "where" not in unavailable:
+        lines.append("- `where`: Boolean OR/NOT predicate tree, AND-composed with filters.")
+    lines.extend(
+        [
+            "- `having`: post-aggregation predicates on requested measures.",
+            "- `compare`: prior-window comparison; require a grounded comparison period.",
+            "- `derived_measures`: inline `ratio`, `sum`, or `diff` over catalog measures.",
+        ]
+    )
+    if "semi_joins" not in unavailable:
+        lines.append(
+            "- `semi_joins`: restrict an outer dimension to values projected by an inner query. "
+            "The inner query must select that dimension; this is AND-only without nesting."
+        )
+    if "rank" not in unavailable:
+        lines.append(
+            "- `rank`: grouped-row selection after aggregation, derived projections, and HAVING, "
+            "before final ordering and global limits. Supply selected grouping `partition_by` "
+            "keys, `order_by` fields with direction and NULL placement, positive `count`, and "
+            "`ties` (`exact` or `include`). Exact selection appends remaining grouping keys "
+            "ascending with NULLS LAST. Include selects all ties at the Nth-row boundary, not "
+            "the top N distinct scores. Comparison, dense fill, and federation are unsupported."
+        )
+    lines.extend(
+        [
+            "- `left_joins`: declared left joins, often paired with `is_null` for absent rows.",
+            '- `aliases`: `{output_name: "cube.field"}` output-name mappings.',
+            "- `order`: `(field, asc|desc)` pairs; `limit` and `offset` are global pagination.",
+            "",
+            "Use only authorized catalog fields. Preserve required filters; never invent "
+            "business definitions, units, or date ranges. Unresolved meaning is not a "
+            "successful query: follow the selected output contract's failure protocol.",
+        ]
+    )
+    return "\n".join(lines)
 
 
 _RAW_FALLBACK = _raw_triggers_block(
@@ -1278,6 +1313,24 @@ def _render_view_block(views: dict[str, View], *, catalog: dict[str, Cube]) -> s
     return "\n".join(lines).rstrip() + "\n"
 
 
+def _semantic_query_output_guidance(projection: SchemaProjection) -> str:
+    lines = [
+        "## Output",
+        "Return one canonical `SemanticQuery` object matching this projected schema.",
+    ]
+    for removal in projection.removed_features:
+        lines.append(f"This contract cannot express `{removal.feature}`; do not emit it.")
+    lines.extend(
+        (
+            "This schema describes representation, not authorization or compiler support.",
+            "```json",
+            json.dumps(projection.schema, ensure_ascii=False, sort_keys=True, indent=2),
+            "```",
+        )
+    )
+    return "\n".join(lines)
+
+
 def build_planner_prompt_fragment(
     catalog: dict[str, Cube],
     *,
@@ -1297,6 +1350,8 @@ def build_planner_prompt_fragment(
     saved_queries: Sequence[SavedQuery] | None = None,
     cube_prompt_hooks: list[CubePromptHook] | None = None,
     instructions: str | None = None,
+    profile: SchemaProfile = SchemaProfile.TOOL,
+    disabled_features: Sequence[SemanticFeature | str] = (),
 ) -> str:
     """Compose the semantic-layer fragment of a planner's system prompt.
 
@@ -1312,8 +1367,11 @@ def build_planner_prompt_fragment(
     their dimensions. Dynamic ``Lookup`` loaders fire here (the only
     I/O path in the prompt builder).
     """
+    from semql.spec import SemanticQuery
+
+    projection = project_schema(SemanticQuery, profile, disabled_features=disabled_features)
     parts: list[str] = [
-        _SPEC_CONTRACT,
+        _spec_contract(projection),
         _DATA_FENCE_PREAMBLE,
         render_catalog_block(
             catalog,
@@ -1341,6 +1399,7 @@ def build_planner_prompt_fragment(
     parts.append(_RAW_FALLBACK)
     if include_introspection:
         parts.append(_INTROSPECTION)
+    parts.append(_semantic_query_output_guidance(projection))
     return "\n\n".join(parts) + "\n"
 
 
@@ -1363,6 +1422,8 @@ def build_planner_prompt_segments(
     saved_queries: Sequence[SavedQuery] | None = None,
     cube_prompt_hooks: list[CubePromptHook] | None = None,
     instructions: str | None = None,
+    profile: SchemaProfile = SchemaProfile.TOOL,
+    disabled_features: Sequence[SemanticFeature | str] = (),
 ) -> CatalogPrompt:
     """Cacheable variant of :func:`build_planner_prompt_fragment`.
 
@@ -1399,7 +1460,14 @@ def build_planner_prompt_segments(
         cube_prompt_hooks=cube_prompt_hooks,
     )
 
-    static_parts: list[str] = [_SPEC_CONTRACT, _DATA_FENCE_PREAMBLE, segments.static.rstrip()]
+    from semql.spec import SemanticQuery
+
+    projection = project_schema(SemanticQuery, profile, disabled_features=disabled_features)
+    static_parts: list[str] = [
+        _spec_contract(projection),
+        _DATA_FENCE_PREAMBLE,
+        segments.static.rstrip(),
+    ]
     if instructions:
         static_parts.append(f"## Additional instructions\n{instructions}")
     if views:
@@ -1409,6 +1477,7 @@ def build_planner_prompt_segments(
     static_parts.append(_RAW_FALLBACK)
     if include_introspection:
         static_parts.append(_INTROSPECTION)
+    static_parts.append(_semantic_query_output_guidance(projection))
     static = "\n\n".join(p for p in static_parts if p) + "\n"
 
     overlay = segments.overlay.rstrip() + "\n" if segments.overlay else ""
@@ -1514,34 +1583,68 @@ def build_router_prompt_fragment(
 # ---------------------------------------------------------------------------
 
 
-_GENERATOR_OUTPUT_SCHEMA = """\
-## Output
-
-Emit a `QueryPlan`:
-
-```
-{
-  "steps": [
-    {
-      "query": <SemanticQuery>,
-      "intent": "headline" | "breakdown" | "compare" | "context",
-      "label": "<one-line description, optional>"
-    },
-    ...
-  ],
-  "reasoning": "<one short sentence, optional>"
-}
-```
-
-Intent vocabulary:
-- `headline` — the primary number the user asked for.
-- `breakdown` — disaggregation alongside the headline.
-- `compare` — sibling number for context (prior period, baseline).
-- `context` — supporting data the answer references but doesn't feature.
-
-One headline per plan is the common case; emit only the steps needed to answer the
-question. Empty `steps` means the query is ambiguous or cannot be safely formulated;
-the caller should ask the user to clarify rather than treat it as a successful answer."""
+def _generator_output_guidance(
+    projection: SchemaProjection,
+    output_model: type[BaseModel],
+    *,
+    disabled_features: Sequence[SemanticFeature | str],
+) -> str:
+    model_name = output_model.__name__
+    schema_text = json.dumps(projection.schema, ensure_ascii=False, sort_keys=True, indent=2)
+    rank_disabled = (
+        SemanticFeature.RANK in disabled_features or SemanticFeature.RANK.value in disabled_features
+    )
+    if model_name == "PlannerResponse":
+        lines = [
+            "## Output",
+            "",
+            "Return exactly one `PlannerResponse` object matching this schema. Its `outcome` is",
+            "one of `plan`, `need_context`, `need_user_clarification`, or `cannot_plan`.",
+            "A `plan` outcome requires a nonempty QueryPlan; "
+            "never signal failure with an empty plan.",
+            "Use a context or clarification outcome when required information is unresolved. Use",
+            "`cannot_plan` with bounded diagnostics when the requested shape is unsupported.",
+        ]
+    else:
+        lines = [
+            "## Output",
+            "",
+            f"Return exactly one `{model_name}` object matching this schema.",
+        ]
+    if model_name == "PlannerResponse":
+        if rank_disabled:
+            lines.append(
+                "Ranking is disabled for this request. Unsupported shapes must use a planner "
+                "outcome; never fall back to raw SQL."
+            )
+        else:
+            lines.extend(
+                (
+                    "Ranking selects grouped rows after aggregation and HAVING, within each "
+                    "partition, before final ordering and global limit.",
+                    "Exact-N uses deterministic grouping-key tie breakers; include-ties compares "
+                    "score keys only.",
+                    "Ranking is not supported with comparison, dense-time fill, or federation: "
+                    "report the unsupported shape in the outcome instead of raw fallback.",
+                )
+            )
+    for removal in projection.removed_features:
+        if removal.feature in {"where", "semi_joins"}:
+            lines.append(f"This contract does not express `{removal.feature}`; do not emit it.")
+        elif removal.feature == SemanticFeature.RANK.value and model_name != "PlannerResponse":
+            lines.append("Ranking is disabled for this request and must not be proposed.")
+    lines.extend(
+        (
+            "",
+            "The schema is a decoder representation only; it does not grant authorization or",
+            "prove compiler support. Preserve caller constraints and use only authorized fields.",
+            "",
+            "```json",
+            schema_text,
+            "```",
+        )
+    )
+    return "\n".join(lines)
 
 
 def build_query_generator_prompt_fragment(
@@ -1564,17 +1667,20 @@ def build_query_generator_prompt_fragment(
     saved_queries: Sequence[SavedQuery] | None = None,
     cube_prompt_hooks: list[CubePromptHook] | None = None,
     instructions: str | None = None,
+    profile: SchemaProfile = SchemaProfile.TOOL,
+    disabled_features: Sequence[SemanticFeature | str] = (),
+    continuation: ContinuationState | None = None,
+    output_model: type[BaseModel] | None = None,
+    continuation_catalog: Catalog | None = None,
+    current_authorized_cubes: Sequence[str] | None = None,
+    current_visibility_revision: str | None = None,
 ) -> str:
-    """Fragment for the second stage of the prompt pipeline.
+    """Render generation guidance aligned to its canonical output model."""
+    if output_model is None:
+        from semql_prompt.outcomes import PlannerResponse
 
-    Given the Router's pick, this stage turns the question into a
-    ``QueryPlan`` (one or more ``QueryStep`` with typed intent).
-
-    ``scope_to`` applies an explicit Router-selected cube/view scope. When
-    omitted, ``user_query`` + ``retriever`` can select relevant cubes. The
-    two mechanisms are alternatives: an explicit scope is authoritative and
-    is never narrowed again by a catalog-wide retriever.
-    """
+        output_model = PlannerResponse
+    projection = project_schema(output_model, profile, disabled_features=disabled_features)
     scoped_catalog: dict[str, Cube] = catalog
     scoped_views: dict[str, View] | None = views
     scoped_lookups: dict[str, Lookup] | None = lookups
@@ -1586,7 +1692,7 @@ def build_query_generator_prompt_fragment(
         if lookups is not None:
             scoped_lookups = {d: lk for d, lk in lookups.items() if cube_of(d) in wanted}
 
-    parts: list[str] = [_SPEC_CONTRACT, _DATA_FENCE_PREAMBLE]
+    parts: list[str] = [_spec_contract(projection), _DATA_FENCE_PREAMBLE]
     if instructions:
         parts.append(f"## Additional instructions\n{instructions}")
     parts.append(
@@ -1608,14 +1714,38 @@ def build_query_generator_prompt_fragment(
         ).rstrip()
     )
     if scoped_views:
-        # Resolve backing-field roles against the full catalog, not the scoped subset.
         view_block = _render_view_block(scoped_views, catalog=catalog).rstrip()
         if view_block:
             parts.append(view_block)
-    parts.append(_RAW_FALLBACK)
     if include_introspection:
         parts.append(_INTROSPECTION)
-    parts.append(_GENERATOR_OUTPUT_SCHEMA.rstrip())
+    parts.append(
+        _generator_output_guidance(
+            projection,
+            output_model,
+            disabled_features=disabled_features,
+        )
+    )
+    if continuation is not None:
+        from semql_prompt.continuation import render_continuation
+
+        if (
+            continuation_catalog is None
+            or current_authorized_cubes is None
+            or current_visibility_revision is None
+        ):
+            raise ValueError(
+                "continuation rendering requires current authorized scope and revision"
+            )
+        parts.append(
+            render_continuation(
+                continuation,
+                catalog=continuation_catalog,
+                viewer=viewer,
+                current_authorized_cubes=current_authorized_cubes,
+                current_visibility_revision=current_visibility_revision,
+            )
+        )
     return "\n\n".join(p for p in parts if p) + "\n"
 
 

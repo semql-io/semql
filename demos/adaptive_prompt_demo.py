@@ -31,7 +31,7 @@ def main() -> None:
         dimensions=[Dimension(name="region", sql="{o}.region", type="string")],
     )
     catalog = Catalog([orders])
-    policy = AdaptivePromptPolicy(top_k=3, max_tokens=4_000)
+    policy = AdaptivePromptPolicy(top_k=3, max_tokens=40_000)
 
     initial = build_adaptive_prompt(
         catalog,
@@ -40,6 +40,7 @@ def main() -> None:
             conversation=("Show recognized revenue by month and region.",),
             retrieved_snippets=("Finance defines recognized revenue from paid orders.",),
         ),
+        policy=policy,
     )
     assert initial.fits
     assert "Finance defines recognized revenue" in initial.text

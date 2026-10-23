@@ -25,6 +25,7 @@ from semql.analysis import (
     SemanticNode,
     SemanticOutput,
     SemanticPopulation,
+    SemanticRanking,
     SemanticResult,
     SemanticTimePolicy,
     compare_analysis,
@@ -196,6 +197,14 @@ from semql.rows import (
     non_portable_entities,
 )
 from semql.safe import is_read_only_statement
+from semql.schema import (
+    SchemaConstraintWeakening,
+    SchemaFeatureRemoval,
+    SchemaProfile,
+    SchemaProjection,
+    SemanticFeature,
+    project_schema,
+)
 from semql.semijoin import (
     SemiJoinBinding,
     SemiJoinPlan,
@@ -208,6 +217,8 @@ from semql.spec import (
     FilterOp,
     InlineDerived,
     InlineDerivedOp,
+    PartitionRank,
+    RankOrder,
     SavedQuery,
     SemanticQuery,
     SemanticQueryDefaults,
@@ -257,6 +268,7 @@ __all__ = [
     "SemanticNode",
     "SemanticOutput",
     "SemanticPopulation",
+    "SemanticRanking",
     "SemanticResult",
     "SemanticTimePolicy",
     "compare_analysis",
@@ -328,6 +340,8 @@ __all__ = [
     "InlineDerived",
     "InlineDerivedOp",
     "GranularityLiteral",
+    "PartitionRank",
+    "RankOrder",
     "Join",
     "JoinPathError",
     "Lookup",
@@ -452,4 +466,10 @@ __all__ = [
     "apply_rollup_to_plan",
     "partition_scans",
     "to_logical_plan",
+    "SchemaConstraintWeakening",
+    "SchemaFeatureRemoval",
+    "SchemaProfile",
+    "SchemaProjection",
+    "SemanticFeature",
+    "project_schema",
 ]

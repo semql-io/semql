@@ -18,8 +18,8 @@ from __future__ import annotations
 import pytest
 from semql.compile import compile_query, explain_plan
 from semql.errors import CompileError
-from semql.model import Cube, Dialect, Dimension, Join, Measure
-from semql.spec import Filter, SemanticQuery
+from semql.model import AuthContext, Cube, Dialect, Dimension, Join, Measure
+from semql.spec import Filter, PartitionRank, RankOrder, SemanticQuery
 
 
 def _catalog(dialect: Dialect = Dialect.DUCKDB) -> dict[str, Cube]:
@@ -56,6 +56,30 @@ def _catalog(dialect: Dialect = Dialect.DUCKDB) -> dict[str, Cube]:
         joins=[Join(to="users", relationship="many_to_one", on="{r}.identity_id = {u}.id")],
     )
     return {c.name: c for c in (users, orders, reviews)}
+
+
+@pytest.mark.parametrize("score", ["orders.count", "orders_count"])
+def test_symmetric_ranking_rejects_masked_qualified_and_output_references(score: str) -> None:
+    catalog = _catalog()
+    orders = catalog["orders"]
+    catalog["orders"] = orders.model_copy(
+        update={
+            "measures": [
+                orders.measures[0].model_copy(
+                    update={"required_roles": ["analyst"], "mask_roles": ["analyst"]}
+                )
+            ]
+        }
+    )
+    query = SemanticQuery(
+        dimensions=["users.id"],
+        measures=["orders.count", "reviews.count"],
+        rank=PartitionRank(
+            order_by=[RankOrder(field=score, direction="desc")], count=1, ties="include"
+        ),
+    )
+    with pytest.raises(CompileError):
+        compile_query(query, catalog, viewer=AuthContext(viewer_id="reader", roles=["analyst"]))
 
 
 # ---------------------------------------------------------------------------

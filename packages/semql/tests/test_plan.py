@@ -72,11 +72,24 @@ def test_query_plan_carries_ordered_steps() -> None:
     assert plan.steps[0].intent == "headline"
 
 
-def test_empty_query_plan_is_legal() -> None:
-    """An empty plan means the Generator could not formulate a query —
-    callers handle it as "ask the user to rephrase," not as success."""
-    plan = QueryPlan()
-    assert plan.steps == []
+def test_query_plan_deeply_freezes_steps_and_rejects_unknown_fields() -> None:
+    steps = [{"query": {"measures": ["orders.revenue"]}, "intent": "headline"}]
+    plan = QueryPlan.model_validate({"steps": steps})
+    steps.clear()
+    assert len(plan.steps) == 1
+    with pytest.raises((AttributeError, TypeError)):
+        plan.steps.append(plan.steps[0])  # type: ignore[attr-defined]
+    with pytest.raises(ValidationError):
+        QueryPlan.model_validate({"steps": [], "sql": "select 1"})
+
+
+def test_query_step_rejects_unknown_fields() -> None:
+    with pytest.raises(ValidationError):
+        QueryStep(
+            query=SemanticQuery(measures=["orders.revenue"]),
+            intent="headline",
+            sql="select 1",  # type: ignore[call-arg]
+        )
 
 
 def test_presentation_summary_required_others_optional() -> None:

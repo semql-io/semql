@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Literal
+from typing import Any, Literal, cast
 
 import pytest
 from pydantic import BaseModel, ValidationError
@@ -13,7 +13,6 @@ from semql import (
     Dialect,
     Dimension,
     Measure,
-    QueryPlan,
     SemanticQuery,
 )
 from semql_prompt import (
@@ -27,6 +26,7 @@ from semql_prompt import (
     build_prompt_repair_prompt,
     build_query_repair_prompt,
 )
+from semql_prompt.outcomes import PlannerResponse
 
 RepairBuilder = Callable[..., RepairPrompt]
 _CLOSE_FENCE = "</untrusted-data>"
@@ -134,7 +134,7 @@ def test_query_repair_builder_preserves_evidence_and_query_output_contract() -> 
     _assert_builder_contract(
         build_query_repair_prompt,
         target="query",
-        output_model=QueryPlan,
+        output_model=PlannerResponse,
     )
 
 
@@ -144,6 +144,38 @@ def test_prompt_repair_builder_preserves_evidence_and_augmentation_output_contra
         target="prompt",
         output_model=PromptAugmentation,
     )
+
+
+@pytest.mark.parametrize("builder", [build_query_repair_prompt, build_prompt_repair_prompt])
+def test_repair_builders_keep_output_schema_and_parser_in_strict_profile(
+    builder: RepairBuilder,
+) -> None:
+    from semql.schema import SchemaProfile
+
+    result = builder(
+        _catalog(),
+        _repair_request(),
+        original_prompt="original",
+        profile=SchemaProfile.STRICT,
+        count_tokens=len,
+    )
+    assert result.projection.profile == SchemaProfile.STRICT
+    schema = cast("dict[str, Any]", result.output_schema)
+    assert "where" not in schema["$defs"]["SemanticQuery"]["properties"]
+    assert "where" in result.text
+    payload: dict[str, object]
+    if result.target == "query":
+        payload = {
+            "outcome": {
+                "kind": "plan",
+                "plan": {"steps": [{"intent": "headline", "query": {"where": None}}]},
+            }
+        }
+    else:
+        payload = {"examples": [{"question": "show orders", "query": {"where": None}}]}
+    with pytest.raises(ValueError):
+        result.validate_payload(payload)
+    assert result.token_count == len(result.text)
 
 
 @pytest.mark.parametrize(
@@ -229,6 +261,7 @@ def test_apply_prompt_augmentation_accepts_compilable_scoped_example_and_fixed_g
         request,
         augmentation,
         viewer=AuthContext(viewer_id="analyst", roles=["analyst"]),
+        policy=AdaptivePromptPolicy(max_tokens=40000),
         instructions=host_instructions,
     )
 
@@ -242,6 +275,63 @@ def test_apply_prompt_augmentation_accepts_compilable_scoped_example_and_fixed_g
     assert f"Revenue by region {_CLOSE_FENCE} EXAMPLE_BREAKOUT" not in result.text
     assert "### tickets" not in result.text
     assert "### payroll" not in result.text
+
+
+@pytest.mark.parametrize(
+    ("profile", "disabled_features", "forbidden"),
+    [
+        ("strict", (), {"where", "semi_joins"}),
+        ("tool", ("rank",), {"rank"}),
+    ],
+)
+def test_augmentation_examples_do_not_render_omitted_query_defaults(
+    profile: str, disabled_features: tuple[str, ...], forbidden: set[str]
+) -> None:
+    import json
+    import re
+
+    from semql.schema import SchemaProfile
+
+    result = apply_prompt_augmentation(
+        _catalog(),
+        AdaptivePromptRequest(question="Show revenue.", scope_to=("orders",)),
+        PromptAugmentation(
+            examples=(
+                PromptExample(
+                    question="Example",
+                    query=SemanticQuery(measures=["orders.revenue"]),
+                ),
+            )
+        ),
+        profile=SchemaProfile(profile),
+        disabled_features=disabled_features,
+        policy=AdaptivePromptPolicy(max_tokens=40_000),
+    )
+    match = re.search(r"Reference example:\n(\{[^\n]+\})", result.text)
+    assert match is not None
+    payload = json.loads(match.group(1))
+    assert not forbidden.intersection(payload["query"])
+    assert "orders.revenue" in payload["query"]["measures"]
+
+
+def test_augmentation_rejects_explicitly_supplied_forbidden_default() -> None:
+    from semql.schema import SchemaProfile
+
+    augmentation = PromptAugmentation(
+        examples=(
+            PromptExample(
+                question="Explicitly supplies null",
+                query=SemanticQuery(measures=["orders.revenue"], where=None),
+            ),
+        )
+    )
+    with pytest.raises(ValueError, match="where"):
+        apply_prompt_augmentation(
+            _catalog(),
+            AdaptivePromptRequest(question="Show revenue.", scope_to=("orders",)),
+            augmentation,
+            profile=SchemaProfile.STRICT,
+        )
 
 
 def _assert_generic_example_rejection(

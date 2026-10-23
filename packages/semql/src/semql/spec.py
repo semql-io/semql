@@ -12,7 +12,7 @@ from collections.abc import Mapping, Sequence
 from datetime import datetime
 from typing import TYPE_CHECKING, Annotated, Any, Literal, cast
 
-from pydantic import Field, model_validator
+from pydantic import ConfigDict, Field, model_validator
 
 # ``parse_instant`` is a pure leaf utility — it lives in
 # :mod:`semql.instant` so the catalog model (which needs it for
@@ -50,7 +50,32 @@ FilterOp = Literal[
 ]
 
 
-class TimeWindow(FrozenModel):
+class _QueryInput(FrozenModel):
+    """Strict base for canonical query payloads; catalog models stay permissive."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+
+class RankOrder(_QueryInput):
+    field: str = Field(min_length=1)
+    direction: Literal["asc", "desc"]
+    nulls: Literal["first", "last"] = "last"
+
+
+class PartitionRank(_QueryInput):
+    partition_by: Sequence[str] = Field(default_factory=list)
+    order_by: Sequence[RankOrder]
+    count: int = Field(gt=0, strict=True)
+    ties: Literal["exact", "include"] = "exact"
+
+    @model_validator(mode="after")
+    def _has_score(self) -> PartitionRank:
+        if not self.order_by:
+            raise ValueError("PartitionRank.order_by must contain at least one score field.")
+        return self
+
+
+class TimeWindow(_QueryInput):
     dimension: str = Field(
         description=(
             "Qualified time-dimension name (e.g. 'orders.created_at') the window restricts."
@@ -103,7 +128,7 @@ class TimeWindow(FrozenModel):
         return self
 
 
-class Filter(FrozenModel):
+class Filter(_QueryInput):
     dimension: str = Field(
         description="Qualified dimension name (e.g. 'orders.region') the predicate applies to.",
     )
@@ -177,7 +202,7 @@ class Filter(FrozenModel):
                 )
 
 
-class BoolExpr(FrozenModel):
+class BoolExpr(_QueryInput):
     """Recursive boolean predicate tree over ``Filter`` leaves.
 
     ``filters`` (the flat list on ``SemanticQuery``) is implicit-AND;
@@ -203,7 +228,7 @@ class BoolExpr(FrozenModel):
         return self
 
 
-class CompareWindow(FrozenModel):
+class CompareWindow(_QueryInput):
     """`previous_period` derives the prior window from the TimeWindow's
     range (same duration, immediately prior). `explicit` requires `range`."""
 
@@ -222,7 +247,7 @@ class CompareWindow(FrozenModel):
 InlineDerivedOp = Literal["ratio", "sum", "diff"]
 
 
-class InlineDerived(FrozenModel):
+class InlineDerived(_QueryInput):
     """Ad-hoc derived measure composed from existing catalog measures.
 
     Covers the exploratory shape an LLM or human reaches for in chat:
@@ -300,7 +325,7 @@ class InlineDerived(FrozenModel):
         return self
 
 
-class SemiJoin(FrozenModel):
+class SemiJoin(_QueryInput):
     """Cross-backend semi-join: restrict an outer dimension to the value
     set produced by an inner query, shipped as a literal value list — never
     a cross-backend join.
@@ -358,7 +383,7 @@ class SemiJoin(FrozenModel):
         return self
 
 
-class SemanticQuery(FrozenModel):
+class SemanticQuery(_QueryInput):
     measures: Sequence[str] = Field(
         default_factory=list,
         description=(
@@ -404,6 +429,10 @@ class SemanticQuery(FrozenModel):
     order: Sequence[tuple[str, Literal["asc", "desc"]]] = Field(
         default_factory=lambda: list[tuple[str, Literal["asc", "desc"]]](),
         description="(field, 'asc'|'desc') pairs; field may be a measure or dimension name.",
+    )
+    rank: PartitionRank | None = Field(
+        default=None,
+        description="Select top grouped rows independently per partition after aggregation.",
     )
     limit: int | None = Field(
         default=None,
@@ -667,6 +696,24 @@ def _apply_query_defaults(
     return query.model_copy(update=updates)
 
 
+def rank_shape_errors(query: SemanticQuery) -> tuple[str, ...]:
+    """Return stable capability codes for catalog-independent unsupported shapes."""
+    if query.rank is None:
+        return ()
+    reasons: list[str] = []
+    if query.ungrouped:
+        reasons.append("ranking_ungrouped_unsupported")
+    elif not query.dimensions and not (
+        query.time_dimension is not None and query.time_dimension.granularity is not None
+    ):
+        reasons.append("ranking_grouping_required")
+    if query.compare is not None:
+        reasons.append("ranking_compare_unsupported")
+    if query.time_dimension is not None and query.time_dimension.fill_nulls_with is not None:
+        reasons.append("ranking_fill_unsupported")
+    return tuple(reasons)
+
+
 __all__ = [
     "BoolExpr",
     "CompareWindow",
@@ -674,10 +721,13 @@ __all__ = [
     "FilterOp",
     "InlineDerived",
     "InlineDerivedOp",
+    "PartitionRank",
+    "RankOrder",
     "SavedQuery",
     "SemanticQuery",
     "SemanticQueryDefaults",
     "SemiJoin",
     "TimeWindow",
     "_apply_query_defaults",
+    "rank_shape_errors",
 ]

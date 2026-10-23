@@ -168,6 +168,10 @@ path = "semql.safe"
 layer = "foundation"
 
 [[modules]]
+path = "semql.schema"
+layer = "app"
+
+[[modules]]
 path = "semql.semijoin"
 layer = "app"
 

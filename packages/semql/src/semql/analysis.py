@@ -117,6 +117,14 @@ class SemanticTimePolicy(_FrozenModel):
     null_policy: str | None = None
 
 
+class SemanticRanking(_FrozenModel):
+    partition_node_ids: tuple[str, ...] = ()
+    order: tuple[tuple[str, str, str], ...] = ()
+    count: int
+    ties: Literal["exact", "include"]
+    tie_breaker_node_ids: tuple[str, ...] = ()
+
+
 class SemanticResult(_FrozenModel):
     grain_node_ids: tuple[str, ...] = ()
     population_ref: str | None = None
@@ -127,6 +135,7 @@ class SemanticResult(_FrozenModel):
     completeness: str = "not_established"
     grain_kind: Literal["rows", "grouped", "scalar"] = "scalar"
     predicate_ids: tuple[str, ...] = ()
+    ranking: SemanticRanking | None = None
 
 
 class Coverage(_FrozenModel):
@@ -725,11 +734,21 @@ def build_analysis(
         for node in nodes
         if node.catalog_ref is not None and node.kind in {"aggregate", "dimension", "time"}
     }
+    nodes_by_id = {node.node_id: node for node in nodes}
+    output_refs = {
+        nodes_by_id[output.node_id].catalog_ref: output.node_id
+        for output in outputs
+        if nodes_by_id[output.node_id].catalog_ref is not None
+    }
+    output_refs.update(zip(query.dimensions, grain_ids, strict=False))
+    output_refs.update((ref, ids[ref]) for ref in query.measures)
+    if query.time_dimension is not None and query.time_dimension.granularity is not None:
+        output_refs[query.time_dimension.dimension] = grain_ids[-1]
     order: list[tuple[str, str]] = []
     unresolved_order = False
     for name, direction in query.order:
         ref = query.aliases.get(name, name)
-        order_node_id = alias_to_node.get(name) or ref_to_node.get(ref)
+        order_node_id = alias_to_node.get(name) or output_refs.get(ref) or ref_to_node.get(ref)
         if order_node_id is None:
             unresolved_order = True
             break
@@ -799,6 +818,38 @@ def build_analysis(
     if unsupported_quantiles:
         incomplete.append("quantile_method_not_established")
     complete = result_complete and scope_coverage == "complete"
+    ranking: SemanticRanking | None = None
+    if query.rank is not None:
+
+        def ranking_node(ref: str) -> str:
+            canonical = query.aliases.get(ref, ref)
+            node_id = alias_to_node.get(ref) or output_refs.get(canonical)
+            if node_id is None:
+                raise ValueError(f"Ranking reference {ref!r} has no semantic node.")
+            return node_id
+
+        partition_ids = tuple(ranking_node(ref) for ref in query.rank.partition_by)
+        order_specs = tuple(
+            (ranking_node(item.field), item.direction, item.nulls) for item in query.rank.order_by
+        )
+        tie_breakers: tuple[str, ...] = ()
+        if query.rank.ties == "exact":
+            part_set = set(partition_ids)
+            tie_breakers = tuple(
+                node_id
+                for _ref, node_id in sorted(
+                    (nodes_by_id[node_id].catalog_ref or "", node_id)
+                    for node_id in grain_ids
+                    if node_id not in part_set
+                )
+            )
+        ranking = SemanticRanking(
+            partition_node_ids=partition_ids,
+            order=order_specs,
+            count=query.rank.count,
+            ties=query.rank.ties,
+            tie_breaker_node_ids=tie_breakers,
+        )
     result = SemanticResult(
         grain_node_ids=tuple(grain_ids),
         population_ref="p1",
@@ -809,6 +860,7 @@ def build_analysis(
         time_policy=time_policy,
         grain_kind=grain_kind,
         completeness="not_established",
+        ranking=ranking,
     )
     coverage = Coverage(
         status="complete" if complete else "not_established",
@@ -863,6 +915,7 @@ def build_analysis(
         joins=joins,
         assumptions=tuple(declared_assumptions),
         derivations=tuple(physical_derivations),
+        required_semantics=("partition_ranking",) if ranking is not None else (),
     )
 
 
@@ -898,6 +951,7 @@ __all__ = [
     "SemanticPopulation",
     "SemanticBinding",
     "SemanticTimePolicy",
+    "SemanticRanking",
     "SemanticResult",
     "Coverage",
     "SemanticAnalysis",

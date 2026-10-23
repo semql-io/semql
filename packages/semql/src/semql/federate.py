@@ -2175,6 +2175,11 @@ def compile_federated_query(
     if not touched:
         raise FederationError("Empty query.", reason="empty")
     backends_seen = {c.dialect for c in touched}
+    if len(backends_seen) > 1 and q.rank is not None:
+        raise FederationError(
+            "Partitioned ranking is not supported for multi-backend queries.",
+            reason="ranking_in_federation",
+        )
     if len(backends_seen) > 1 and q.derived_measures:
         raise FederationError(
             "Inline-derived measures are not supported across multiple backends.",

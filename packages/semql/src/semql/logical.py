@@ -53,7 +53,7 @@ from semql.model import (
 )
 from semql.model import Join as ModelJoin
 from semql.partition import select_physical_sources
-from semql.spec import BoolExpr, Filter, SemanticQuery, TimeWindow
+from semql.spec import BoolExpr, Filter, PartitionRank, SemanticQuery, TimeWindow
 
 # Aggregates whose value is inflated when a join duplicates the rows of the
 # cube the measure lives on. The single basis shared by the fan-out guard
@@ -312,6 +312,7 @@ class LogicalPlan:
     # contract is unchanged. The compiler turns these into
     # ``CompiledQuery.warnings`` (W3/ktx-C4).
     join_diagnostics: tuple[JoinDiagnostic, ...] = ()
+    rank: PartitionRank | None = None
 
     def __repr__(self) -> str:
         lines = [
@@ -326,6 +327,8 @@ class LogicalPlan:
             f"  time_window={self.time_window!r}",
             f"  compare={self.compare!r}",
         ]
+        if self.rank is not None:
+            lines.append(f"  rank={self.rank!r}")
         return "\n".join(lines)
 
 
@@ -531,6 +534,7 @@ def to_logical_plan(
         segments=tuple(query.segments),
         aliases=tuple(query.aliases.items()),
         symmetric=symmetric,
+        rank=query.rank,
         join_diagnostics=join_diagnostics,
     )
 

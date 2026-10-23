@@ -18,11 +18,11 @@ from semql import (
     Dialect,
     Dimension,
     Measure,
-    QueryPlan,
     SemanticQuery,
     UnknownIdentifierError,
 )
 from semql_prompt import AdaptivePromptPolicy, AdaptivePromptRequest, build_adaptive_prompt
+from semql_prompt.outcomes import PlannerResponse, PlanOutcome
 from semql_prompt.repair import (
     PromptAugmentation,
     PromptExample,
@@ -48,7 +48,7 @@ def main() -> None:
         ]
     )
     viewer = AuthContext(viewer_id="repair-demo-user")
-    policy = AdaptivePromptPolicy(top_k=3, max_tokens=4_000)
+    policy = AdaptivePromptPolicy(top_k=3, max_tokens=40_000)
     question = "Show total order revenue by region."
     original = build_adaptive_prompt(
         catalog,
@@ -113,23 +113,30 @@ def main() -> None:
     print("Both repair prompts retain the original prompt, failed query JSON, and safe diagnostic.")
 
     # Host-owned parsing of sample values; these are not model responses.
-    query_plan_json = json.dumps(
+    response_json = json.dumps(
         {
-            "steps": [
-                {
-                    "query": {
-                        "measures": ["orders.revenue"],
-                        "dimensions": ["orders.region"],
-                    },
-                    "intent": "breakdown",
-                    "label": "Revenue by region",
-                }
-            ],
-            "reasoning": None,
+            "outcome": {
+                "kind": "plan",
+                "plan": {
+                    "steps": [
+                        {
+                            "query": {
+                                "measures": ["orders.revenue"],
+                                "dimensions": ["orders.region"],
+                            },
+                            "intent": "breakdown",
+                            "label": "Revenue by region",
+                        }
+                    ],
+                    "reasoning": None,
+                },
+            }
         }
     )
-    query_plan = QueryPlan.model_validate_json(query_plan_json)
-    print("Caller-provided sample QueryPlan output parsed by the host (not a model response).")
+    response = PlannerResponse.model_validate_json(response_json)
+    assert isinstance(response.outcome, PlanOutcome)
+    query_plan = response.outcome.plan
+    print("Caller-provided PlannerResponse parsed by the host (not a model response).")
 
     augmentation_json = json.dumps(
         {

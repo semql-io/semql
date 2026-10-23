@@ -118,6 +118,8 @@ def _reject_unsupported(query: SemanticQuery) -> None:
         unsupported.append("compare(mode='explicit')")
     if query.time_dimension is not None and query.time_dimension.fill_nulls_with is not None:
         unsupported.append("time_dimension.fill_nulls_with")
+    if query.rank is not None:
+        unsupported.append("rank")
     if unsupported:
         raise UnparseError(
             "SemanticQuery uses features with no semantic-SQL representation: "

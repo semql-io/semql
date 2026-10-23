@@ -80,7 +80,9 @@ def test_static_segment_omits_protected_field_of_public_cube() -> None:
 
 
 def test_dynamic_policy_is_authoritative_for_direct_and_segmented_planners() -> None:
-    cube = _public_cube_with_protected_field()
+    cube = _public_cube_with_protected_field().model_copy(
+        update={"name": "confidential_sales_policy_cube"}
+    )
     cat = Catalog([cube], policy=lambda _cube, _viewer: False)
     guest = AuthContext(viewer_id="guest")
 
@@ -92,14 +94,16 @@ def test_dynamic_policy_is_authoritative_for_direct_and_segmented_planners() -> 
     segmented = planner_prompt_segments(cat, viewer=guest)
     combined = planner_prompt(cat, viewer=guest)
 
-    assert "orders" not in direct
-    assert "orders" not in segmented.static
-    assert "orders" not in segmented.overlay
-    assert "orders" not in combined
+    assert cube.name not in direct
+    assert cube.name not in segmented.static
+    assert cube.name not in segmented.overlay
+    assert cube.name not in combined
 
 
 def test_viewer_dependent_policy_uses_only_authorized_planner_overlay() -> None:
-    cube = _public_cube_with_protected_field()
+    cube = _public_cube_with_protected_field().model_copy(
+        update={"name": "confidential_sales_policy_cube"}
+    )
     cat = Catalog(
         [cube],
         policy=lambda _cube, viewer: viewer.viewer_id == "admin",
@@ -112,17 +116,20 @@ def test_viewer_dependent_policy_uses_only_authorized_planner_overlay() -> None:
     admin_direct = planner_prompt(cat, viewer=admin)
     guest_direct = planner_prompt(cat, viewer=guest)
 
-    assert "orders" not in admin_segments.static
-    assert "orders.revenue" in admin_segments.overlay
-    assert "orders" not in guest_segments.static
-    assert "orders" not in guest_segments.overlay
-    assert "orders.revenue" in admin_direct
-    assert "orders" not in guest_direct
+    assert cube.name not in admin_segments.static
+    assert f"{cube.name}.revenue" in admin_segments.overlay
+    assert cube.name not in guest_segments.static
+    assert cube.name not in guest_segments.overlay
+    assert f"{cube.name}.revenue" in admin_direct
+    assert cube.name not in guest_direct
 
 
 def test_policy_dependent_planner_cache_is_invariant_with_no_viewer_discovery() -> None:
+    cube = _public_cube_with_protected_field().model_copy(
+        update={"name": "confidential_sales_policy_cube"}
+    )
     cat = Catalog(
-        [_public_cube_with_protected_field()],
+        [cube],
         policy=lambda _cube, viewer: viewer.viewer_id == "admin",
     )
     no_viewer = planner_prompt_segments(cat)
@@ -133,14 +140,14 @@ def test_policy_dependent_planner_cache_is_invariant_with_no_viewer_discovery() 
     guest = planner_prompt_segments(cat, viewer=AuthContext(viewer_id="guest"))
 
     assert no_viewer.static == admin.static == guest.static
-    assert "orders" not in no_viewer.static
-    assert "orders.revenue" in no_viewer.overlay
-    assert "orders.margin" in no_viewer.overlay
-    assert "orders.revenue" in admin.overlay
-    assert "orders.margin" in admin.overlay
-    assert "orders" not in guest.overlay
-    assert "orders.revenue" in no_viewer.joined()
-    assert "orders.margin" in no_viewer.joined()
+    assert cube.name not in no_viewer.static
+    assert f"{cube.name}.revenue" in no_viewer.overlay
+    assert f"{cube.name}.margin" in no_viewer.overlay
+    assert f"{cube.name}.revenue" in admin.overlay
+    assert f"{cube.name}.margin" in admin.overlay
+    assert cube.name not in guest.overlay
+    assert f"{cube.name}.revenue" in no_viewer.joined()
+    assert f"{cube.name}.margin" in no_viewer.joined()
 
 
 def test_no_viewer_mode_preserves_unfiltered_catalog_discovery() -> None:

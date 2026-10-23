@@ -75,7 +75,7 @@ from semql import Catalog
 from semql.compile import CompiledQuery
 from semql.errors import AuthError, SemQLError
 from semql.lookups import materialize as materialize_lookup
-from semql.lookups import resolve as resolve_lookup
+from semql.lookups import resolve_outcome
 from semql.model import AuthContext, Cube, Entity, MutableEntity, Op, ResolutionContext
 from semql.mutate import SemanticMutation
 from semql.refs import cube_of
@@ -390,7 +390,7 @@ class MCPServer:
                 viewer = resolve_viewer(viewer_id, roles)
                 _check_lookup_visible(dimension, viewer)
                 ctx = _build_resolution_ctx(viewer, context)
-                values = resolve_lookup(
+                outcome = resolve_outcome(
                     catalog,
                     dimension,
                     query,
@@ -399,15 +399,26 @@ class MCPServer:
                 )
             except Exception as exc:
                 return _error_payload(exc, debug=debug)
-            return {"dimension": dimension, "query": query, "values": values}
+            return {
+                "dimension": outcome.dimension,
+                "query": outcome.query,
+                "status": outcome.status,
+                "values": list(outcome.values),
+                "labels": dict(outcome.labels) if outcome.labels is not None else None,
+                "match_kind": outcome.match_kind,
+                "authoritative": outcome.authoritative,
+                "complete": outcome.complete,
+                "truncated": outcome.truncated,
+                "total_candidates": outcome.total_candidates,
+            }
 
         resolve_lookup_fn.__name__ = "resolve_lookup"
         resolve_lookup_fn.__doc__ = (
-            "Turn a free-text ``query`` into a list of canonical "
-            "values for ``dimension`` using the catalog's configured "
-            "Lookup. Resolution is exact-case-insensitive → substring "
-            "→ fuzzy. Pass ``context`` / ``viewer_id`` / ``roles`` for "
-            "dynamic lookups whose loader needs a ResolutionContext."
+            "Resolve free text into canonical candidates with explicit status and certainty. "
+            "Only status='resolved' is an authoritative unique match; ambiguous candidates "
+            "require a choice, including a single fuzzy suggestion or a truncated list. "
+            "not_found differs from unavailable context. "
+            "Pass context / viewer_id / roles for dynamic lookups."
             f"\n\nDimensions with lookups: {', '.join(dim_keys)}."
         )
         resolve_lookup_fn.__annotations__ = {
