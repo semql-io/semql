@@ -1,8 +1,8 @@
 #!/usr/bin/env -S uv run
 """End-to-end walk through the four prompt-pipeline roles.
 
-Runs without any LLM. The LLM outputs (RouterDecision, QueryPlan,
-Presentation, DrilldownSuggestions) are stubbed inline so you can see
+Runs without any LLM. The outputs (RouterDecision, PlannerResponse,
+Presentation, DrilldownSuggestions) are caller-provided samples so you can see
 the full data flow — fragment in, structured value out, compiled SQL,
 narrative back — without needing an API key. Drop in pydantic-ai
 Agents to make it real.
@@ -38,6 +38,8 @@ from semql import (
 from semql.introspect import iter_cubes
 from semql.visualize import ShapeStats, decide_visualization
 from semql_prompt import (
+    PlannerResponse,
+    PlanOutcome,
     build_drilldown_prompt_fragment,
     build_presenter_prompt_fragment,
     build_query_generator_prompt_fragment,
@@ -206,7 +208,7 @@ def stage_router() -> RouterDecision:
 # ---------------------------------------------------------------------------
 
 
-def stage_generator(decision: RouterDecision) -> QueryPlan:
+def stage_generator(decision: RouterDecision) -> PlannerResponse:
     banner("STAGE 2 / QUERY GENERATOR")
     section("Generator prompt fragment (scoped to router's picks)")
     fragment = build_query_generator_prompt_fragment(
@@ -220,7 +222,7 @@ def stage_generator(decision: RouterDecision) -> QueryPlan:
     print(textwrap.indent(cat_block.rstrip(), "  "))
     print("  ... [raw-fallback rule + output schema follow]")
 
-    section("Stubbed LLM output (QueryPlan)")
+    section("Caller-provided sample output (PlannerResponse)")
     plan = QueryPlan(
         steps=[
             QueryStep(
@@ -252,8 +254,9 @@ def stage_generator(decision: RouterDecision) -> QueryPlan:
         ],
         reasoning="Headline + prior-quarter compare for trend context.",
     )
-    print(plan.model_dump_json(indent=2))
-    return plan
+    response = PlannerResponse(outcome=PlanOutcome(plan=plan))
+    print(response.model_dump_json(indent=2))
+    return response
 
 
 # ---------------------------------------------------------------------------
@@ -440,7 +443,12 @@ def stage_drilldown() -> DrilldownSuggestions:
 
 def main() -> None:
     decision = stage_router()
-    plan = stage_generator(decision)
+    response = stage_generator(decision)
+    if not isinstance(response.outcome, PlanOutcome):
+        raise RuntimeError(
+            "The host must handle clarification, context, or failure before compile."
+        )
+    plan = response.outcome.plan
     results = stage_compile(plan)
     stage_presenter(plan, results)
     stage_drilldown()

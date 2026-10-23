@@ -7,6 +7,32 @@ packages version in lockstep. Format loosely follows
 
 ## [Unreleased]
 
+### Added
+
+- The planner's default structured response is `PlannerResponse` with four
+  outcomes: a nonempty plan, typed context requests, user clarification, or
+  bounded cannot-plan diagnostics. Query repair now returns that same response
+  contract instead of treating an empty `QueryPlan` as failure.
+- Partitioned ranking selects grouped results after aggregation, derived
+  projections, and HAVING. Exact-N uses deterministic group-key tie breakers;
+  include-ties selects all rows at the Nth score boundary.
+- Profiled generation contracts pair decoder schemas with matching prompt
+  guidance and report schema removals or weakened constraints. Host-owned,
+  correlated continuation accepts only confirmed typed decisions and reapplies
+  current authorization before compiling.
+
+### Changed
+
+- Canonical semantic query inputs now reject unknown fields. `QueryPlan` is
+  immutable and extra-forbid; planner failure/context states belong in the
+  `PlannerResponse` outcome protocol.
+- Lookup outcomes distinguish authoritative misses, unavailable sources,
+  ambiguity, and fuzzy suggestions; candidate truncation no longer implies a
+  unique resolution.
+- Partitioned ranking defaults nulls to last and runs before final global caps.
+  Comparison, dense-time fill, and multi-backend federation remain unsupported;
+  semantic SQL parsing does not round-trip ranking.
+
 ## [0.12.0] - 2026-10-23
 
 ### Fixed

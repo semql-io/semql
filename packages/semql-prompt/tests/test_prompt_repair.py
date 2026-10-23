@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Literal
+from typing import Any, Literal, cast
 
 import pytest
 from pydantic import BaseModel, ValidationError
@@ -13,7 +13,6 @@ from semql import (
     Dialect,
     Dimension,
     Measure,
-    QueryPlan,
     SemanticQuery,
 )
 from semql_prompt import (
@@ -27,6 +26,7 @@ from semql_prompt import (
     build_prompt_repair_prompt,
     build_query_repair_prompt,
 )
+from semql_prompt.outcomes import PlannerResponse
 
 RepairBuilder = Callable[..., RepairPrompt]
 _CLOSE_FENCE = "</untrusted-data>"
@@ -134,7 +134,7 @@ def test_query_repair_builder_preserves_evidence_and_query_output_contract() -> 
     _assert_builder_contract(
         build_query_repair_prompt,
         target="query",
-        output_model=QueryPlan,
+        output_model=PlannerResponse,
     )
 
 
@@ -144,6 +144,38 @@ def test_prompt_repair_builder_preserves_evidence_and_augmentation_output_contra
         target="prompt",
         output_model=PromptAugmentation,
     )
+
+
+@pytest.mark.parametrize("builder", [build_query_repair_prompt, build_prompt_repair_prompt])
+def test_repair_builders_keep_output_schema_and_parser_in_strict_profile(
+    builder: RepairBuilder,
+) -> None:
+    from semql.schema import SchemaProfile
+
+    result = builder(
+        _catalog(),
+        _repair_request(),
+        original_prompt="original",
+        profile=SchemaProfile.STRICT,
+        count_tokens=len,
+    )
+    assert result.projection.profile == SchemaProfile.STRICT
+    schema = cast("dict[str, Any]", result.output_schema)
+    assert "where" not in schema["$defs"]["SemanticQuery"]["properties"]
+    assert "where" in result.text
+    payload: dict[str, object]
+    if result.target == "query":
+        payload = {
+            "outcome": {
+                "kind": "plan",
+                "plan": {"steps": [{"intent": "headline", "query": {"where": None}}]},
+            }
+        }
+    else:
+        payload = {"examples": [{"question": "show orders", "query": {"where": None}}]}
+    with pytest.raises(ValueError):
+        result.validate_payload(payload)
+    assert result.token_count == len(result.text)
 
 
 @pytest.mark.parametrize(
@@ -229,6 +261,7 @@ def test_apply_prompt_augmentation_accepts_compilable_scoped_example_and_fixed_g
         request,
         augmentation,
         viewer=AuthContext(viewer_id="analyst", roles=["analyst"]),
+        policy=AdaptivePromptPolicy(max_tokens=40000),
         instructions=host_instructions,
     )
 

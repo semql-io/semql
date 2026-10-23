@@ -38,6 +38,7 @@ front door for this projection.
 from __future__ import annotations
 
 import copy
+from collections.abc import Sequence
 from typing import Any, cast
 
 
@@ -146,6 +147,49 @@ def to_llm_safe_schema(schema: dict[str, Any]) -> dict[str, Any]:
         if not defs:
             schema.pop("$defs", None)
     return schema
+
+
+def profile_schema(
+    schema: dict[str, Any], *, removed_properties: frozenset[str], strict: bool
+) -> dict[str, Any]:
+    """Project declared semantic features, preserving all other payloads."""
+    projected = copy.deepcopy(flatten_root_ref(schema))
+
+    def remove_declared(node: JSONNode) -> None:
+        if isinstance(node, dict):
+            obj = cast("dict[str, Any]", node)
+            if obj.get("title") == "SemanticQuery":
+                properties = obj.get("properties")
+                if isinstance(properties, dict):
+                    props = cast("dict[str, Any]", properties)
+                    removed = [name for name in removed_properties if name in props]
+                    for name in removed:
+                        del props[name]
+                    required = obj.get("required")
+                    if isinstance(required, list):
+                        required_items = cast("Sequence[object]", required)
+                        obj["required"] = [name for name in required_items if name not in removed]
+            for value in obj.values():
+                remove_declared(value)
+        elif isinstance(node, list):
+            values: Sequence[object] = _as_list(node)
+            for value in values:
+                remove_declared(value)
+
+    remove_declared(projected)
+    if strict:
+        defs_value = projected.get("$defs")
+        if isinstance(defs_value, dict):
+            defs = cast("dict[str, Any]", defs_value)
+            _prune_unreachable_defs(projected, defs)
+            cyclic = _cyclic_def_names(_ref_edges(defs))
+            if cyclic:
+                raise ValueError(
+                    "strict schema projection cannot preserve recursive required payloads: "
+                    + ", ".join(sorted(cyclic))
+                )
+        _inline_prefix_items(projected)
+    return projected
 
 
 # A JSON-Schema subtree, recursively: an object (``dict[str, JSONNode]``), an
@@ -292,4 +336,4 @@ def _prune_unreachable_defs(schema: dict[str, Any], defs: dict[str, Any]) -> Non
             del defs[name]
 
 
-__all__ = ["flatten_root_ref", "to_llm_safe_schema"]
+__all__ = ["flatten_root_ref", "profile_schema", "to_llm_safe_schema"]

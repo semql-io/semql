@@ -470,6 +470,20 @@ def parse_sql_statement(
             resolved_references=resolved_refs,
         )
 
+    if ast.find(exp.Window) is not None:
+        msg = (
+            "Window functions (including partition ranking) are unsupported "
+            "by the semantic SQL parser."
+        )
+        if strict:
+            raise ParseError(msg)
+        errors.append(msg)
+        return ParserDecision(
+            query=SemanticQuery(),
+            original_statement=statement,
+            parse_errors=tuple(errors),
+            resolved_references=resolved_refs,
+        )
     ctx = _build_resolve_ctx(ast, catalog)
     if not ctx.cubes and catalog:
         msg = "Could not determine cube name from FROM clause."

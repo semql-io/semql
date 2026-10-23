@@ -36,6 +36,7 @@ from semql_prompt.catalog_tools import to_openai_tools
 if TYPE_CHECKING:
     from semql import Catalog
     from semql.model import AuthContext
+from semql.schema import SchemaProfile, SemanticFeature
 
 
 def to_bedrock_converse_tools(
@@ -43,6 +44,8 @@ def to_bedrock_converse_tools(
     *,
     viewer: AuthContext | None = None,
     only_exposed: bool = True,
+    profile: SchemaProfile = SchemaProfile.TOOL,
+    disabled_features: tuple[SemanticFeature | str, ...] = (),
 ) -> list[dict[str, Any]]:
     """One Bedrock Converse ``toolSpec`` per visible cube + saved query.
 
@@ -58,7 +61,13 @@ def to_bedrock_converse_tools(
     :func:`flatten_root_ref` for Converse root-``$ref`` compatibility.
     """
     tools: list[dict[str, Any]] = []
-    for tool in to_openai_tools(catalog, viewer=viewer, only_exposed=only_exposed):
+    for tool in to_openai_tools(
+        catalog,
+        viewer=viewer,
+        only_exposed=only_exposed,
+        profile=profile,
+        disabled_features=disabled_features,
+    ):
         fn = tool["function"]
         tools.append(
             {

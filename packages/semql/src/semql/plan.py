@@ -21,10 +21,12 @@ HTTP) — the structured output is the contract.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from semql.model import FrozenModel
 from semql.spec import SemanticQuery
 from semql.visualize import VizDecision
 
@@ -76,36 +78,24 @@ QueryIntent = Literal["headline", "breakdown", "compare", "context"]
 """
 
 
-class QueryStep(BaseModel):
-    """One compiled-but-not-yet-run query inside a ``QueryPlan``.
+class QueryStep(FrozenModel):
+    """One compiled-but-not-yet-run query inside a ``QueryPlan``."""
 
-    ``intent`` lets the Presenter compose a coherent answer — the
-    headline gets prose, breakdowns become tables / charts, compares
-    surface as deltas. A bare ``list[SemanticQuery]`` would force the
-    Presenter to re-infer intent from shape, which is fragile.
-
-    ``label`` is an optional human-readable description (e.g. "Q4
-    revenue vs Q3"); useful for prose generation and for the UI when
-    showing the plan to the user.
-    """
-
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, extra="forbid")
     query: SemanticQuery
     intent: QueryIntent
     label: str | None = None
 
 
-class QueryPlan(BaseModel):
-    """The Query Generator's output. A list of typed ``QueryStep``s
-    that compile and execute independently, plus optional reasoning.
+class QueryPlan(FrozenModel):
+    """Ordered immutable query steps plus optional reasoning.
 
-    Empty ``steps`` is legal — it means the Generator could not
-    formulate a query for the routed question. Treat it as "ask the
-    user to rephrase," not as a successful answer.
+    Empty plans remain useful as host-side intermediate state. Planner-facing
+    ``PlanOutcome`` enforces a nonempty plan at the protocol boundary.
     """
 
-    model_config = ConfigDict(frozen=True)
-    steps: list[QueryStep] = []
+    model_config = ConfigDict(frozen=True, extra="forbid")
+    steps: Sequence[QueryStep] = Field(default_factory=tuple)
     reasoning: str | None = None
 
 

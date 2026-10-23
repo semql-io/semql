@@ -20,6 +20,7 @@ import asyncio
 from collections.abc import Awaitable
 from typing import Any
 
+import pytest
 from fastmcp import Client
 from semql import (
     Catalog,
@@ -152,6 +153,8 @@ def test_resolve_lookup_exact_match_returns_single_value() -> None:
     assert out["dimension"] == "orders.region"
     assert out["query"] == "emea"
     assert out["values"] == ["EMEA"]
+    assert out["status"] == "resolved"
+    assert out["authoritative"] is True
 
 
 def test_resolve_lookup_substring_match_returns_canonical_values() -> None:
@@ -187,21 +190,6 @@ def test_resolve_lookup_label_match_works() -> None:
     assert out["values"] == ["AMER"]
 
 
-def test_resolve_lookup_unknown_dimension_returns_error() -> None:
-    s = _server(_static_catalog())
-
-    async def call() -> Any:  # noqa: ANN401
-        async with _client(s) as c:
-            return await c.call_tool(
-                "resolve_lookup",
-                {"dimension": "orders.region", "query": "ignored"},
-            )
-
-    # Sanity check: a known dimension call shouldn't error.
-    result = _run(call())
-    assert not result.is_error
-
-
 def test_resolve_lookup_no_match_returns_empty_values() -> None:
     s = _server(_static_catalog())
 
@@ -215,6 +203,7 @@ def test_resolve_lookup_no_match_returns_empty_values() -> None:
 
     out = _run(call())
     assert out["values"] == []
+    assert out["status"] == "not_found"
 
 
 # ---------------------------------------------------------------------------
@@ -337,3 +326,71 @@ def test_resolve_lookup_threads_viewer_into_context() -> None:
     public_out = _run(call(viewer_id="u2", roles=[]))
     assert "secret_c" in admin_out["values"]
     assert "secret_c" not in public_out["values"]
+
+
+@pytest.mark.parametrize(
+    ("values", "labels", "query", "cap", "expected", "total", "match_kind"),
+    [
+        (
+            ("retail_a", "retail_b"),
+            {"retail_a": "Retail", "retail_b": "Retail"},
+            "Retail",
+            5,
+            ["retail_a", "retail_b"],
+            2,
+            "exact",
+        ),
+        (("retail_a", "retail_b"), None, "retail", 1, ["retail_a"], 2, "substring"),
+        (("retail",), None, "retial", 5, ["retail"], 1, "fuzzy"),
+    ],
+)
+def test_resolve_lookup_reports_uncertainty_before_candidate_truncation(
+    values: tuple[str, ...],
+    labels: dict[str, str] | None,
+    query: str,
+    cap: int,
+    expected: list[str],
+    total: int,
+    match_kind: str,
+) -> None:
+    server = _server(
+        Catalog(
+            [_orders_cube()],
+            lookups=[Lookup(dimension="orders.region", values=values, labels=labels)],
+        )
+    )
+
+    async def call() -> dict[str, Any]:
+        async with _client(server) as client:
+            result = await client.call_tool(
+                "resolve_lookup",
+                {"dimension": "orders.region", "query": query, "max_candidates": cap},
+            )
+            return result.data  # type: ignore[no-any-return]
+
+    outcome = _run(call())
+    assert outcome["values"] == expected
+    assert outcome["status"] == "ambiguous"
+    assert outcome["authoritative"] is False
+    assert outcome["match_kind"] == match_kind
+    assert outcome["total_candidates"] == total
+    assert outcome["truncated"] is (total > cap)
+    assert outcome["complete"] is (total <= cap)
+
+
+def test_resolve_lookup_distinguishes_unavailable_context_from_no_match() -> None:
+    server = _server(_dynamic_catalog())
+
+    async def call(context: dict[str, str] | None) -> dict[str, Any]:
+        async with _client(server) as client:
+            result = await client.call_tool(
+                "resolve_lookup",
+                {"dimension": "orders.region", "query": "zzzzz", "context": context},
+            )
+            return result.data  # type: ignore[no-any-return]
+
+    unavailable = _run(call(None))
+    not_found = _run(call({"tenant": "acme"}))
+    assert unavailable["status"] == "unavailable"
+    assert not_found["status"] == "not_found"
+    assert unavailable["values"] == not_found["values"] == []

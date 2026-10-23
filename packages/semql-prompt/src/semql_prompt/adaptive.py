@@ -11,8 +11,11 @@ from semql import AuthContext, Catalog, Cube, Diagnostic, ResolutionContext
 from semql.introspect import viewer_sees
 from semql.model import BaseField, Dialect, GlossaryEntry
 from semql.retrieve import SQLiteBM25Retriever
+from semql.schema import SchemaProfile, SemanticFeature
 
-from semql_prompt.prompt import CatalogPrompt, build_query_generator_prompt_fragment
+from semql_prompt.continuation import ContinuationState
+from semql_prompt.generation import GenerationContract, build_generation_contract
+from semql_prompt.prompt import CatalogPrompt
 from semql_prompt.prompt_budget import PromptBudget
 
 
@@ -46,11 +49,12 @@ class AdaptivePromptPolicy(BaseModel):
 
 
 class AdaptivePromptResult(BaseModel):
-    """Rendered prompt plus selection and complete-prompt budget evidence."""
+    """Rendered prompt plus selection, schema, and complete-prompt budget evidence."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, arbitrary_types_allowed=True)
 
     text: str
+    generation_contract: GenerationContract
     selected_cubes: tuple[str, ...]
     selection_reason: Literal["explicit", "question", "conversation", "fallback", "empty"]
     token_count: int = Field(ge=0)
@@ -300,6 +304,12 @@ def build_adaptive_prompt(
     policy: AdaptivePromptPolicy | None = None,
     count_tokens: Callable[[str], int] | None = None,
     instructions: str | None = None,
+    profile: SchemaProfile = SchemaProfile.TOOL,
+    disabled_features: Sequence[SemanticFeature | str] = (),
+    output_model: type[BaseModel] | None = None,
+    continuation: ContinuationState | None = None,
+    current_authorized_cubes: Sequence[str] | None = None,
+    current_visibility_revision: str | None = None,
 ) -> AdaptivePromptResult:
     """Build a deterministic, authorized, budgeted Query Generator prompt.
 
@@ -327,8 +337,13 @@ def build_adaptive_prompt(
     )
     if not can_render_domain:
         chosen = {name: cube.model_copy(update={"relations": ""}) for name, cube in chosen.items()}
-    prompt = build_query_generator_prompt_fragment(
+    from semql_prompt.outcomes import PlannerResponse
+
+    generation_contract = build_generation_contract(
         chosen,
+        profile=profile,
+        disabled_features=disabled_features,
+        output_model=output_model or PlannerResponse,
         only_exposed=True,
         viewer=viewer,
         policy=None,
@@ -341,7 +356,12 @@ def build_adaptive_prompt(
         glossary=glossary,
         relations=catalog.relations if can_render_domain else "",
         instructions=instructions,
+        continuation=continuation,
+        continuation_catalog=catalog if continuation is not None else None,
+        current_authorized_cubes=current_authorized_cubes if continuation is not None else None,
+        current_visibility_revision=current_visibility_revision,
     )
+    prompt = generation_contract.text
     units = _runtime_context(request, safe_diagnostics)
     dropped: list[str] = []
     protected = frozenset(selected)
@@ -385,6 +405,12 @@ def build_adaptive_prompt(
     if dropped:
         budgeted = budgeted.model_copy(update={"dropped": tuple((*budgeted.dropped, *dropped))})
     return AdaptivePromptResult(
+        generation_contract=GenerationContract(
+            output_model=generation_contract.output_model,
+            projection=generation_contract.projection,
+            text=budgeted.text,
+            disabled_features=generation_contract.disabled_features,
+        ),
         text=budgeted.text,
         selected_cubes=tuple(selected),
         selection_reason=reason,

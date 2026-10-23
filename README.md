@@ -99,6 +99,43 @@ scope predicate inside the alias, so no outer `OR` can reach a row
 the viewer isn't authorised to see. Identity and context values
 always bind as parameters — never SQL literals.
 
+## Top grouped rows per partition
+
+Select the top three sales reps in each region, using the catalog above:
+
+```python
+from semql import PartitionRank, RankOrder
+
+ranked = catalog.compile(
+    SemanticQuery(
+        dimensions=["orders.region", "orders.rep_id"],
+        measures=["orders.revenue"],
+        rank=PartitionRank(
+            partition_by=["orders.region"],
+            order_by=[
+                RankOrder(field="orders.revenue", direction="desc", nulls="last")
+            ],
+            count=3,
+            ties="exact",
+        ),
+        order=[("orders.region", "asc"), ("orders.revenue", "desc")],
+    ),
+    viewer=viewer,
+    context={"ctx.viewer_team": "EMEA-East"},
+)
+```
+
+Ranking runs **after aggregation, selected derived measures, and HAVING**, but
+before final ordering and any global limit/offset. `ties="exact"` selects up to
+N rows per partition with deterministic remaining-group-key tie breakers;
+`ties="include"` includes every tie at the Nth boundary (`RANK`, not
+`DENSE_RANK`). Null scores default to `NULLS LAST`. Ranking requires grouped,
+single-backend output; comparison, dense-time fill, and genuine multi-backend
+federation are unsupported. It is a `SemanticQuery` API, not a semantic-SQL
+parser/serializer round-trip. See the
+[migration guide](docs/migrations/planner-contracts-ranking.md) and
+[`demos/partitioned_ranking_demo.py`](demos/partitioned_ranking_demo.py).
+
 ## Run it end-to-end
 
 `semql` stops at SQL — running it is the caller's job. `semql-engine`
@@ -159,7 +196,7 @@ Bring your own LLM. Each role pairs a **prompt-fragment builder**
 | Role | Fragment builder | Output model |
 |---|---|---|
 | Router | `build_router_prompt_fragment` | `RouterDecision` |
-| Query Generator | `build_query_generator_prompt_fragment` | `QueryPlan` (list of `QueryStep` with intent) |
+| Query Generator | `build_query_generator_prompt_fragment` | `PlannerResponse` (plan / context / clarification / cannot-plan) |
 | Presenter | `build_presenter_prompt_fragment` | `Presentation` |
 | Drilldown | `build_drilldown_prompt_fragment` | `DrilldownSuggestions` |
 
@@ -170,13 +207,30 @@ catalog. Run with `uv run demos/pipeline_demo.py`.
 ## Surface to LLMs
 
 ```python
-from semql_prompt import build_planner_prompt_fragment
+from semql import SchemaProfile
+from semql_prompt import build_generation_contract
 
-# planner-facing fragment, viewer-filtered
-print(build_planner_prompt_fragment(catalog.as_dict(), viewer=viewer))
+contract = build_generation_contract(
+    catalog.as_dict(), viewer=viewer, profile=SchemaProfile.STRICT,
+)
+prompt_fragment = contract.text
+response_schema = contract.schema
+losses = contract.report.removed_features, contract.report.weakened_constraints
 ```
 
-Catalog cubes the viewer can't see vanish from the rendered prompt.
+Supply this paired prompt/schema to your own structured-output client, then
+call `contract.validate_payload(parsed_payload)`. `SchemaProfile.TOOL` preserves
+recursive Boolean filters and semi-joins; `STRICT` omits `where` and `semi_joins`
+and weakens tuple-position schema validation for restrictive decoders. Inspect
+the loss report and still validate canonically. You can explicitly disable
+`SemanticFeature.RANK`, `WHERE`, or `SEMI_JOINS` for a request.
+
+A profile describes **representation**, not compiler support or authorization.
+Catalog visibility is viewer-filtered; every executable proposal still needs
+current host authorization and compilation. Adaptive and repair prompts include
+mandatory output schemas, and continuation locks cannot be trimmed away to make
+a budget fit. Check the returned `fits` before calling a model; the adaptive and
+repair demos use `max_tokens=40_000`, not a guaranteed minimum for other catalogs.
 
 ## Minimal example: MCP server
 
@@ -206,40 +260,65 @@ server.run(transport="stdio")
 For exec mode, pass an `executor: (sql, params) -> list[dict]` and a
 `query_execute` tool registers alongside the compile-only ones.
 
-## Minimal example: Pydantic text-to-SQL chatbot agent
+## Minimal example: provider-neutral text-to-SQL chatbot
 
-Pair prompt-fragment builders with typed Pydantic outputs. The
-generator's `QueryPlan` contains `SemanticQuery` objects you feed
-straight into `Catalog.compile`.
+The generator now returns a `PlannerResponse` with four peer outcomes, not an
+empty `QueryPlan` to signal failure. The function below consumes a parsed JSON
+payload from your own client, using the same generation contract supplied to
+that client. It executes only plan outcomes and leaves context retrieval,
+clarification, rendering, and model calls with the host.
 
 ```python
-from pydantic_ai import Agent
 from semql import Catalog
-from semql.plan import QueryPlan
-from semql_prompt import build_query_generator_prompt_fragment
-
-generator = Agent(
-    model="openai:gpt-4o",
-    system_prompt=build_query_generator_prompt_fragment(catalog.as_dict()),
-    result_type=QueryPlan,
+from semql_prompt import (
+    CannotPlan, GenerationContract, NeedContext, NeedUserClarification,
+    PlannerResponse, PlanOutcome,
 )
 
-def answer(question: str, catalog: Catalog, run_sql) -> str:
-    plan: QueryPlan = generator.run_sync(question).data
-    if not plan.steps:
-        return "I couldn't map that to the catalog."
-    head = plan.steps[0]
-    compiled = catalog.compile(head.query)
-    rows = run_sql(compiled.sql, compiled.params)  # your DB driver
-    return f"{head.label or 'Result'}: {rows}"
+
+def answer(payload, catalog: Catalog, contract: GenerationContract, run_sql,
+           *, viewer, context):
+    response = contract.validate_payload(payload)
+    assert isinstance(response, PlannerResponse)
+    outcome = response.outcome
+    if isinstance(outcome, NeedContext):
+        return {"kind": outcome.kind, "requests": outcome.requests}
+    if isinstance(outcome, NeedUserClarification):
+        return {
+            "kind": outcome.kind,
+            "decision_id": outcome.decision_id,
+            "prompt": outcome.prompt,
+            "choices": outcome.choices,
+        }
+    if isinstance(outcome, CannotPlan):
+        return {"kind": outcome.kind, "diagnostics": outcome.diagnostics}
+    assert isinstance(outcome, PlanOutcome)
+    compiled = [
+        catalog.compile(step.query, viewer=viewer, context=context)
+        for step in outcome.plan.steps
+    ]
+    return {
+        "kind": "plan",
+        "results": [
+            {"label": step.label or "Result",
+             "rows": run_sql(query.sql, query.params)}
+            for step, query in zip(outcome.plan.steps, compiled, strict=True)
+        ],
+    }
 ```
 
-The four prompt-fragment builders (`build_router_prompt_fragment`,
-`build_query_generator_prompt_fragment`, `build_presenter_prompt_fragment`,
-`build_drilldown_prompt_fragment`) pair one-to-one with the four output
-models in `semql.plan` (`RouterDecision`, `QueryPlan`, `Presentation`,
-`DrilldownSuggestions`). `demos/pipeline_demo.py` wires the full
-Router → Generator → Compile → Presenter → Drilldown chain.
+Parsing does not authorize a query or make model-selected context requests
+trusted. For a resumed conversation, use host-confirmed typed decisions and
+`accept_continuation`, rather than executing a newly parsed plan directly.
+The host owns correlation, retrieval, confirmation, budgets, and termination.
+See the [migration guide](docs/migrations/planner-contracts-ranking.md) and
+[`demos/planner_continuation_demo.py`](demos/planner_continuation_demo.py).
+
+Router, Presenter, and Drilldown still use `RouterDecision`, `Presentation`,
+and `DrilldownSuggestions` from `semql.plan`. `QueryPlan` remains the immutable
+plan payload inside `PlanOutcome`; it is no longer the generator's default
+outer response. `demos/pipeline_demo.py` illustrates the four-role flow without
+requiring a model provider.
 
 ## Skills
 

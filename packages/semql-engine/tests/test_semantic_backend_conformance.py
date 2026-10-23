@@ -45,6 +45,7 @@ from semql import (
 from semql.compile import CompiledQuery
 from semql.model import DimTypeLiteral
 from semql.parse import parse_sql_statement
+from semql.spec import PartitionRank, RankOrder
 from semql.unparse import query_to_sql
 from semql_engine import AdapterResult, DBAPIAdapter, DuckDBAdapter, DuckDBMergeEngine, Engine
 from semql_engine.adapter import Adapter
@@ -708,6 +709,23 @@ def test_real_symmetric_observed_population(backend: _Backend, exclude_b: bool) 
         assert {
             row["id"]: (row["amount"], row["hours"]) for row in backend.rows(native)
         } == expected
+        ranked = compile_query(
+            query.model_copy(
+                update={
+                    "rank": PartitionRank(
+                        order_by=[RankOrder(field="amount", direction="desc")], count=1
+                    )
+                }
+            ),
+            native_catalog,
+            context=context,
+            viewer=viewer,
+            catalog_context=catalog_context,
+        )
+        winner = "A" if exclude_b else "B"
+        assert {row["id"]: (row["amount"], row["hours"]) for row in backend.rows(ranked)} == {
+            winner: expected[winner]
+        }
         if backend.dialect == Dialect.DUCKDB:
             return
         plan = compile_federated_query(
@@ -1002,3 +1020,188 @@ def test_nullable_comparison_keys_do_not_collide_with_typed_sentinels(
         )
         for row in rows
     } == {(5, 2, 3, 150), (7, 4, 3, 75), (11, 1, 10, 1000)}
+
+
+@pytest.fixture(scope="module")
+def ranking_catalog(backend: _Backend) -> Catalog:
+    table = f"{backend.prefix}ranked_sales"
+    if backend.dialect == Dialect.CLICKHOUSE:
+        backend.setup(
+            f"CREATE TABLE {table} (category Nullable(String), product String, "
+            "amount Float64, views Float64, tenant String) ENGINE=Memory"
+        )
+    else:
+        backend.setup(
+            f"CREATE TABLE {table} (category VARCHAR, product VARCHAR, "
+            "amount DOUBLE PRECISION, views DOUBLE PRECISION, tenant VARCHAR)"
+        )
+    backend.setup(
+        f"INSERT INTO {table} VALUES "
+        "('A','a',60,100,'visible'),('A','a',40,100,'visible'),"
+        "('A','b',100,100,'visible'),('A','c',90,30,'visible'),"
+        "('A','d',5,0,'visible'),"
+        "('B','e',80,100,'visible'),('B','f',70,100,'visible'),"
+        "('B','g',70,100,'visible'),('B','z',1,0,'visible'),"
+        "(NULL,'h',50,100,'visible'),(NULL,'i',40,100,'visible'),"
+        "('A','private',1000,1,'hidden')"
+    )
+    return Catalog(
+        [
+            Cube(
+                name="ranked",
+                table=table,
+                alias="r",
+                dialect=backend.dialect,
+                security_sql="{r}.tenant = {ctx.tenant}",
+                security_ctx_keys=["tenant"],
+                dimensions=[
+                    Dimension(name="category", sql="{r}.category", type="string"),
+                    Dimension(name="product", sql="{r}.product", type="string"),
+                ],
+                measures=[
+                    Measure(name="amount", sql="{r}.amount", agg="sum"),
+                    Measure(name="views", sql="{r}.views", agg="sum"),
+                ],
+            )
+        ]
+    )
+
+
+@pytest.mark.parametrize(
+    ("ties", "count", "expected"),
+    [
+        ("exact", 1, {"a": 100.0, "e": 80.0, "h": 50.0}),
+        ("include", 1, {"a": 100.0, "b": 100.0, "e": 80.0, "h": 50.0}),
+        ("exact", 2, {"a": 100.0, "b": 100.0, "e": 80.0, "f": 70.0, "h": 50.0, "i": 40.0}),
+        (
+            "include",
+            2,
+            {"a": 100.0, "b": 100.0, "e": 80.0, "f": 70.0, "g": 70.0, "h": 50.0, "i": 40.0},
+        ),
+        (
+            "exact",
+            20,
+            {
+                "a": 100.0,
+                "b": 100.0,
+                "c": 90.0,
+                "d": 5.0,
+                "e": 80.0,
+                "f": 70.0,
+                "g": 70.0,
+                "z": 1.0,
+                "h": 50.0,
+                "i": 40.0,
+            },
+        ),
+    ],
+)
+def test_partitioned_ranking_aggregates_before_scoped_selection(
+    backend: _Backend,
+    ranking_catalog: Catalog,
+    ties: str,
+    count: int,
+    expected: dict[str, float],
+) -> None:
+    rank = PartitionRank.model_validate(
+        {
+            "partition_by": ["ranked.category"],
+            "order_by": [{"field": "ranked.amount", "direction": "desc"}],
+            "count": count,
+            "ties": ties,
+        }
+    )
+    compiled = ranking_catalog.compile(
+        SemanticQuery(
+            dimensions=["ranked.category", "ranked.product"],
+            measures=["ranked.amount"],
+            rank=rank,
+        ),
+        viewer=AuthContext(viewer_id="ranking-reader"),
+        context={"ctx.tenant": "visible"},
+    )
+    rows = backend.rows(compiled)
+    assert {str(row["product"]): float(row["amount"]) for row in rows} == expected
+    assert {row["product"] for row in rows if row["category"] is None} == (
+        {"h"} if count == 1 else {"h", "i"}
+    )
+
+
+@pytest.mark.parametrize(
+    ("nulls", "expected"),
+    [
+        ("last", {"c": 3.0, "e": 0.8, "h": 0.5}),
+        ("first", {"d": None, "z": None, "h": 0.5}),
+    ],
+)
+def test_partitioned_ranking_uses_derived_outputs_and_explicit_null_order(
+    backend: _Backend,
+    ranking_catalog: Catalog,
+    nulls: str,
+    expected: dict[str, float | None],
+) -> None:
+    order = RankOrder.model_validate({"field": "conversion", "direction": "desc", "nulls": nulls})
+    compiled = ranking_catalog.compile(
+        SemanticQuery(
+            dimensions=["ranked.category", "ranked.product"],
+            measures=["ranked.amount"],
+            derived_measures=[
+                InlineDerived(
+                    name="conversion", op="ratio", operands=["ranked.amount", "ranked.views"]
+                )
+            ],
+            rank=PartitionRank(
+                partition_by=["ranked.category"], order_by=[order], count=1, ties="exact"
+            ),
+        ),
+        viewer=AuthContext(viewer_id="ranking-reader"),
+        context={"ctx.tenant": "visible"},
+    )
+    assert {
+        str(row["product"]): (None if row["conversion"] is None else float(row["conversion"]))
+        for row in backend.rows(compiled)
+    } == expected
+
+
+def test_partitioned_ranking_having_aliases_and_final_global_limit(
+    backend: _Backend, ranking_catalog: Catalog
+) -> None:
+    compiled = ranking_catalog.compile(
+        SemanticQuery(
+            dimensions=["ranked.category", "ranked.product"],
+            measures=["ranked.amount"],
+            aliases={"total": "ranked.amount"},
+            having=[Filter(dimension="ranked.amount", op="lt", values=[100])],
+            rank=PartitionRank(
+                partition_by=["ranked.category"],
+                order_by=[RankOrder(field="total", direction="desc")],
+                count=2,
+                ties="exact",
+            ),
+            order=[("total", "desc"), ("ranked.product", "asc")],
+            limit=3,
+        ),
+        viewer=AuthContext(viewer_id="ranking-reader"),
+        context={"ctx.tenant": "visible"},
+    )
+    assert [(row["product"], float(row["total"])) for row in backend.rows(compiled)] == [
+        ("c", 90.0),
+        ("e", 80.0),
+        ("f", 70.0),
+    ]
+
+
+def test_partitioned_ranking_runs_after_rollup_reaggregation(backend: _Backend) -> None:
+    query = SemanticQuery(
+        dimensions=["events.region"],
+        measures=["events.amount", "events.n"],
+        rank=PartitionRank(order_by=[RankOrder(field="events.n", direction="desc")], count=1),
+    )
+    for use_rollup in (False, True):
+        compiled = backend.compile(query, rollup=use_rollup)
+        if use_rollup:
+            assert compiled.applied_rollup == "by_region"
+        rows = backend.rows(compiled)
+        assert [(row["region"], float(row["amount"]), int(row["n"])) for row in rows] == [
+            ("A", 60.0, 3)
+        ]

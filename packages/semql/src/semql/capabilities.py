@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from semql.errors import ContractError, Diagnostic
-from semql.spec import SemanticQuery
+from semql.spec import SemanticQuery, rank_shape_errors
 
 
 def check_query_capabilities(query: SemanticQuery) -> tuple[Diagnostic, ...]:
@@ -42,6 +42,15 @@ def check_query_capabilities(query: SemanticQuery) -> tuple[Diagnostic, ...]:
                 stage="lowering",
             )
         )
+    diagnostics.extend(
+        Diagnostic(
+            code="capability_unsupported",
+            reason=reason,
+            operation="rank",
+            stage="lowering",
+        )
+        for reason in rank_shape_errors(query)
+    )
     return tuple(diagnostics)
 
 

@@ -174,10 +174,18 @@ class _Graph:
                 normalized = tuple(sorted((self.binding(item) for item in value), key=repr))
             elif name.endswith("binding_ref"):
                 normalized = self.binding(value)
-            elif name == "grain_node_ids":
+            elif name in {"grain_node_ids", "partition_node_ids"}:
                 normalized = tuple(sorted((self.node(item) for item in value), key=repr))
+            elif name == "tie_breaker_node_ids":
+                normalized = tuple(self.node(item) for item in value)
             elif name == "order":
-                normalized = tuple((self.node(item[0]), item[1]) for item in value)
+                normalized = tuple(
+                    (
+                        self.node(item[0]),
+                        *item[1:],
+                    )
+                    for item in value
+                )
             elif name in {"grain_refs", "source_refs", "policy_refs", "mask_roles"}:
                 normalized = tuple(sorted(value))
             elif isinstance(value, BaseModel):
@@ -261,7 +269,8 @@ def compare_analysis(
 
     if left.schema_version != 1 or right.schema_version != 1:
         return result(ComparisonResult.NOT_ESTABLISHED, "analysis_version_unsupported")
-    if left.required_semantics or right.required_semantics:
+    supported_required = {"partition_ranking"}
+    if not (set(left.required_semantics) | set(right.required_semantics)) <= supported_required:
         return result(ComparisonResult.NOT_ESTABLISHED, "required_semantics_unsupported")
     lg, rg = _Graph(left), _Graph(right)
     try:

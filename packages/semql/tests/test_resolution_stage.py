@@ -14,9 +14,11 @@ from __future__ import annotations
 from semql import Catalog, Cube, Dialect, Dimension, Filter, Join, Lookup, Measure, SemanticQuery
 from semql.lookups import (
     QueryResolution,
+    resolve,
     resolve_outcome,
     resolve_query_filters,
 )
+from semql.model import ResolutionContext
 
 
 def _catalog() -> Catalog:
@@ -62,10 +64,83 @@ def test_resolve_outcome_multiple_hits_is_ambiguous() -> None:
     assert set(out.values) == {"EMEA", "APAC", "NA"}
 
 
-def test_resolve_outcome_no_match_is_unresolved() -> None:
+def test_resolve_outcome_no_match_is_not_found() -> None:
     out = resolve_outcome(_catalog(), "orders.region", "zzzzz")
-    assert out.status == "unresolved"
+    assert out.status == "not_found"
     assert out.values == ()
+
+
+def test_duplicate_exact_labels_remain_ambiguous() -> None:
+    cat = Catalog(
+        cubes=list(_catalog()),
+        lookups=[
+            Lookup(
+                dimension="orders.region",
+                values=("EMEA", "EU"),
+                labels={"EMEA": "Europe", "EU": "Europe"},
+            )
+        ],
+    )
+    out = resolve_outcome(cat, "orders.region", "Europe")
+    assert out.status == "ambiguous"
+    assert set(out.values) == {"EMEA", "EU"}
+
+
+def test_truncation_does_not_create_resolution_certainty() -> None:
+    out = resolve_outcome(_catalog(), "orders.region", "a", max_candidates=1)
+    assert out.status == "ambiguous"
+    assert out.complete is False
+    assert out.total_candidates > len(out.values)
+
+
+def test_single_fuzzy_suggestion_is_not_authoritative() -> None:
+    cat = Catalog(
+        cubes=list(_catalog()),
+        lookups=[Lookup(dimension="orders.region", values=("EMEA",))],
+    )
+    out = resolve_outcome(cat, "orders.region", "EMEAx")
+    assert out.status == "ambiguous"
+    assert out.authoritative is False
+    assert out.match_kind == "fuzzy"
+
+
+def test_candidate_list_respects_display_cap_without_implying_certainty() -> None:
+    assert resolve(_catalog(), "orders.region", "a", max_candidates=1) == ["EMEA"]
+    assert resolve_outcome(_catalog(), "orders.region", "a", max_candidates=1).status == "ambiguous"
+
+
+def test_candidate_list_keeps_non_authoritative_fuzzy_suggestions() -> None:
+    cat = Catalog(
+        cubes=list(_catalog()),
+        lookups=[Lookup(dimension="orders.region", values=("EMEA",))],
+    )
+    assert resolve(cat, "orders.region", "EMEAx") == ["EMEA"]
+
+
+def test_missing_dynamic_context_is_unavailable_not_no_match() -> None:
+    cat = Catalog(
+        cubes=list(_catalog()),
+        lookups=[Lookup(dimension="orders.region", loader=lambda _ctx: ["EMEA"])],
+    )
+    out = resolve_outcome(cat, "orders.region", "unknown")
+    assert out.status == "unavailable"
+
+
+def test_resolution_invokes_dynamic_loader_once() -> None:
+    calls = 0
+
+    def load(_ctx: object) -> list[str]:
+        nonlocal calls
+        calls += 1
+        return ["EMEA", "APAC"]
+
+    cat = Catalog(
+        cubes=list(_catalog()),
+        lookups=[Lookup(dimension="orders.region", loader=load)],
+    )
+    result = resolve_outcome(cat, "orders.region", "emea", ctx=ResolutionContext())
+    assert result.value == "EMEA"
+    assert calls == 1
 
 
 # ---------------------------------------------------------------------------
