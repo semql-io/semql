@@ -51,11 +51,11 @@ Package versions remain 0.13.0. No merge or publication is authorized here.
 ### Observed verification
 
 - Native `just check` with external backend endpoints unset and
-  `SEMQL_CONFORMANCE_TESTCONTAINERS=1`: **3,600 passed, 8 skipped, 1 xfailed;
+  `SEMQL_CONFORMANCE_TESTCONTAINERS=1`: **3,616 passed, 8 skipped, 1 xfailed;
   78 snapshots passed**. Ruff, mypy (287 files), Pyright, Tach, core boundaries,
   and frozen-model checks passed.
 - Targeted cohort and semantic-SQL regression run with DuckDB's optional `pytz`
-  timestamp dependency supplied through `uv run --with pytz`: **191 passed**.
+  timestamp dependency supplied through `uv run --with pytz`: **207 passed**.
   This exercised native DATE, naive/aware timestamps, UUID, exact DECIMAL
   identity, and refusal of lossy decimal semantic-SQL rendering.
 - Actual backend cohort conformance: **5 passed, 1 intentionally skipped**:
@@ -73,6 +73,15 @@ Package versions remain 0.13.0. No merge or publication is authorized here.
 - Public API checker against base
   `066c3d408e0f2f3b8e08e87aa9ca7215ba7c875b` reported no breaking changes
   in its checked surfaces (`semql`, `semql_mcp`, `semql_erd`).
+
+The first PR CI run passed its executed tests/static/build/API checks but failed
+the unchanged engine branch-coverage floor (82.27% versus 83%). Added real-driver
+type-drift failure cases, Boolean identity, floating comparison zero-denominator
+boundaries, and actual View-based execution, replacing internal binding-only
+assertions. The CI-equivalent engine-only run then passed **325 tests** with
+**84.16% branch-inclusive coverage**, retaining the 83% floor.
+
+PR: <https://github.com/semql-io/semql/pull/21>. Remains unmerged.
 
 ### Review-driven repairs
 

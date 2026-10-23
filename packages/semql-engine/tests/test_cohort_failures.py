@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Iterator, Mapping
 from dataclasses import replace
 from decimal import Decimal
-from typing import Any
+from typing import Any, Literal
 
 import duckdb
 import pytest
@@ -23,6 +23,7 @@ from semql import (
     InlineDerived,
     Measure,
     SemanticQuery,
+    View,
     compile_cohort_query,
 )
 from semql.errors import CompileError, FederationError
@@ -277,6 +278,7 @@ def test_corrupt_composed_projection_rejects_before_io(
     ("logical_type", "sql_type", "first", "second"),
     [
         ("date", "DATE", "2026-10-23", "2026-10-24"),
+        ("bool", "BOOLEAN", "true", "false"),
         ("time", "TIMESTAMP", "2026-10-23T01:02:03", "2026-10-24T01:02:03"),
         ("time", "TIMESTAMPTZ", "2026-10-23T01:02:03+00:00", "2026-10-24T01:02:03+00:00"),
         (
@@ -455,3 +457,151 @@ def test_measurement_arithmetic_does_not_require_comparison_units(
     )
     assert result.rows[0][-1] == Decimal("14")
     assert result.rows[1][-1] is None
+
+
+@pytest.mark.parametrize(
+    ("logical_type", "expression", "reason"),
+    [
+        ("number", "'not-numeric'", "cohort_member_key_type_mismatch"),
+        ("number", "true", "cohort_member_key_type_mismatch"),
+        ("number", "CAST('NaN' AS DOUBLE)", "cohort_nonfinite_member_key"),
+        ("uuid", "'not-a-uuid'", "cohort_member_key_type_mismatch"),
+        ("uuid", "1", "cohort_member_key_type_mismatch"),
+        ("date", "'not-a-date'", "cohort_member_key_type_mismatch"),
+        ("date", "1", "cohort_member_key_type_mismatch"),
+        ("time", "'not-a-timestamp'", "cohort_member_key_type_mismatch"),
+        ("time", "DATE '2026-10-23'", "cohort_member_key_type_mismatch"),
+        ("bool", "'true'", "cohort_member_key_type_mismatch"),
+        ("string", "1", "cohort_member_key_type_mismatch"),
+    ],
+)
+def test_incompatible_driver_keys_fail_before_measurement_io(
+    connection: duckdb.DuckDBPyConnection, logical_type: str, expression: str, reason: str
+) -> None:
+    connection.execute(
+        f"CREATE TABLE incompatible AS SELECT {expression} AS id, region, period, owner, amount "
+        "FROM facts"
+    )
+    cube = _cube().model_copy(
+        update={
+            "table": "incompatible",
+            "dimensions": [
+                Dimension.model_validate({"name": "id", "sql": "{f}.id", "type": logical_type}),
+                *_cube().dimensions[1:],
+            ],
+        }
+    )
+    adapter = _CountingAdapter(connection)
+    with pytest.raises(ExecutionContractError) as error:
+        run_cohort(
+            compile_cohort_query(
+                _query(), {cube.name: cube}, viewer=AuthContext(viewer_id="reader")
+            ),
+            Engine(adapters={Dialect.DUCKDB: adapter}),
+        )
+    assert error.value.reason == reason
+    assert len(adapter.calls) == 1
+
+
+@pytest.mark.parametrize(
+    ("op", "prior_amount", "expected"),
+    [
+        ("ratio", 10, 0.7),
+        ("ratio", 0, None),
+        ("percent_change", 10, -30.0),
+        ("percent_change", 0, None),
+    ],
+)
+def test_float_comparisons_preserve_division_and_missingness(
+    connection: duckdb.DuckDBPyConnection,
+    op: Literal["ratio", "percent_change"],
+    prior_amount: int,
+    expected: float | None,
+) -> None:
+    connection.execute(
+        "UPDATE facts SET amount = ? WHERE id = 1 AND period = 'prior'", [prior_amount]
+    )
+    cube = _cube()
+    cube = cube.model_copy(
+        update={"measures": [cube.measures[0].model_copy(update={"agg": "avg"})]}
+    )
+    query = _query()
+    current = query.measurements[0]
+    query = query.model_copy(
+        update={
+            "measurements": [
+                current,
+                current.model_copy(
+                    update={
+                        "name": "prior",
+                        "query": current.query.model_copy(
+                            update={
+                                "filters": [
+                                    Filter(dimension="facts.period", op="eq", values=["prior"])
+                                ]
+                            }
+                        ),
+                    }
+                ),
+            ],
+            "comparisons": [
+                CohortComparison(
+                    name="change",
+                    left=CohortMetric(measurement="current", column="amount"),
+                    right=CohortMetric(measurement="prior", column="amount"),
+                    op=op,
+                )
+            ],
+        }
+    )
+    result = run_cohort(
+        compile_cohort_query(query, {cube.name: cube}, viewer=AuthContext(viewer_id="reader")),
+        Engine(adapters={Dialect.DUCKDB: DuckDBAdapter(connection)}),
+    )
+    assert result.rows[0][-1] == (pytest.approx(expected) if expected is not None else None)
+    assert result.rows[1][-1] is None
+    assert result.presence["current"] == (True, False)
+
+
+def test_view_member_keys_and_attributes_execute_with_canonical_output_names(
+    connection: duckdb.DuckDBPyConnection,
+) -> None:
+    view = View(name="people", fields={"person": "facts.id", "area": "facts.region"})
+    query = _query()
+    source = query.cohort.source.model_copy(update={"dimensions": ["people.person", "people.area"]})
+    current = query.measurements[0]
+    query = query.model_copy(
+        update={
+            "cohort": Cohort(
+                source=source, member_keys=["people.person"], attributes=["people.area"]
+            ),
+            "measurements": [
+                current.model_copy(
+                    update={
+                        "query": current.query.model_copy(
+                            update={"dimensions": ["people.person", "people.area"]}
+                        ),
+                        "key_mapping": {"people.person": "people.person"},
+                        "attributes": ["people.area"],
+                    }
+                )
+            ],
+        }
+    )
+    cube = _cube()
+    result = run_cohort(
+        compile_cohort_query(
+            query,
+            {cube.name: cube},
+            views={view.name: view},
+            viewer=AuthContext(viewer_id="reader"),
+        ),
+        Engine(adapters={Dialect.DUCKDB: DuckDBAdapter(connection)}),
+    )
+    assert result.columns == (
+        "selection.person",
+        "selection.area",
+        "current.area",
+        "current.amount",
+    )
+    assert result.rows == ((1, "West", "West", Decimal("7")), (2, "East", None, None))

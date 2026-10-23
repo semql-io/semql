@@ -22,7 +22,6 @@ from semql import (
     Measure,
     SemanticQuery,
     TimeWindow,
-    View,
     compile_cohort_query,
     compile_query,
 )
@@ -132,16 +131,8 @@ def test_decimal_filter_literal_round_trips_and_binds_exactly() -> None:
         DecimalLiteral(value="NaN")
 
 
-def test_cohort_projection_uses_compiled_metadata_and_rejects_hidden_time_grain() -> None:
-    plan = compile_cohort_query(_query(), _catalog())
-    selection_id = next(column for column in plan.columns if column.name == "selection.id")
-    selection_meta = next(meta for meta in plan.source.column_meta if meta.name == "id")
-    assert selection_id.child_meta == selection_meta
-    current_amount = next(column for column in plan.columns if column.name == "current.amount")
-    current_meta = next(meta for meta in plan.measurements[0].column_meta if meta.name == "amount")
-    assert current_amount.child_meta == current_meta
-
-    source = plan.cohort.cohort.source.model_copy(
+def test_hidden_time_grain_is_rejected() -> None:
+    source = _query().cohort.source.model_copy(
         update={
             "time_dimension": TimeWindow(
                 dimension="activity.period",
@@ -245,34 +236,3 @@ def test_comparison_metadata_preserves_operand_masking() -> None:
     )
     assert metadata is not None
     assert metadata.masked
-
-
-def test_view_fields_bind_to_compiler_resolved_output_columns() -> None:
-    view = View(
-        name="activity_view",
-        fields={"person": "activity.id", "selected_region": "activity.region"},
-    )
-    source = SemanticQuery(dimensions=["activity_view.person", "activity_view.selected_region"])
-    query = CohortQuery(
-        cohort=Cohort(
-            source=source,
-            member_keys=["activity_view.person"],
-            attributes=["activity_view.selected_region"],
-        ),
-        measurements=[
-            CohortMeasurement(
-                name="current",
-                query=SemanticQuery(
-                    dimensions=["activity_view.person", "activity_view.selected_region"],
-                    measures=["activity.amount"],
-                ),
-                key_mapping={"activity_view.person": "activity_view.person"},
-                attributes=["activity_view.selected_region"],
-            )
-        ],
-    )
-
-    plan = compile_cohort_query(query, _catalog(), views={view.name: view})
-    assert plan.source.key_columns == ("person",)
-    assert plan.source.attribute_columns == ("selected_region",)
-    assert plan.measurements[0].key_columns == ("person",)
