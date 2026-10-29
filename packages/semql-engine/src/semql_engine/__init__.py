@@ -34,6 +34,7 @@ from semql_engine.engine import (
     MergeKeyValidationEvidence,
     to_async_merge_engine,
 )
+from semql_engine.execution import ExecutionLimits
 from semql_engine.rows import (
     InMemoryRowAdapter,
     RowCapableAdapter,
@@ -61,6 +62,7 @@ __all__ = [
     "Engine",
     "EngineError",
     "ExecutionContractError",
+    "ExecutionLimits",
     "ExecutionResult",
     "ExecutionRowIterator",
     "MergeKeyValidationEvidence",

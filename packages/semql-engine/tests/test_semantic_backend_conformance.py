@@ -8,6 +8,7 @@ named database/schema. No SQL rewriting or placeholder translation is used.
 
 from __future__ import annotations
 
+import collections
 import collections.abc
 import dataclasses
 import json
@@ -16,11 +17,12 @@ import urllib.parse
 import urllib.request
 import uuid
 from decimal import Decimal
-from typing import Any, LiteralString, cast
+from typing import Any, LiteralString, NoReturn, cast
 
 import duckdb
 import psycopg
 import pytest
+from adapter_conformance import SOURCE_ROWS, adapter_cases, assert_adapter
 from semql import (
     AuthContext,
     BoolExpr,
@@ -76,7 +78,11 @@ class _HTTPClickHouse:
         self.password = password
 
     def request(self, sql: str, params: collections.abc.Mapping[str, Any]) -> str:
-        options = {"database": self.database, "join_use_nulls": "1"}
+        options = {
+            "database": self.database,
+            "join_use_nulls": "1",
+            "output_format_json_quote_decimals": "1",
+        }
         if self.username is not None:
             options["user"] = self.username
         if self.password is not None:
@@ -94,10 +100,20 @@ class _HTTPClickHouse:
     def execute(self, sql: str, params: collections.abc.Mapping[str, Any]) -> AdapterResult:
         payload = json.loads(self.request(sql + " FORMAT JSON", params))
         columns = [str(item["name"]) for item in payload["meta"]]
+        column_types = [str(item["type"]) for item in payload["meta"]]
+        rows = [
+            tuple(
+                Decimal(str(row[column]))
+                if row[column] is not None and "Decimal(" in column_type
+                else row[column]
+                for column, column_type in zip(columns, column_types, strict=True)
+            )
+            for row in payload["data"]
+        ]
         return AdapterResult(
             columns=columns,
-            rows=[tuple(row[column] for column in columns) for row in payload["data"]],
-            column_types=[str(item["type"]) for item in payload["meta"]],
+            rows=rows,
+            column_types=column_types,
         )
 
 
@@ -188,7 +204,9 @@ def backend(request: pytest.FixtureRequest) -> collections.abc.Iterator[_Backend
                     "user=semql_test password=semql_test_password"
                 )
             if not dsn:
-                pytest.skip("set SEMQL_CONFORMANCE_POSTGRES or SEMQL_CONFORMANCE_TESTCONTAINERS=1")
+                _skip_or_fail_required(
+                    "set SEMQL_CONFORMANCE_POSTGRES or SEMQL_CONFORMANCE_TESTCONTAINERS=1"
+                )
             pg = psycopg.connect(dsn, autocommit=True, connect_timeout=10)
 
             def execute_postgres(sql: str) -> object:
@@ -228,7 +246,7 @@ def backend(request: pytest.FixtureRequest) -> collections.abc.Iterator[_Backend
                 port = container.get_exposed_port(8123)
                 url = f"http://{_url_host(host)}:{port}"
             if not url:
-                pytest.skip(
+                _skip_or_fail_required(
                     "set SEMQL_CONFORMANCE_CLICKHOUSE or SEMQL_CONFORMANCE_TESTCONTAINERS=1"
                 )
             root = _HTTPClickHouse(
@@ -328,6 +346,38 @@ def backend(request: pytest.FixtureRequest) -> collections.abc.Iterator[_Backend
         finally:
             if container is not None:
                 container.stop()
+
+
+def _skip_or_fail_required(reason: str) -> NoReturn:
+    if os.environ.get("SEMQL_CONFORMANCE_REQUIRED") == "1":
+        pytest.fail(f"required real-backend conformance tier unavailable: {reason}")
+    pytest.skip(reason)
+
+
+def test_adapter_shared_pack_against_real_backend_driver(backend: _Backend) -> None:
+    """Run the same driver-observable pack against each real fixture backend.
+
+    PostgreSQL is the real psycopg DB-API implementation; ClickHouse is the
+    existing HTTP/native-placeholder driver fixture. DuckDB is the actual
+    in-process driver. Decimal JSON strings are decoded using the authoritative
+    column schema without passing through a binary float.
+    """
+    table = f"{backend.prefix}adapter_values"
+    if backend.dialect == Dialect.CLICKHOUSE:
+        backend.setup(
+            f"CREATE TABLE {table} (id Int32, label String, amount Nullable(Decimal(12,4))) "
+            "ENGINE=Memory"
+        )
+    else:
+        backend.setup(f"CREATE TABLE {table} (id INTEGER, label VARCHAR, amount DECIMAL(12,4))")
+    values = ",".join(
+        f"({key}, '{label.replace(chr(39), chr(39) * 2)}', "
+        f"{'NULL' if amount is None else str(amount)})"
+        for key, label, amount in SOURCE_ROWS
+    )
+    backend.setup(f"INSERT INTO {table} VALUES {values}")
+    for case in adapter_cases(backend.dialect, table=table):
+        assert_adapter(backend.adapter, case)
 
 
 def _url_host(host: str) -> str:

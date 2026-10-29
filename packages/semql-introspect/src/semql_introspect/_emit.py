@@ -41,6 +41,35 @@ def emit_python(result: IntrospectionResult, *, header: str | None = None) -> st
     lines.append("")
     lines.append("")
 
+    provenance = result.source_provenance
+    if provenance is not None:
+        lines.append(f"SOURCE_PROVENANCE = {provenance.model_dump(exclude_none=True)!r}")
+    else:
+        lines.append("SOURCE_PROVENANCE = None")
+    lines.append("TABLE_MAPPING_REPORTS = [")
+    for report in result.table_reports:
+        lines.append("    {")
+        lines.append(f"        'table': {report.table!r},")
+        lines.append(f"        'source_primary_key': {report.source_primary_key!r},")
+        lines.append(f"        'mapped_primary_key': {report.mapped_primary_key!r},")
+        lines.append(
+            "        'unsupported_primary_key_components': "
+            f"{report.unsupported_primary_key_components!r},"
+        )
+        lines.append(f"        'unsupported_foreign_keys': {report.unsupported_foreign_keys!r},")
+        lines.append(f"        'mapping_status': {report.mapping_status.value!r},")
+        lines.append("        'facts': [")
+        for fact in report.facts:
+            lines.append("            {")
+            lines.append(f"                'source_kind': {fact.source_kind!r},")
+            lines.append(f"                'source_columns': {fact.source_columns!r},")
+            lines.append(f"                'status': {fact.status.value!r},")
+            lines.append(f"                'detail': {fact.detail!r},")
+            lines.append("            },")
+        lines.append("        ],")
+        lines.append("    },")
+    lines.append("]")
+    lines.append("")
     for cube in result.cubes:
         lines.append(_render_cube(cube, annotations_by_field))
         lines.append("")
@@ -49,7 +78,6 @@ def emit_python(result: IntrospectionResult, *, header: str | None = None) -> st
     for cube in result.cubes:
         lines.append(f"    {_cube_var(cube.name)},")
     lines.append("]")
-
     return "\n".join(lines) + "\n"
 
 

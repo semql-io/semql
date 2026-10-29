@@ -28,7 +28,13 @@ from semql.rows import CompiledEntityQuery, RowPlan, RowPred
 from semql.safe import is_read_only_statement
 
 from semql_engine.adapter import Adapter, AdapterResult
-from semql_engine.engine import ExecutionContractError
+
+# Share the engine's exact close-on-error ownership policy for entity iterators.
+from semql_engine.engine import (
+    ExecutionContractError,
+    _close_iterator,  # pyright: ignore[reportPrivateUsage]
+)
+from semql_engine.execution import Admission, ExecutionLimits, ExecutionScope, execution_scope
 
 __all__ = [
     "InMemoryRowAdapter",
@@ -48,10 +54,22 @@ class RowCapableAdapter(Protocol):
     def execute_rows(self, plan: RowPlan) -> AdapterResult: ...
 
 
-def _materialize_result(result: AdapterResult) -> AdapterResult:
+def _materialize_result(result: AdapterResult, scope: ExecutionScope) -> AdapterResult:
+    row_iter = iter(result.rows)
+    fragment_budget = scope.fragment_budget()
+    output_budget = scope.output_budget()
+    rows: list[tuple[Any, ...]] = []
+    try:
+        for row in row_iter:
+            fragment_budget.check_row(row)
+            output_budget.check_row(row)
+            rows.append(tuple(row))
+        scope.check_deadline()
+    finally:
+        _close_iterator(row_iter)
     return AdapterResult(
         columns=list(result.columns),
-        rows=[tuple(row) for row in result.rows],
+        rows=rows,
         column_types=(list(result.column_types) if result.column_types is not None else None),
     )
 
@@ -59,13 +77,26 @@ def _materialize_result(result: AdapterResult) -> AdapterResult:
 def execute_entity(
     compiled: CompiledEntityQuery,
     adapter: Adapter | RowCapableAdapter,
+    *,
+    limits: ExecutionLimits | None = None,
+    admission: Admission | None = None,
 ) -> AdapterResult:
     """Run a compiled entity read on the right kind of adapter.
 
     SQL backends (``compiled.sql is not None``) run via an
     :class:`~semql_engine.adapter.Adapter`; custom backends run via a
-    :class:`RowCapableAdapter`. Raises ``TypeError`` if the adapter doesn't
-    match the compiled shape."""
+    :class:`RowCapableAdapter`. Limits are opt-in and deadlines are cooperative:
+    a synchronous driver call cannot be interrupted here. Reuse an ``Admission``
+    across calls to share its configured concurrency bound."""
+    with execution_scope(limits, admission) as scope:
+        return _execute_entity(compiled, adapter, scope)
+
+
+def _execute_entity(
+    compiled: CompiledEntityQuery,
+    adapter: Adapter | RowCapableAdapter,
+    scope: ExecutionScope,
+) -> AdapterResult:
     if compiled.plan.version != 1:
         raise ExecutionContractError(
             "Entity row plan uses an unsupported version.",
@@ -75,9 +106,13 @@ def execute_entity(
             stage="preflight",
         )
     if compiled.sql is not None:
-        if not hasattr(adapter, "execute"):
-            raise TypeError(
-                "compiled query has SQL but the adapter is not a SQL Adapter (no execute method)."
+        if not callable(getattr(adapter, "execute", None)):
+            raise ExecutionContractError(
+                "Entity query requires a SQL adapter.",
+                reason="adapter_capability_missing",
+                artifact="entity_query",
+                operation="execute",
+                stage="preflight",
             )
         sql_adapter = cast(Adapter, adapter)
         dialect = Dialect(compiled.plan.source.backend)
@@ -100,15 +135,20 @@ def execute_entity(
                 operation="execute",
                 stage="preflight",
             )
-        result = _materialize_result(sql_adapter.execute(compiled.sql, compiled.params))
+        scope.check_deadline()
+        result = _materialize_result(sql_adapter.execute(compiled.sql, compiled.params), scope)
     else:
-        if not hasattr(adapter, "execute_rows"):
-            raise TypeError(
-                "compiled query has no SQL (custom backend) but the adapter is "
-                "not a RowCapableAdapter (no execute_rows method)."
+        if not callable(getattr(adapter, "execute_rows", None)):
+            raise ExecutionContractError(
+                "Entity query requires a row-capable adapter.",
+                reason="adapter_capability_missing",
+                artifact="entity_query",
+                operation="execute",
+                stage="preflight",
             )
         row_adapter: RowCapableAdapter = adapter  # type: ignore[assignment]
-        result = _materialize_result(row_adapter.execute_rows(compiled.plan))
+        scope.check_deadline()
+        result = _materialize_result(row_adapter.execute_rows(compiled.plan), scope)
     if list(result.columns) != list(compiled.columns):
         raise ExecutionContractError(
             "Entity adapter columns do not match the compiled output projection.",

@@ -23,7 +23,14 @@ from semql import (
     SemanticQuery,
     compile_cohort_query,
 )
-from semql_engine import AdapterResult, DuckDBAdapter, Engine, ExecutionContractError, run_cohort
+from semql_engine import (
+    AdapterResult,
+    DuckDBAdapter,
+    Engine,
+    ExecutionContractError,
+    ExecutionLimits,
+    run_cohort,
+)
 
 
 class _Adapter:
@@ -246,3 +253,101 @@ def test_empty_cohort_skips_measurement_io(db: duckdb.DuckDBPyConnection) -> Non
     result = run_cohort(plan, Engine(adapters={Dialect.DUCKDB: _Adapter(db)}))
     assert result.rows == ()
     assert result.presence["current"] == ()
+
+
+def test_nested_engine_runs_reuse_single_admission_slot(db: duckdb.DuckDBPyConnection) -> None:
+    engine = Engine(
+        adapters={Dialect.DUCKDB: _Adapter(db)},
+        limits=ExecutionLimits(max_in_flight=1, admission_timeout=0.1),
+    )
+    result = run_cohort(_plan(), engine)
+    assert len(result.rows) == 2
+
+
+def test_cohort_execution_timeout_is_shared_across_stages(
+    db: duckdb.DuckDBPyConnection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from types import SimpleNamespace
+
+    clock = [0.0]
+    monkeypatch.setattr("semql_engine.execution.time", SimpleNamespace(monotonic=lambda: clock[0]))
+    calls = 0
+
+    class AdvancingAdapter(_Adapter):
+        def execute(self, sql: str, params: Mapping[str, Any]) -> AdapterResult:
+            nonlocal calls
+            calls += 1
+            result = super().execute(sql, params)
+            clock[0] += 0.6
+            return result
+
+    engine = Engine(
+        adapters={Dialect.DUCKDB: AdvancingAdapter(db)},
+        limits=ExecutionLimits(execution_timeout=1.0),
+    )
+    with pytest.raises(ExecutionContractError) as error:
+        run_cohort(_plan(), engine)
+    assert error.value.reason == "execution_deadline_exceeded"
+    assert calls == 2
+
+
+def test_cohort_assembled_output_obeys_value_byte_cap(
+    db: duckdb.DuckDBPyConnection,
+) -> None:
+    plan = _plan(source_limit=1)
+    engine = Engine(
+        adapters={Dialect.DUCKDB: _Adapter(db)},
+        limits=ExecutionLimits(max_value_bytes=10),
+    )
+    assert len(engine.run(plan.source.plan).rows) == 1
+    bind_members = plan.measurements[0].bind_members
+    assert bind_members is not None
+    bound = bind_members([(1,)])
+    assert len(engine.run(bound).rows) == 1
+    with pytest.raises(ExecutionContractError) as error:
+        run_cohort(plan, engine)
+    assert error.value.reason == "execution_value_byte_limit_exceeded"
+
+
+def test_later_unregistered_measurement_backend_fails_before_selection() -> None:
+    prior = Cube(
+        name="prior",
+        dialect=Dialect.POSTGRES,
+        table="prior_activity",
+        alias="p",
+        dimensions=[Dimension(name="id", sql="{p}.id", type="number")],
+    )
+    current = Cube(
+        name="current",
+        dialect=Dialect.BIGQUERY,
+        table="current_activity",
+        alias="c",
+        dimensions=[Dimension(name="id", sql="{c}.id", type="number")],
+        measures=[Measure(name="amount", sql="{c}.amount", agg="sum")],
+    )
+    request = CohortQuery(
+        cohort=Cohort(
+            source=SemanticQuery(dimensions=["prior.id"]),
+            member_keys=["prior.id"],
+        ),
+        measurements=[
+            CohortMeasurement(
+                name="current",
+                query=SemanticQuery(dimensions=["current.id"], measures=["current.amount"]),
+                key_mapping={"prior.id": "current.id"},
+            )
+        ],
+    )
+    plan = compile_cohort_query(request, {"prior": prior, "current": current})
+    calls: list[str] = []
+
+    class CountingAdapter:
+        def execute(self, sql: str, params: Mapping[str, Any]) -> AdapterResult:
+            calls.append(sql)
+            return AdapterResult(list(plan.source.columns), [(1,)])
+
+    engine = Engine(adapters={Dialect.POSTGRES: CountingAdapter()})
+    with pytest.raises(ExecutionContractError) as error:
+        run_cohort(plan, engine)
+    assert error.value.reason == "adapter_missing"
+    assert calls == []

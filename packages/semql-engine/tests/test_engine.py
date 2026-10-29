@@ -28,7 +28,7 @@ from semql import (
     compile_federated_query,
 )
 from semql.federate import FederatedPlan
-from semql_engine import AdapterResult, DuckDBAdapter, Engine, EngineError
+from semql_engine import AdapterResult, DuckDBAdapter, Engine, ExecutionContractError
 from semql_engine.merge import render_merge_sql
 
 # ---------------------------------------------------------------------------
@@ -300,8 +300,9 @@ def test_engine_refuses_plan_with_unregistered_backend(
     engine.register(Dialect.POSTGRES, DuckDBAdapter(pg_con))
     # BigQuery NOT registered.
 
-    with pytest.raises(EngineError, match="No adapter registered"):
+    with pytest.raises(ExecutionContractError) as error:
         engine.run(plan)
+    assert error.value.reason == "adapter_missing"
 
 
 def test_engine_repeatable_runs_dont_leak_state(

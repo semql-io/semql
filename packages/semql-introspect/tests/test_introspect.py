@@ -330,3 +330,108 @@ def test_introspect_join_on_clause_uses_quoted_identifiers(
     # Both sides of = must have quoted column names.
     assert '"customer_id"' in on
     assert '"id"' in on
+
+
+def test_composite_primary_key_is_preserved_as_dimensions_and_loss_reported(
+    conn: duckdb.DuckDBPyConnection,
+) -> None:
+    conn.execute(
+        "CREATE TABLE composite_items (tenant_id INTEGER, item_id INTEGER, qty INTEGER, "
+        "PRIMARY KEY (tenant_id, item_id))"
+    )
+    result = introspect_to_result(conn, dialect=Dialect.DUCKDB, schema="main")
+    cube = next(cube for cube in result.cubes if cube.name == "composite_items")
+    report = next(report for report in result.table_reports if report.table == "composite_items")
+    assert report.source_primary_key == ("tenant_id", "item_id")
+    assert report.mapped_primary_key is None
+    assert report.unsupported_primary_key_components == ("tenant_id", "item_id")
+    assert report.facts[0].source_kind == "primary_key"
+    assert report.facts[0].status.value == "report_only"
+    assert report.facts[0].source_columns == ("tenant_id", "item_id")
+    assert cube.primary_key is None
+    assert {dimension.name for dimension in cube.dimensions} >= {"tenant_id", "item_id"}
+    assert not any(measure.name in {"tenant_id", "item_id"} for measure in cube.measures)
+
+
+def test_composite_foreign_key_emits_one_conjunction_join(
+    conn: duckdb.DuckDBPyConnection,
+) -> None:
+    from semql import Catalog, SemanticQuery
+
+    conn.execute(
+        "CREATE TABLE composite_parent (a INTEGER, b INTEGER, PRIMARY KEY (a, b), UNIQUE (b, a))"
+    )
+    conn.execute(
+        "CREATE TABLE composite_child (x INTEGER, y INTEGER, qty INTEGER, "
+        "FOREIGN KEY (x, y) REFERENCES composite_parent (b, a))"
+    )
+    conn.execute("INSERT INTO composite_parent VALUES (1, 2), (2, 1), (3, 2)")
+    conn.execute("INSERT INTO composite_child VALUES (2, 1, 10), (1, 2, 20), (2, 3, 30)")
+    query = SemanticQuery(
+        dimensions=["composite_parent.a"],
+        measures=["composite_child.qty"],
+        order=[("composite_parent.a", "asc")],
+    )
+    result = introspect_to_result(conn, dialect=Dialect.DUCKDB, schema="main")
+    namespace: dict[str, object] = {}
+    exec(introspect_to_python(conn, dialect=Dialect.DUCKDB, schema="main"), namespace)
+    for cubes in (result.cubes, cast(list[Cube], namespace["CUBES"])):
+        compiled = Catalog(cubes).compile(query)
+        assert conn.execute(compiled.sql, compiled.params).fetchall() == [(1, 10), (2, 20), (3, 30)]
+    reports = cast(list[dict[str, object]], namespace["TABLE_MAPPING_REPORTS"])
+    by_table = {str(report["table"]): report for report in reports}
+    assert by_table["composite_parent"]["source_primary_key"] == ("a", "b")
+    assert by_table["composite_parent"]["mapped_primary_key"] is None
+    assert by_table["composite_parent"]["unsupported_primary_key_components"] == ("a", "b")
+
+
+def test_scalar_key_keeps_catalog_key_and_reports_source_provenance(
+    conn: duckdb.DuckDBPyConnection,
+) -> None:
+    conn.execute("CREATE TABLE scalar_key (id INTEGER PRIMARY KEY, qty INTEGER)")
+    result = introspect_to_result(conn, dialect=Dialect.DUCKDB, schema="main")
+    cube = next(cube for cube in result.cubes if cube.name == "scalar_key")
+    report = next(report for report in result.table_reports if report.table == "scalar_key")
+    assert cube.primary_key == "id"
+    assert report.source_primary_key == ("id",)
+    assert report.mapping_status.value == "inferred"
+    assert any(
+        fact.source_kind == "primary_key" and fact.status.value == "mapped" for fact in report.facts
+    )
+    assert result.source_provenance is not None
+    assert result.source_provenance.source_format == "information_schema"
+    assert result.source_provenance.source_identity == "main"
+
+
+def test_list_only_api_warns_when_it_hides_composite_key_loss(
+    conn: duckdb.DuckDBPyConnection,
+) -> None:
+    conn.execute(
+        "CREATE TABLE composite_key (left_id INTEGER, right_id INTEGER, "
+        "PRIMARY KEY (left_id, right_id))"
+    )
+    with pytest.warns(UserWarning, match="would hide source-schema mapping losses"):
+        cubes = introspect_catalog(conn, dialect=Dialect.DUCKDB, schema="main")
+    assert cubes[0].primary_key is None
+
+
+def test_imported_alias_collisions_preserve_executable_field_and_join_references(
+    conn: duckdb.DuckDBPyConnection,
+) -> None:
+    from semql import Catalog, SemanticQuery
+
+    conn.execute("CREATE TABLE accounts (id INTEGER PRIMARY KEY, region VARCHAR)")
+    conn.execute(
+        "CREATE TABLE activity (id INTEGER PRIMARY KEY, "
+        "account_id INTEGER REFERENCES accounts(id), amount INTEGER)"
+    )
+    conn.execute("INSERT INTO accounts VALUES (1, 'north'), (2, 'south')")
+    conn.execute("INSERT INTO activity VALUES (1, 1, 10), (2, 1, 5), (3, 2, 7)")
+    result = introspect_to_result(conn, dialect=Dialect.DUCKDB, schema="main")
+    query = SemanticQuery(
+        dimensions=["accounts.region"],
+        measures=["activity.amount"],
+        order=[("accounts.region", "asc")],
+    )
+    compiled = Catalog(result.cubes).compile(query)
+    assert conn.execute(compiled.sql, compiled.params).fetchall() == [("north", 15), ("south", 7)]

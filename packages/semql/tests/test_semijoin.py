@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import pytest
 from semql import (
+    AuthContext,
     Cube,
     Dialect,
     Dimension,
@@ -21,7 +22,7 @@ from semql import (
     SemiJoin,
 )
 from semql.compile import compile_query
-from semql.errors import FederationError
+from semql.errors import CompileError, FederationError
 from semql.federate import compile_federated_query
 from semql.semijoin import SemiJoinPlan, compile_semi_join_query
 
@@ -82,6 +83,74 @@ def _query(op: str = "in") -> SemanticQuery:
         dimensions=["activity.employee_id"],
         semi_joins=[_sales_semi_join(op)],
     )
+
+
+def _orders_customers_catalog(*, protected_customers: bool = False) -> dict[str, Cube]:
+    orders = Cube(
+        name="orders",
+        dialect=Dialect.POSTGRES,
+        table="orders",
+        alias="o",
+        measures=[Measure(name="revenue", sql="{o}.amount", agg="sum")],
+        dimensions=[
+            Dimension(
+                name="customer_id",
+                sql="{o}.customer_id",
+                type="number",
+                foreign_key="customers",
+            )
+        ],
+        joins=[Join(to="customers", relationship="many_to_one", on="{o}.customer_id = {c}.id")],
+    )
+    customers = Cube(
+        name="customers",
+        dialect=Dialect.BIGQUERY,
+        table="customers",
+        alias="c",
+        required_roles=["customer_reader"] if protected_customers else [],
+        dimensions=[Dimension(name="id", sql="{c}.id", type="number")],
+    )
+    selected = Cube(
+        name="selected",
+        dialect=Dialect.DUCKDB,
+        table="selected",
+        alias="s",
+        dimensions=[Dimension(name="id", sql="{s}.id", type="number")],
+    )
+    return {cube.name: cube for cube in (orders, customers, selected)}
+
+
+def _orders_semi_join_query() -> SemanticQuery:
+    return SemanticQuery(
+        measures=["orders.revenue"],
+        semi_joins=[
+            SemiJoin(
+                dimension="customers.id",
+                select="selected.id",
+                source=SemanticQuery(dimensions=["selected.id"]),
+            )
+        ],
+    )
+
+
+def test_preflight_shape_retains_filter_only_binding_cube_without_changing_output() -> None:
+    plan = compile_semi_join_query(_orders_semi_join_query(), _orders_customers_catalog())
+    assert {fragment.dialect for fragment in plan.outer_plan.fragments} == {
+        Dialect.POSTGRES,
+        Dialect.BIGQUERY,
+    }
+    assert plan.columns == ["revenue"]
+    assert plan.column_meta[0].storage_type == "number"
+    assert plan.column_meta[0].additive is True
+
+
+def test_unauthorized_filter_only_binding_cube_refuses_during_compile() -> None:
+    with pytest.raises(CompileError):
+        compile_semi_join_query(
+            _orders_semi_join_query(),
+            _orders_customers_catalog(protected_customers=True),
+            viewer=AuthContext(viewer_id="viewer", roles=[]),
+        )
 
 
 def test_compiles_to_staged_plan() -> None:

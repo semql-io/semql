@@ -44,9 +44,24 @@ semql-introspect --backend duckdb --schema main --conn "warehouse.db"
 - Columns ending in `_id` → `Measure(agg="count_distinct")` (the table's
   cardinality is usually interesting).
 - `date` / `timestamp` columns → `TimeDimension`.
-- Foreign keys → `Join(relationship="many_to_one")` plus the foreign-side
-  `Dimension(foreign_key=...)`.
+- Foreign keys → one `Join(relationship="many_to_one")` per constraint;
+  composite constraints preserve their paired columns in a conjunction.
+  Scalar `Dimension(foreign_key=...)` is emitted only for scalar primary-key targets.
 - Everything else → `Dimension` typed by the column's SQL type.
 
 Heuristic guesses get a `# TODO: review` comment so the diff makes the
 inference choices reviewable.
+
+## Mapping reports and source identity
+
+Use `introspect_to_result(...)` for `cubes`, heuristic `annotations`, ordered
+`table_reports`, and optional `source_provenance`. Reports distinguish mapped,
+inferred, and report-only facts. Composite primary keys retain every component
+as a dimension and in the report; no component is falsely used as the whole
+`Cube.primary_key`. Hand-authored definitions remain trusted.
+
+Generated Python includes `CUBES`, `SOURCE_PROVENANCE`, and `TABLE_MAPPING_REPORTS`.
+The cubes-only `introspect_catalog(...)` warns when it would hide mapping losses.
+Custom probes now return tuple-valued primary keys and grouped `ForeignKeyInfo`
+constraints. See the [migration guide](../../docs/migrations/reliable-integration.md)
+for the exact interface changes and provenance API.

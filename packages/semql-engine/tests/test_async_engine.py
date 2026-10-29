@@ -203,8 +203,9 @@ def test_async_engine_refuses_unregistered_backend(
     )
     engine = AsyncEngine()
     engine.register(Dialect.POSTGRES, AsyncDuckDBAdapter(pg_con))
-    with pytest.raises(EngineError, match="No adapter registered"):
+    with pytest.raises(ExecutionContractError) as error:
         _run(engine.run(plan))
+    assert error.value.reason == "adapter_missing"
 
 
 # ---------------------------------------------------------------------------

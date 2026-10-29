@@ -607,3 +607,101 @@ def test_legacy_mutating_catalog_spec_refuses_ambiguous_entity_subtype() -> None
     }
     with pytest.raises(ValueError, match="cannot safely restore entity mutation"):
         CatalogSpec.from_dict(payload)
+
+
+def test_catalog_content_digest_is_canonical_and_recomputed() -> None:
+    from semql import CATALOG_DIGEST_FORMAT_VERSION, CatalogContentDigest, SourceProvenance
+    from semql.catalog import CatalogSpec
+
+    cube = _orders().model_copy(update={"metadata": {"z": "last", "a": "first"}})
+    provenance = SourceProvenance(
+        source_format="warehouse-schema",
+        source_format_version="2",
+        source_identity="tenant_schema",
+        source_snapshot="snapshot-7",
+    )
+    spec = CatalogSpec(cubes=(cube,), source_provenance=provenance)
+    restored = CatalogSpec.from_dict(json.loads(spec.model_dump_json()))
+    assert isinstance(spec.content_digest, CatalogContentDigest)
+    assert spec.content_digest.format_version == CATALOG_DIGEST_FORMAT_VERSION
+    assert restored.content_digest == spec.content_digest
+    assert restored.source_provenance == provenance
+    assert Catalog.from_spec(restored).source_provenance == provenance
+    assert spec.model_copy(update={"cubes": (_orders(),)}).content_digest != spec.content_digest
+    from semql import CatalogContext
+
+    context = CatalogContext(namespace="tenant", semantic_revision="revision-1")
+    changed = spec.model_copy(update={"cubes": (_orders(),)})
+    assert context.semantic_revision == "revision-1"
+    assert changed.content_digest != spec.content_digest
+
+
+def test_catalog_digest_sorts_mapping_keys_but_preserves_sequence_order() -> None:
+    from semql.catalog import CatalogSpec
+    from semql.model import GlossaryEntry
+
+    first = _orders().model_copy(update={"metadata": {"a": "1", "b": "2"}})
+    reordered = _orders().model_copy(update={"metadata": {"b": "2", "a": "1"}})
+    assert (
+        CatalogSpec(cubes=(first,)).content_digest == CatalogSpec(cubes=(reordered,)).content_digest
+    )
+    entries = (
+        GlossaryEntry(term="alpha", definition="A"),
+        GlossaryEntry(term="beta", definition="B"),
+    )
+    assert (
+        CatalogSpec(glossary=entries).content_digest
+        != CatalogSpec(glossary=tuple(reversed(entries))).content_digest
+    )
+
+
+def test_catalog_digest_excludes_construction_error_presentation_and_is_not_a_gate() -> None:
+    from semql import SemanticQuery
+    from semql.catalog import CatalogSpec
+
+    clean = CatalogSpec(cubes=(_orders(),))
+    with_errors = clean.model_copy(
+        update={"construction_errors": ({"code": "x", "message": "bad"},)}
+    )
+    assert clean.content_digest == with_errors.content_digest
+    assert Catalog([_orders()]).compile(SemanticQuery(measures=["orders.count"]))
+
+
+def test_catalog_digest_rejects_nonfinite_saved_query_values() -> None:
+    from semql import Filter, SavedQuery, SemanticQuery
+    from semql.catalog import CatalogSpec
+
+    query = SemanticQuery(
+        measures=["orders.count"],
+        filters=[Filter(dimension="orders.region", op="eq", values=[float("nan")])],
+    )
+    spec = CatalogSpec(saved_queries=(SavedQuery(name="nonfinite", query=query),))
+    with pytest.raises(TypeError):
+        _ = spec.content_digest
+
+
+def test_catalog_digest_ignores_lookup_runtime_code_but_keeps_declarations() -> None:
+    from semql import Lookup
+    from semql.model import ResolutionContext
+
+    def loader(_context: ResolutionContext) -> list[str]:
+        raise AssertionError("Digesting must not run a lookup loader")
+
+    class Enricher:
+        def enrich(self, ids: list[str], ctx: ResolutionContext) -> dict[str, str]:
+            raise AssertionError("Digesting must not run an enricher")
+
+    dynamic = Catalog([_orders()], lookups=[Lookup(dimension="orders.region", loader=loader)])
+    replacement = Catalog(
+        [_orders()], lookups=[Lookup(dimension="orders.region", loader=lambda _context: ["EU"])]
+    )
+    assert dynamic.content_digest == replacement.content_digest
+    enriched = Catalog(
+        [_orders()], lookups=[Lookup(dimension="orders.region", enricher=Enricher())]
+    )
+    assert enriched.content_digest == dynamic.content_digest
+    changed = Catalog(
+        [_orders()],
+        lookups=[Lookup(dimension="orders.region", loader=loader, description="Changed meaning")],
+    )
+    assert changed.content_digest != dynamic.content_digest

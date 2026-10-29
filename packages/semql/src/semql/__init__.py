@@ -32,7 +32,12 @@ from semql.analysis import (
 )
 from semql.autoplan import AutoPlan, CrossSourceDecision, autoplan
 from semql.bindings import BindingRequirement
-from semql.catalog import Catalog
+from semql.catalog import (
+    CATALOG_DIGEST_FORMAT_VERSION,
+    Catalog,
+    CatalogContentDigest,
+    SourceProvenance,
+)
 from semql.cohort import (
     COHORT_PLAN_VERSION,
     Cohort,
@@ -261,7 +266,10 @@ from semql.visualize import (
 )
 
 __all__ = [
+    "CATALOG_DIGEST_FORMAT_VERSION",
+    "CatalogContentDigest",
     "BindingRequirement",
+    "SourceProvenance",
     "CatalogContext",
     "Comparison",
     "ComparisonResult",

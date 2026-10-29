@@ -49,7 +49,7 @@ if TYPE_CHECKING:
     from semql.model import AuthContext, Cube, Dialect, Dimension, View
 
 
-SEMI_JOIN_PLAN_VERSION = 1
+SEMI_JOIN_PLAN_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -77,10 +77,15 @@ class SemiJoinPlan:
     ``column_meta`` describe the final output shape — identical to the outer
     query's, since an ``IN`` filter never changes the projection.
 
+    ``outer_plan`` is a preflight-only shape that retains requirements from
+    every binding dimension, including filter-only foreign cubes. Its output
+    shape matches the final outer query; the structural predicates are never
+    executed.
     Frozen, like every node in the compile IR; ``bind_outer`` is excluded from
     equality/repr (it's an opaque closure over the catalog + compile options)."""
 
     inner_plans: tuple[FederatedPlan, ...]
+    outer_plan: FederatedPlan = field(kw_only=True)
     bindings: tuple[SemiJoinBinding, ...]
     bind_outer: Callable[[list[Filter]], FederatedPlan] = field(compare=False, repr=False)
     columns: list[str]
@@ -205,11 +210,21 @@ def compile_semi_join_query(
         bound = residual.model_copy(update={"filters": [*residual.filters, *extra_filters]})
         return _compile(bound)
 
-    # The IN list never changes the projection, so the residual (no
-    # value-list filters) already has the final output shape.
+    # Filter-only cubes can change federation strategy and its metadata. Keep
+    # the real residual output separately from the dependency-only template.
     shape = _compile(residual)
+    preflight_query = residual.model_copy(
+        update={
+            "filters": [
+                *residual.filters,
+                *(Filter(dimension=binding.bind_dimension, op="not_null") for binding in bindings),
+            ]
+        }
+    )
+    preflight_shape = _compile(preflight_query)
     return SemiJoinPlan(
         inner_plans=tuple(inner_plans),
+        outer_plan=preflight_shape,
         bindings=tuple(bindings),
         bind_outer=bind_outer,
         columns=shape.columns,
