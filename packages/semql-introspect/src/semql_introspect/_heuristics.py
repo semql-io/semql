@@ -171,14 +171,15 @@ def classify_column(col: ColumnInfo, *, is_fk: bool, is_pk: bool) -> Classificat
     """
     name = col.name.lower()
 
-    if _is_date(col.data_type):
-        return Classification(kind="time_dimension")
-
     if is_pk:
         return Classification(
             kind="dimension",
             dim_type=_dim_type_for(col.data_type),
         )
+
+    if _is_date(col.data_type):
+        return Classification(kind="time_dimension")
+
     if is_fk:
         return Classification(
             kind="dimension",

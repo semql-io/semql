@@ -19,6 +19,7 @@ from semql.federate import FEDERATED_PLAN_VERSION
 from semql.spec import SemanticQuery
 
 from semql_engine.engine import Engine, ExecutionContractError, ExecutionResult
+from semql_engine.execution import ExecutionScope
 
 
 @dataclass(frozen=True)
@@ -168,6 +169,19 @@ def run_cohort(
     cache_namespace: str | None = None,
 ) -> CohortResult:
     """Run selection, validate it, then restrict and align each measurement."""
+    with engine.execution_scope() as scope:
+        result = _run_cohort(plan, engine, scope, cache_namespace=cache_namespace)
+        scope.check_deadline()
+        return result
+
+
+def _run_cohort(
+    plan: CohortPlan,
+    engine: Engine,
+    scope: ExecutionScope,
+    *,
+    cache_namespace: str | None,
+) -> CohortResult:
     if plan.version != COHORT_PLAN_VERSION:
         raise _fail("artifact_version_unsupported", "preflight")
     if not plan.measurements or len(plan.measurements) != len(plan.cohort.measurements):
@@ -203,6 +217,7 @@ def run_cohort(
                 )
             except ContractError as error:
                 raise ExecutionContractError.from_contract_error(error) from error
+        engine.preflight(stage.plan)
     expected_projection = [
         (f"selection.{name}", "dimension", name)
         for name in (*plan.source.key_columns, *plan.source.attribute_columns)
@@ -352,6 +367,7 @@ def run_cohort(
         comparison_values[comparison.name] = tuple(compared_values)
 
     output: list[tuple[Any, ...]] = []
+    output_budget = scope.output_budget()
     for index, key in enumerate(member_order):
         output_row: list[Any] = [*member_values[key], *members[key]]
         for stage in plan.measurements:
@@ -364,6 +380,7 @@ def run_cohort(
         output_row.extend(
             comparison_values[comparison.name][index] for comparison in plan.cohort.comparisons
         )
+        output_budget.check_row(output_row)
         output.append(tuple(output_row))
     return CohortResult(
         expected_names,

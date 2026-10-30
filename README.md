@@ -187,6 +187,11 @@ steps in the [0.7-to-0.8 migration guide](docs/migrations/0.7-to-0.8.md).
 For the next release's budget-admission and prompt-result changes, see the
 [0.8-to-0.9 migration guide](docs/migrations/0.8-to-0.9.md).
 
+For loss-aware introspection reports, descriptive catalog provenance/digests,
+and opt-in execution admission, deadline, row and value-byte limits, see the
+[reliable integration guide](docs/migrations/reliable-integration.md).
+Programmer-authored declarations remain trusted; resource limits are optional.
+
 ## The four-role prompt pipeline
 
 Bring your own LLM. Each role pairs a **prompt-fragment builder**

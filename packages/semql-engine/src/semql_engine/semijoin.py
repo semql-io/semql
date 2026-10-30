@@ -22,12 +22,13 @@ from __future__ import annotations
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
+from semql.semijoin import SEMI_JOIN_PLAN_VERSION
 from semql.spec import Filter
 
-from semql_engine.engine import ExecutionResult
+from semql_engine.engine import ExecutionContractError, ExecutionResult
 
 if TYPE_CHECKING:
-    from semql.semijoin import SemiJoinBinding, SemiJoinPlan
+    from semql.semijoin import SemiJoinPlan
 
     from semql_engine.engine import Engine
 
@@ -66,8 +67,38 @@ def run_semi_join(
     Each inner plan runs first; its ``select_column`` is projected to a value
     list and bound as a literal filter on the outer query. ``cache_namespace``
     is forwarded to every stage's :meth:`Engine.run`."""
+    with engine.execution_scope() as scope:
+        result = _run_semi_join(plan, engine, cache_namespace=cache_namespace)
+        scope.check_deadline()
+        return result
+
+
+def _run_semi_join(
+    plan: SemiJoinPlan,
+    engine: Engine,
+    *,
+    cache_namespace: str | None,
+) -> ExecutionResult:
+    if plan.version != SEMI_JOIN_PLAN_VERSION or len(plan.inner_plans) != len(plan.bindings):
+        raise ExecutionContractError(
+            "Semi-join plan violates its declared contract.",
+            reason="semi_join_plan_invalid",
+            artifact="semi_join_plan",
+            operation="execute",
+            stage="preflight",
+        )
+    engine.preflight(plan.outer_plan)
+    for inner_plan, binding in zip(plan.inner_plans, plan.bindings, strict=True):
+        engine.preflight(inner_plan)
+        if binding.select_column not in inner_plan.columns:
+            raise ExecutionContractError(
+                "Semi-join selection is absent from its inner projection.",
+                reason="semi_join_projection_mismatch",
+                artifact="semi_join_plan",
+                operation="execute",
+                stage="preflight",
+            )
     filters: list[Filter] = []
-    binding: SemiJoinBinding
     for inner_plan, binding in zip(plan.inner_plans, plan.bindings, strict=True):
         inner_result = engine.run(inner_plan, cache_namespace=cache_namespace)
         values = _project_values(inner_result, binding.select_column)

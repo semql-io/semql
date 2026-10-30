@@ -28,9 +28,13 @@ caller is otherwise async-first.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import threading
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
+
+from semql_engine.execution import run_blocking_owned
 
 
 @dataclass
@@ -48,6 +52,44 @@ class AdapterResult:
     columns: list[str]
     rows: Iterable[Sequence[Any]]
     column_types: Sequence[str | None] | None = None
+
+
+async def _execute_blocking[T](function: Callable[..., T], *args: object) -> T:
+    """Run sync adapter work without abandoning a late result on cancellation."""
+    lock = threading.Lock()
+    state: dict[str, object] = {"abandoned": False, "closed": False}
+
+    def work() -> T:
+        result = function(*args)
+        with lock:
+            state["result"] = result
+        return result
+
+    def close_late_result() -> None:
+        with lock:
+            result = state.get("result")
+            if not state["abandoned"] or result is None or state["closed"]:
+                return
+            state["closed"] = True
+        rows = getattr(result, "rows", None)
+        close = getattr(rows, "close", None)
+        if not callable(close) and rows is not None:
+            try:
+                close = getattr(iter(rows), "close", None)
+            except Exception:
+                close = None
+        if callable(close):
+            # The waiter has gone; cleanup cannot report an error to it.
+            with contextlib.suppress(Exception):
+                close()
+
+    try:
+        return await run_blocking_owned(work, on_complete=close_late_result)
+    except asyncio.CancelledError:
+        with lock:
+            state["abandoned"] = True
+        close_late_result()
+        raise
 
 
 def _dbapi_column_types(description: Sequence[Any]) -> list[str | None]:
@@ -183,20 +225,17 @@ class _SyncAsAsyncAdapter:
         self._inner = inner
 
     async def execute(self, sql: str, params: Mapping[str, Any]) -> AdapterResult:
-        # Cancellation stops awaiting this coroutine, but cannot stop a
-        # synchronous operation already running in the worker thread.
-        return await asyncio.to_thread(self._inner.execute, sql, params)
+        return await _execute_blocking(self._inner.execute, sql, params)
 
 
 def to_async_adapter(adapter: Adapter) -> AsyncAdapter:
     """Wrap a sync :class:`Adapter` so it satisfies :class:`AsyncAdapter`.
 
     The wrapped adapter dispatches each ``execute`` to a worker thread
-    via ``asyncio.to_thread`` — fragments scheduled on
-    :class:`semql_engine.AsyncEngine` still run concurrently because
-    the event loop is freed up while the thread blocks on I/O. Prefer a
-    native async adapter when the underlying driver supports one; the
-    bridge is the right answer for drivers that only ship sync APIs.
+    while keeping ownership of uncancellable work until completion.
+    A cancelled waiter returns promptly; if the eventual result contains
+    a closeable row iterator, the wrapper closes it instead of leaking it.
+    Native async adapters remain preferable when the driver supports one.
     """
     return _SyncAsAsyncAdapter(adapter)
 
@@ -205,16 +244,15 @@ class AsyncDuckDBAdapter:
     """Async DuckDB adapter — wraps an existing ``duckdb.DuckDBPyConnection``.
 
     DuckDB has no native async API; this adapter dispatches each
-    ``execute`` to a worker thread via ``asyncio.to_thread``. Useful
-    for single-fragment async plans, in-memory test fixtures, and for
-    keeping async-first user code from inheriting a sync ``Engine``.
+    ``execute`` to a worker thread while retaining ownership across caller
+    cancellation. Useful for single-fragment async plans and test fixtures.
     """
 
     def __init__(self, connection: Any) -> None:  # noqa: ANN401 — duckdb conn
         self._inner = DuckDBAdapter(connection)
 
     async def execute(self, sql: str, params: Mapping[str, Any]) -> AdapterResult:
-        return await asyncio.to_thread(self._inner.execute, sql, params)
+        return await _execute_blocking(self._inner.execute, sql, params)
 
 
 class AsyncDBAPIAdapter:
@@ -225,10 +263,9 @@ class AsyncDBAPIAdapter:
     is synchronous. Async drivers (asyncpg, ``psycopg`` async mode)
     are *not* DB-API; they implement :class:`AsyncAdapter` directly.
 
-    This adapter dispatches each ``execute`` to a worker thread via
-    :func:`asyncio.to_thread` so the event loop is free to schedule
-    sibling coroutines while the DB-API call blocks. Parameters are
-    passed as a dict — the named-parameter form is the only one
+    This adapter dispatches each ``execute`` to a worker thread so the
+    event loop is free to schedule sibling coroutines while the DB-API call
+    blocks. Parameters are passed as a dict — the named-parameter form is
     guaranteed portable across the DB-API family; the caller is
     responsible for matching the compiler's emitted placeholder
     syntax to the driver (Postgres / Snowflake both use
@@ -243,7 +280,7 @@ class AsyncDBAPIAdapter:
         self._conn = connection
 
     async def execute(self, sql: str, params: Mapping[str, Any]) -> AdapterResult:
-        return await asyncio.to_thread(self._sync_execute, sql, params)
+        return await _execute_blocking(self._sync_execute, sql, params)
 
     def _sync_execute(self, sql: str, params: Mapping[str, Any]) -> AdapterResult:
         cursor = self._conn.cursor()
@@ -319,9 +356,8 @@ class AsyncBigQueryAdapter:
        job is *parameterised* — not f-string interpolated. This is
        the only safe way to run user-supplied values against BQ
        without exposing a SQL-injection surface.
-    2. Dispatches the entire ``.query()`` call to a worker thread via
-       :func:`asyncio.to_thread` so the event loop is free to schedule
-       sibling coroutines during the round-trip.
+    2. Dispatches the full query and row materialization to a worker
+       thread while retaining ownership if the awaiting caller is cancelled.
 
     The translator is a function ``(params) -> job_config``. The
     default attempts to import ``google.cloud.bigquery`` and use the
@@ -343,7 +379,7 @@ class AsyncBigQueryAdapter:
         self._translator = translator or _default_bq_translator
 
     async def execute(self, sql: str, params: Mapping[str, Any]) -> AdapterResult:
-        return await asyncio.to_thread(self._sync_execute, sql, params)
+        return await _execute_blocking(self._sync_execute, sql, params)
 
     def _sync_execute(self, sql: str, params: Mapping[str, Any]) -> AdapterResult:
         job_config = self._translator(params)

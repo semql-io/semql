@@ -32,6 +32,7 @@ import uuid
 import warnings
 from collections import OrderedDict
 from collections.abc import (
+    AsyncGenerator,
     AsyncIterator,
     Awaitable,
     Callable,
@@ -41,6 +42,7 @@ from collections.abc import (
     Mapping,
     Sequence,
 )
+from contextvars import ContextVar
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from decimal import Decimal
@@ -59,7 +61,22 @@ from semql.federate import FEDERATED_PLAN_VERSION, FederatedPlan, MergeSpec
 from semql.model import Dialect
 from semql.safe import is_read_only_statement
 
-from semql_engine.adapter import Adapter, AdapterResult, AsyncAdapter
+# Merge wrappers share adapter cancellation ownership and late-result disposal.
+from semql_engine.adapter import (
+    Adapter,
+    AdapterResult,
+    AsyncAdapter,
+    _execute_blocking,  # pyright: ignore[reportPrivateUsage]
+)
+from semql_engine.execution import (
+    Admission,
+    ExecutionBudget,
+    ExecutionLimits,
+    ExecutionScope,
+    await_with_deadline,
+    blocking_work_owner,
+    run_blocking_owned,
+)
 from semql_engine.merge import render_merge_sql
 
 # Inline-merge deprecation: the engine's built-in DuckDB merge (render
@@ -125,22 +142,17 @@ def _execution_validate_bindings(
 
 
 def _assert_fragments_read_only(plan: FederatedPlan) -> None:
-    """Defense-in-depth: refuse to execute any fragment that isn't a
-    read-only SELECT.
-
-    The compiler emits SELECT by construction, but RawSQL escape hatches
-    (``DerivedTable.sql``, ``with_ctes``, ``security_sql``,
-    ``ScopePredicate.sql``) splice author-controlled strings into the
-    emitted fragments. Checked at the execution choke point — before any
-    fragment SQL (or its ``derived_sources``) reaches a driver — per
-    PHILOSOPHY, "the defensive guarantee is implemented in the recipe."
-    """
+    """Reject fragments not proven to be read-only SELECTs before adapter calls."""
     for i, frag in enumerate(plan.fragments):
         for sql in (frag.sql, *frag.derived_sources):
             if not is_read_only_statement(sql, dialect=frag.dialect.value):
-                raise EngineError(
-                    f"Fragment {i} (backend {frag.dialect.value!r}) is not a "
-                    f"read-only SELECT; refusing to execute."
+                raise ExecutionContractError(
+                    "A compiled fragment is not a read-only SELECT.",
+                    reason="read_only_statement_required",
+                    artifact="execution",
+                    references=(f"fragment:{i}",),
+                    operation="execute",
+                    stage="preflight",
                 )
 
 
@@ -150,7 +162,13 @@ def _assert_merge_read_only(merge_sql: str) -> None:
     the merge SQL (the single-fragment fast path, a custom merge engine)
     skip this by construction."""
     if not is_read_only_statement(merge_sql, dialect="duckdb"):
-        raise EngineError("Merge SQL is not a read-only SELECT; refusing to execute.")
+        raise ExecutionContractError(
+            "Merge SQL is not a read-only SELECT.",
+            reason="read_only_statement_required",
+            artifact="merge",
+            operation="merge",
+            stage="preflight",
+        )
 
 
 def _preflight(plan: FederatedPlan) -> tuple[str, dict[str, Any]]:
@@ -239,28 +257,42 @@ def _close_iterator(iterator: object) -> None:
             raise
 
 
-def _materialize_result(result: AdapterResult) -> _MaterializedAdapterResult:
-    """Consume and close the acquired adapter row iterator exactly once."""
+def _close_adapter_result(result: AdapterResult) -> None:
+    _close_iterator(iter(result.rows))
+
+
+def _materialize_result(
+    result: AdapterResult, budget: ExecutionBudget | None = None
+) -> _MaterializedAdapterResult:
+    """Consume and close acquired rows, checking optional limits before append."""
     row_iter = iter(result.rows)
+    rows: list[tuple[Any, ...]] = []
     try:
-        rows = [tuple(row) for row in row_iter]
+        for row in row_iter:
+            materialized = tuple(row)
+            if budget is not None:
+                budget.check_row(materialized)
+            rows.append(materialized)
     finally:
         _close_iterator(row_iter)
+    if budget is not None:
+        budget.scope.check_deadline()
     return _MaterializedAdapterResult(
         columns=list(result.columns),
         rows=rows,
-        column_types=(list(result.column_types) if result.column_types is not None else None),
+        column_types=list(result.column_types) if result.column_types is not None else None,
     )
 
 
 def _materialize_results(
-    results: Sequence[AdapterResult],
+    results: Sequence[AdapterResult], scope: ExecutionScope | None = None
 ) -> list[_MaterializedAdapterResult]:
-    """Materialize adapter rows and close later iterators if one fails."""
+    """Materialize adapter rows incrementally, closing later iterators on failure."""
     materialized: list[_MaterializedAdapterResult] = []
     for index, result in enumerate(results):
         try:
-            materialized.append(_materialize_result(result))
+            budget = scope.fragment_budget() if scope is not None else None
+            materialized.append(_materialize_result(result, budget))
         except BaseException:
             for unconsumed in results[index + 1 :]:
                 try:
@@ -272,9 +304,11 @@ def _materialize_results(
     return materialized
 
 
-async def _gather_owned[T](operations: Iterable[Awaitable[T]]) -> list[T]:
-    """Run request-owned operations and cancel/drain siblings on any exit."""
-    tasks: list[asyncio.Future[T]] = []
+async def _gather_owned(
+    operations: Iterable[Awaitable[AdapterResult]],
+) -> list[AdapterResult]:
+    """Own both pending tasks and successful results until materialization."""
+    tasks: list[asyncio.Future[AdapterResult]] = []
     try:
         for operation in operations:
             tasks.append(asyncio.ensure_future(operation))
@@ -284,7 +318,40 @@ async def _gather_owned[T](operations: Iterable[Awaitable[T]]) -> list[T]:
             if not task.done():
                 task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+        for task in tasks:
+            if not task.cancelled() and task.exception() is None:
+                _close_adapter_result(task.result())
         raise
+
+
+async def _iterate_blocking[T](
+    iterator: Iterator[T], scope: ExecutionScope
+) -> AsyncGenerator[T, None]:
+    """Keep an iterator and its resources alive until an in-flight advance finishes."""
+    pending = 0
+    closing = False
+    sentinel = object()
+
+    def finished() -> None:
+        nonlocal pending
+        pending -= 1
+        if closing and pending == 0:
+            _close_iterator(iterator)
+
+    try:
+        while True:
+            scope.check_deadline()
+            pending += 1
+            value = await await_with_deadline(
+                run_blocking_owned(next, iterator, sentinel, on_complete=finished), scope
+            )
+            if value is sentinel:
+                return
+            yield cast("T", value)
+    finally:
+        closing = True
+        if pending == 0:
+            _close_iterator(iterator)
 
 
 def _duckdb_key_value(value: object, duckdb_type: str, null_sentinel: object) -> object:
@@ -653,7 +720,7 @@ class _SyncAsAsyncMergeEngine:
         self._inner = inner
 
     async def merge(self, fragment_results: list[AdapterResult], spec: Any) -> AdapterResult:  # noqa: ANN401
-        return await asyncio.to_thread(self._inner.merge, fragment_results, spec)
+        return await _execute_blocking(self._inner.merge, fragment_results, spec)
 
 
 def to_async_merge_engine(engine: MergeEngine) -> AsyncMergeEngine:
@@ -753,6 +820,7 @@ class Engine:
         cache_size: int = 0,
         cache_ttl: float | None = None,
         on_execute: OnExecuteHook | None = None,
+        limits: ExecutionLimits | None = None,
     ) -> None:
         if cache_size < 0:
             raise ValueError(f"cache_size must be non-negative, got {cache_size}")
@@ -761,6 +829,11 @@ class Engine:
         self._con: Any = duckdb_connection or duckdb.connect(":memory:")
         self._adapters: dict[Dialect, Adapter] = dict(adapters or {})
         self._merge_engine = merge_engine
+        self._limits = limits
+        self._admission = Admission(limits)
+        self._scope_var: ContextVar[ExecutionScope | None] = ContextVar(
+            f"semql_execution_scope_{id(self)}", default=None
+        )
         self._cache_size = cache_size
         self._cache_ttl = cache_ttl
         # OrderedDict gives us insertion-order iteration; popitem(last=False)
@@ -816,64 +889,62 @@ class Engine:
         )
 
     def run(self, plan: FederatedPlan, *, cache_namespace: str | None = None) -> ExecutionResult:
-        """Execute a :class:`FederatedPlan` end-to-end.
-
-        For each fragment, runs the SQL via the matching adapter and
-        materialises the rows into a DuckDB temp table. Then runs the
-        plan's merge SQL and returns the final rows + metadata.
-
-        Raises :class:`EngineError` for missing adapters or column
-        mismatches between adapter output and the fragment's declared
-        columns.
-
-        If the engine has a cache and the plan's emitted shape
-        matches a prior run, the cached result is returned without
-        touching the adapter or DuckDB. The on_execute hook fires
-        either way.
-
-        ``cache_misses`` increments on every plan execution, even when
-        caching is disabled (``cache_size=0``): a miss is "the engine
-        actually ran the plan" — a hit is "the engine returned from
-        cache". The two counters are independent and useful for
-        /metrics emission."""
-        merge_sql, merge_params = _preflight(plan)
-        cache_enabled = self._cache_size > 0
-        cache_key: tuple[Any, ...] | None = (
-            self._cache_key(plan, cache_namespace) if cache_enabled else None
-        )
-        if cache_enabled and cache_key is not None:
-            entry = self._cache.get(cache_key)
-            if entry is not None:
-                if entry.expires_at is not None and self._clock() >= entry.expires_at:
-                    del self._cache[cache_key]
-                else:
+        """Execute a federated plan, applying configured optional limits."""
+        active_scope = self._scope_var.get()
+        owns_scope = active_scope is None
+        if owns_scope:
+            self._admission.acquire()
+            scope = ExecutionScope(self._limits)
+            scope_token = self._scope_var.set(scope)
+        else:
+            assert active_scope is not None
+            scope = active_scope
+            scope_token = None
+        try:
+            merge_sql, merge_params = _preflight(plan)
+            self._adapters_present(plan)
+            scope.check_deadline()
+            _assert_fragments_read_only(plan)
+            cache_enabled = self._cache_size > 0
+            cache_key = self._cache_key(plan, cache_namespace) if cache_enabled else None
+            if cache_key is not None and cache_key in self._cache:
+                entry = self._cache[cache_key]
+                if entry.expires_at is None or self._clock() < entry.expires_at:
                     self._cache.move_to_end(cache_key)
                     self._cache_hits += 1
-                    self._fire_hook(plan, 0.0, cache_hit=True)
                     result = _isolate(entry.result)
                     result.columns = list(plan.columns)
                     result.column_meta = [replace(m) for m in plan.column_meta]
                     result.analysis = _plan_analysis(plan)
+                    output_budget = scope.output_budget()
+                    for row in result.rows:
+                        output_budget.check_row(row)
+                    self._fire_hook(plan, 0.0, cache_hit=True)
+                    scope.check_deadline()
                     return result
+                del self._cache[cache_key]
 
-        start = time.perf_counter()
-        result = self._execute_uncached(plan, merge_sql, merge_params)
-        elapsed_ms = (time.perf_counter() - start) * 1000.0
-        if cache_enabled and cache_key is not None:
-            expires_at = self._clock() + self._cache_ttl if self._cache_ttl is not None else None
-            try:
-                physical_result = _isolate(result)
-            except TypeError:
-                # Do not cache opaque adapter values whose mutability is unknown.
-                physical_result = None
-            if physical_result is not None:
-                self._cache[cache_key] = _CacheEntry(physical_result, expires_at)
-                self._cache.move_to_end(cache_key)
+            start = time.perf_counter()
+            result = self._execute_uncached(plan, merge_sql, merge_params)
+            scope.check_deadline()
+            elapsed_ms = (time.perf_counter() - start) * 1000.0
+            if cache_key is not None:
+                expires_at = (
+                    self._clock() + self._cache_ttl if self._cache_ttl is not None else None
+                )
+                with contextlib.suppress(TypeError):
+                    self._cache[cache_key] = _CacheEntry(_isolate(result), expires_at)
                 while len(self._cache) > self._cache_size:
                     self._cache.popitem(last=False)
-        self._cache_misses += 1
-        self._fire_hook(plan, elapsed_ms, cache_hit=False)
-        return result
+            self._cache_misses += 1
+            self._fire_hook(plan, elapsed_ms, cache_hit=False)
+            scope.check_deadline()
+            return result
+        finally:
+            if owns_scope:
+                assert scope_token is not None
+                self._scope_var.reset(scope_token)
+                self._admission.release()
 
     def _fire_hook(self, plan: FederatedPlan, elapsed_ms: float, *, cache_hit: bool) -> None:
         if self._on_execute is None:
@@ -884,10 +955,50 @@ class Engine:
             # failure mode can wrap their own hook to log + re-raise.
             self._on_execute(plan, elapsed_ms, cache_hit=cache_hit)
 
+    def preflight(self, plan: FederatedPlan) -> None:
+        _preflight(plan)
+        self._adapters_present(plan)
+        _assert_fragments_read_only(plan)
+
+    @contextlib.contextmanager
+    def execution_scope(self) -> Generator[ExecutionScope]:
+        active = self._scope_var.get()
+        if active is not None:
+            yield active
+            return
+        self._admission.acquire()
+        scope = ExecutionScope(self._limits)
+        token = self._scope_var.set(scope)
+        try:
+            yield scope
+        finally:
+            self._scope_var.reset(token)
+            self._admission.release()
+
+    def _adapters_present(self, plan: FederatedPlan) -> None:
+        missing = [
+            fragment.dialect
+            for fragment in plan.fragments
+            if fragment.dialect not in self._adapters
+        ]
+        if missing:
+            dialect = missing[0]
+            raise ExecutionContractError(
+                "A required source adapter is not registered.",
+                reason="adapter_missing",
+                artifact="execution",
+                references=(f"backend:{dialect.value}",),
+                operation="execute",
+                stage="preflight",
+            )
+
     def _execute_uncached(
         self, plan: FederatedPlan, merge_sql: str, merge_params: dict[str, Any]
     ) -> ExecutionResult:
         _assert_fragments_read_only(plan)
+        active_scope = self._scope_var.get()
+        if active_scope is not None:
+            active_scope.check_deadline()
         fragment_results: list[_MaterializedAdapterResult] = []
         for i, fragment in enumerate(plan.fragments):
             adapter = self._adapters.get(fragment.dialect)
@@ -898,7 +1009,11 @@ class Engine:
                     f"Dialect.{fragment.dialect.name}, your_adapter) "
                     f"before running this plan."
                 )
-            result = _materialize_result(adapter.execute(fragment.sql, fragment.params))
+            active_scope = self._scope_var.get()
+            budget = active_scope.fragment_budget() if active_scope is not None else None
+            if active_scope is not None:
+                active_scope.check_deadline()
+            result = _materialize_result(adapter.execute(fragment.sql, fragment.params), budget)
             if list(result.columns) != list(fragment.columns):
                 raise ExecutionContractError(
                     "Adapter columns do not match the compiled fragment projection.",
@@ -911,12 +1026,17 @@ class Engine:
                 )
             fragment_results.append(result)
         evidence = _validate_merge_keys(plan.merge_spec, fragment_results)
+        if active_scope is not None:
+            active_scope.check_deadline()
 
         if self._merge_engine is not None:
+            active_scope = self._scope_var.get()
+            budget = active_scope.output_budget() if active_scope is not None else None
             merged = _materialize_result(
                 self._merge_engine.merge(
                     cast("list[AdapterResult]", fragment_results), plan.merge_spec
-                )
+                ),
+                budget,
             )
             if list(merged.columns) != list(plan.columns):
                 raise ExecutionContractError(
@@ -936,11 +1056,17 @@ class Engine:
             )
 
         self._reset_frag_tables(len(plan.fragments))
+        if active_scope is not None:
+            active_scope.check_deadline()
         for i, result in enumerate(fragment_results):
             self._load_fragment(i, result.columns, list(result.rows), result.column_types)
+            if active_scope is not None:
+                active_scope.check_deadline()
 
         self._warn_inline_once()
         merge_cursor = self._con.execute(merge_sql, dict(merge_params))
+        if active_scope is not None:
+            active_scope.check_deadline()
         columns = [item[0] for item in merge_cursor.description]
         if columns != list(plan.columns):
             raise ExecutionContractError(
@@ -951,7 +1077,17 @@ class Engine:
                 operation="merge",
                 stage="output_validation",
             )
-        rows = merge_cursor.fetchall()
+        scope = self._scope_var.get()
+        budget = scope.output_budget() if scope is not None else None
+        rows: list[tuple[Any, ...]] = []
+        while batch := merge_cursor.fetchmany(1024):
+            for row in batch:
+                value = tuple(row)
+                if budget is not None:
+                    budget.check_row(value)
+                rows.append(value)
+        if scope is not None:
+            scope.check_deadline()
         return ExecutionResult(
             columns=list(plan.columns),
             column_meta=[replace(m) for m in plan.column_meta],
@@ -1328,6 +1464,7 @@ class AsyncEngine:
         *,
         adapters: dict[Dialect, AsyncAdapter] | None = None,
         merge_engine: AsyncMergeEngine | None = None,
+        limits: ExecutionLimits | None = None,
     ) -> None:
         # The merge step is per-call scratch over fixed ``frag_<i>`` table
         # names. A single shared connection would let two in-flight run()
@@ -1340,6 +1477,10 @@ class AsyncEngine:
         self._adapters: dict[Dialect, AsyncAdapter] = dict(adapters or {})
         self._merge_engine = merge_engine
         self.last_iter_run_used_fast_path: bool = False
+        self._limits = limits
+        self._async_admission = (
+            asyncio.Semaphore(limits.max_in_flight) if limits and limits.max_in_flight else None
+        )
         self._warned_inline = False
 
     def _warn_inline_once(self) -> None:
@@ -1372,6 +1513,53 @@ class AsyncEngine:
         self._adapters[dialect] = adapter
 
     async def run(self, plan: FederatedPlan) -> ExecutionResult:
+        """Execute with optional admission and cooperative deadline controls."""
+        semaphore = self._async_admission
+        if semaphore is not None:
+            try:
+                if self._limits and self._limits.admission_timeout is not None:
+                    await asyncio.wait_for(semaphore.acquire(), self._limits.admission_timeout)
+                else:
+                    await semaphore.acquire()
+            except TimeoutError:
+                raise ExecutionContractError(
+                    "Execution admission wait limit exceeded.",
+                    reason="execution_admission_timeout",
+                    artifact="execution",
+                    operation="execute",
+                    stage="admission",
+                ) from None
+        scope = ExecutionScope(self._limits)
+        outstanding = 1
+        released = False
+
+        def retain_worker() -> Callable[[], None]:
+            nonlocal outstanding
+            outstanding += 1
+            called = False
+
+            def finished() -> None:
+                nonlocal outstanding, released, called
+                if called:
+                    return
+                called = True
+                outstanding -= 1
+                if outstanding == 0 and semaphore is not None and not released:
+                    released = True
+                    semaphore.release()
+
+            return finished
+
+        try:
+            with blocking_work_owner(retain_worker):
+                return await await_with_deadline(self._run_impl(plan, scope), scope)
+        finally:
+            outstanding -= 1
+            if outstanding == 0 and semaphore is not None and not released:
+                released = True
+                semaphore.release()
+
+    async def _run_impl(self, plan: FederatedPlan, scope: ExecutionScope) -> ExecutionResult:
         """Execute a :class:`FederatedPlan` end-to-end on an event loop.
 
         Fragments are launched concurrently via :func:`asyncio.gather`;
@@ -1385,20 +1573,24 @@ class AsyncEngine:
         merge_sql, merge_params = _preflight(plan)
         self._adapters_present(plan)
         _assert_fragments_read_only(plan)
+        scope.check_deadline()
         adapter_results = await _gather_owned(
             self._adapters[frag.dialect].execute(frag.sql, frag.params) for frag in plan.fragments
         )
-        results = _materialize_results(adapter_results)
+        results = _materialize_results(adapter_results, scope)
         for i, (fragment, result) in enumerate(zip(plan.fragments, results, strict=True)):
             self._validate_result(i, fragment, result)
         evidence = _validate_merge_keys(plan.merge_spec, results)
+        scope.check_deadline()
 
         if self._merge_engine is not None:
             merged = _materialize_result(
                 await self._merge_engine.merge(
                     cast("list[AdapterResult]", results), plan.merge_spec
-                )
+                ),
+                scope.output_budget(),
             )
+            scope.check_deadline()
             if list(merged.columns) != list(plan.columns):
                 raise ExecutionContractError(
                     "Merge engine columns do not match the declared output projection.",
@@ -1416,13 +1608,43 @@ class AsyncEngine:
                 validation_evidence=evidence,
             )
 
+        rows: list[tuple[Any, ...]] = []
+        chunks = _iterate_blocking(
+            self._inline_merge_chunks(plan, merge_sql, merge_params, results, scope, 1024), scope
+        )
+        async with contextlib.aclosing(chunks):
+            async for chunk in chunks:
+                rows.extend(chunk)
+        scope.check_deadline()
+        return ExecutionResult(
+            columns=list(plan.columns),
+            column_meta=[replace(m) for m in plan.column_meta],
+            rows=rows,
+            analysis=_plan_analysis(plan),
+            validation_evidence=evidence,
+        )
+
+    def _inline_merge_chunks(
+        self,
+        plan: FederatedPlan,
+        merge_sql: str,
+        merge_params: dict[str, Any],
+        results: list[_MaterializedAdapterResult],
+        scope: ExecutionScope,
+        chunk_rows: int,
+    ) -> Iterator[list[tuple[Any, ...]]]:
+        # The connection belongs to this iterator, including a cancelled advance
+        # that is still executing in a worker. _iterate_blocking defers close.
         with self._merge_con(len(plan.fragments)) as con:
+            scope.check_deadline()
             for i, result in enumerate(results):
                 _load_fragment_into(
-                    con, i, result.columns, list(result.rows), result.column_types, fragment_index=i
+                    con, i, result.columns, result.rows, result.column_types, fragment_index=i
                 )
+                scope.check_deadline()
             self._warn_inline_once()
             cursor = con.execute(merge_sql, dict(merge_params))
+            scope.check_deadline()
             columns = [item[0] for item in cursor.description]
             if columns != list(plan.columns):
                 raise ExecutionContractError(
@@ -1433,14 +1655,18 @@ class AsyncEngine:
                     operation="merge",
                     stage="output_validation",
                 )
-            rows = cursor.fetchall()
-        return ExecutionResult(
-            columns=list(plan.columns),
-            column_meta=[replace(m) for m in plan.column_meta],
-            rows=rows,
-            analysis=_plan_analysis(plan),
-            validation_evidence=evidence,
-        )
+            budget = scope.output_budget()
+            while True:
+                batch = cursor.fetchmany(chunk_rows)
+                scope.check_deadline()
+                if not batch:
+                    return
+                converted: list[tuple[Any, ...]] = []
+                for row in batch:
+                    value = tuple(row)
+                    budget.check_row(value)
+                    converted.append(value)
+                yield converted
 
     def iter_run(
         self,
@@ -1451,19 +1677,26 @@ class AsyncEngine:
         """Return streamed merge chunks with metadata scoped to this iterator."""
         stream: AsyncExecutionIterator
 
-        async def chunks() -> AsyncIterator[list[tuple[Any, ...]]]:
+        async def chunks_with_scope(
+            scope: ExecutionScope,
+        ) -> AsyncGenerator[list[tuple[Any, ...]], None]:
             if chunk_rows <= 0:
                 raise EngineError(f"iter_run: chunk_rows must be positive, got {chunk_rows!r}.")
             merge_sql, merge_params = _preflight(plan)
             self._adapters_present(plan)
             _assert_fragments_read_only(plan)
+            scope.check_deadline()
             self.last_iter_run_used_fast_path = False
 
             if _can_stream_single_fragment(plan):
                 fragment = plan.fragments[0]
                 self.last_iter_run_used_fast_path = True
-                adapter_result = await self._adapters[fragment.dialect].execute(
-                    fragment.sql, fragment.params
+                fragment_budget = scope.fragment_budget()
+                output_budget = scope.output_budget()
+                adapter_result = await await_with_deadline(
+                    self._adapters[fragment.dialect].execute(fragment.sql, fragment.params),
+                    scope,
+                    dispose_late_result=_close_adapter_result,
                 )
                 row_iter: Iterator[Sequence[Any]] | None = None
                 try:
@@ -1475,8 +1708,10 @@ class AsyncEngine:
                                 columns=adapter_result.columns,
                                 rows=row_iter,
                                 column_types=adapter_result.column_types,
-                            )
+                            ),
+                            fragment_budget,
                         )
+                        fragment_budget = scope.fragment_budget()
                         row_iter = iter(materialized_result.rows)
                         stream.validation_evidence = _validate_merge_keys(
                             plan.merge_spec, [materialized_result]
@@ -1485,9 +1720,13 @@ class AsyncEngine:
                         chunk: list[tuple[Any, ...]] = []
                         for _ in range(chunk_rows):
                             try:
-                                chunk.append(tuple(next(row_iter)))
+                                value = tuple(next(row_iter))
+                                fragment_budget.check_row(value)
+                                output_budget.check_row(value)
+                                chunk.append(value)
                             except StopIteration:
                                 break
+                        scope.check_deadline()
                         if not chunk:
                             return
                         yield chunk
@@ -1495,37 +1734,82 @@ class AsyncEngine:
                     if row_iter is not None:
                         _close_iterator(row_iter)
 
-            adapter_results = await _gather_owned(
-                self._adapters[frag.dialect].execute(frag.sql, frag.params)
-                for frag in plan.fragments
-            )
-            results = _materialize_results(adapter_results)
+            async def execute_fragment(fragment: CompiledQuery) -> AdapterResult:
+                return await await_with_deadline(
+                    self._adapters[fragment.dialect].execute(fragment.sql, fragment.params),
+                    scope,
+                    dispose_late_result=_close_adapter_result,
+                )
+
+            adapter_results = await _gather_owned(execute_fragment(frag) for frag in plan.fragments)
+            results = _materialize_results(adapter_results, scope)
             for i, (fragment, result) in enumerate(zip(plan.fragments, results, strict=True)):
                 self._validate_result(i, fragment, result)
             stream.validation_evidence = _validate_merge_keys(plan.merge_spec, results)
+            scope.check_deadline()
 
-            with self._merge_con(len(plan.fragments)) as con:
-                for i, result in enumerate(results):
-                    _load_fragment_into(
-                        con, i, result.columns, result.rows, result.column_types, fragment_index=i
-                    )
-                self._warn_inline_once()
-                cursor = con.execute(merge_sql, dict(merge_params))
-                columns = [item[0] for item in cursor.description]
-                if columns != list(plan.columns):
+            chunks = _iterate_blocking(
+                self._inline_merge_chunks(
+                    plan, merge_sql, merge_params, results, scope, chunk_rows
+                ),
+                scope,
+            )
+            async with contextlib.aclosing(chunks):
+                async for chunk in chunks:
+                    yield chunk
+
+        async def chunks() -> AsyncIterator[list[tuple[Any, ...]]]:
+            semaphore = self._async_admission
+            if semaphore is not None:
+                try:
+                    timeout = self._limits.admission_timeout if self._limits else None
+                    if timeout is None:
+                        await semaphore.acquire()
+                    else:
+                        await asyncio.wait_for(semaphore.acquire(), timeout)
+                except TimeoutError:
                     raise ExecutionContractError(
-                        "Rendered merge columns do not match the declared output projection.",
-                        reason="output_columns_mismatch",
-                        artifact="merge",
-                        names=tuple(plan.columns),
-                        operation="merge",
-                        stage="output_validation",
-                    )
+                        "Execution admission wait limit exceeded.",
+                        reason="execution_admission_timeout",
+                        artifact="execution",
+                        operation="execute",
+                        stage="admission",
+                    ) from None
+            outstanding = 1
+            released = False
+
+            def retain_worker() -> Callable[[], None]:
+                nonlocal outstanding
+                outstanding += 1
+
+                def finished() -> None:
+                    nonlocal outstanding, released
+                    outstanding -= 1
+                    if outstanding == 0 and semaphore is not None and not released:
+                        released = True
+                        semaphore.release()
+
+                return finished
+
+            scope = ExecutionScope(self._limits)
+            inner = chunks_with_scope(scope)
+            try:
                 while True:
-                    chunk = await asyncio.to_thread(cursor.fetchmany, chunk_rows)
-                    if not chunk:
-                        return
-                    yield [tuple(row) for row in chunk]
+                    with blocking_work_owner(retain_worker):
+                        try:
+                            chunk = await anext(inner)
+                        except StopAsyncIteration:
+                            return
+                    yield chunk
+            finally:
+                try:
+                    with blocking_work_owner(retain_worker):
+                        await inner.aclose()
+                finally:
+                    outstanding -= 1
+                    if outstanding == 0 and semaphore is not None and not released:
+                        released = True
+                        semaphore.release()
 
         stream = AsyncExecutionIterator(chunks(), _plan_analysis(plan))
         return stream
@@ -1537,11 +1821,13 @@ class AsyncEngine:
     def _adapters_present(self, plan: FederatedPlan) -> None:
         for frag in plan.fragments:
             if frag.dialect not in self._adapters:
-                raise EngineError(
-                    f"No adapter registered for backend "
-                    f"{frag.dialect.value!r}. Call AsyncEngine.register("
-                    f"Dialect.{frag.dialect.name}, your_adapter) before "
-                    f"running this plan."
+                raise ExecutionContractError(
+                    "A required source adapter is not registered.",
+                    reason="adapter_missing",
+                    artifact="federated_plan",
+                    names=(frag.dialect.value,),
+                    operation="execute",
+                    stage="preflight",
                 )
 
     def _validate_result(

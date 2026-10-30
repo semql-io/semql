@@ -33,6 +33,9 @@ aggregated into a single list instead of a first-error raise.
 from __future__ import annotations
 
 import difflib
+import hashlib
+import json
+import math
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Annotated, Any, cast
@@ -62,12 +65,67 @@ from semql.model import (
 from semql.refs import is_qualified, parse_qualified_ref
 from semql.retrieve import EmbeddingProvider, Retriever, build_default_retriever
 from semql.spec import SavedQuery, SemanticQuery, SemanticQueryDefaults, _apply_query_defaults
+from semql.units import DEFAULT_REGISTRY, Registry
+from semql.validate import ValidationError, validate
 
 if TYPE_CHECKING:
     from semql.mutate import CompiledMutation, SemanticMutation
     from semql.rows import CompiledEntityQuery, EntityFetch, EntityList
-from semql.units import DEFAULT_REGISTRY, Registry
-from semql.validate import ValidationError, validate
+CATALOG_DIGEST_FORMAT_VERSION = 1
+
+
+class SourceProvenance(BaseModel):
+    """Optional identity supplied by an importer or host.
+
+    This describes source-format/version and a source label/snapshot; it
+    is not the host semantic revision (see :class:`CatalogContext`).
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    source_format: str
+    source_format_version: str | None = None
+    source_identity: str | None = None
+    source_snapshot: str | None = None
+
+
+class CatalogContentDigest(BaseModel):
+    """Versioned digest of serialized catalog content, not executable meaning."""
+
+    model_config = ConfigDict(frozen=True)
+
+    format_version: int
+    algorithm: str = "sha256"
+    value: str
+
+
+def _canonical_json_value(value: object, path: str = "$") -> object:
+    """Validate JSON's actual value/key domain and canonicalize object keys."""
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if type(value) is float:
+        number = value
+        if not math.isfinite(number):
+            raise TypeError(f"catalog content digest requires finite JSON numbers at {path}")
+        return number
+    if isinstance(value, (list, tuple)):
+        sequence = cast(list[object] | tuple[object, ...], value)
+        return [
+            _canonical_json_value(item, f"{path}[{index}]") for index, item in enumerate(sequence)
+        ]
+    if isinstance(value, dict):
+        mapping = cast(dict[object, object], value)
+        if any(type(key) is not str for key in mapping):
+            raise TypeError(f"catalog content digest requires string JSON object keys at {path}")
+        string_mapping = cast(dict[str, object], mapping)
+        return {
+            key: _canonical_json_value(string_mapping[key], f"{path}.{key}")
+            for key in sorted(string_mapping)
+        }
+    raise TypeError(
+        f"catalog content digest requires JSON-safe serialized values at {path}; "
+        f"got {type(value).__name__}"
+    )
 
 
 def _entity_spec_tag(value: object) -> str | None:
@@ -662,6 +720,34 @@ class CatalogSpec(BaseModel):
     #: ``()`` for a clean build; populated when collect-all surfaces
     #: a problem the legacy first-error constructor would have raised.
     construction_errors: tuple[dict[str, Any], ...] = Field(default_factory=tuple)
+    source_provenance: SourceProvenance | None = None
+
+    @property
+    def content_digest(self) -> CatalogContentDigest:
+        """Return the deterministic digest of serialized spec content.
+
+        This is descriptive integrity metadata only. It does not identify
+        runtime callables, policy code, authorization, or semantic equivalence.
+        """
+        payload = self.model_dump(
+            mode="python",
+            exclude={
+                "construction_errors": True,
+                "lookups": {"__all__": {"loader", "enricher"}},
+            },
+        )
+        canonical = _canonical_json_value(payload)
+        encoded = json.dumps(
+            {"format_version": CATALOG_DIGEST_FORMAT_VERSION, "catalog": canonical},
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return CatalogContentDigest(
+            format_version=CATALOG_DIGEST_FORMAT_VERSION,
+            value=hashlib.sha256(encoded).hexdigest(),
+        )
 
     @model_validator(mode="before")
     @classmethod
@@ -737,6 +823,7 @@ class CatalogSpec(BaseModel):
         allow_mutations: bool = False,
         max_list_limit: int = 1000,
         max_mutation_rows: int = 1000,
+        source_provenance: SourceProvenance | None = None,
     ) -> tuple[CatalogSpec, list[dict[str, Any]]]:
         """Collect-all constructor for a spec.
 
@@ -814,6 +901,7 @@ class CatalogSpec(BaseModel):
             allow_mutations=allow_mutations,
             max_list_limit=max_list_limit,
             max_mutation_rows=max_mutation_rows,
+            source_provenance=source_provenance,
             construction_errors=tuple(errors),
         )
         return spec, errors
@@ -916,7 +1004,16 @@ class Catalog:
             allow_mutations=spec.allow_mutations,
             max_list_limit=spec.max_list_limit,
             max_mutation_rows=spec.max_mutation_rows,
+            source_provenance=spec.source_provenance,
         )
+
+    @property
+    def source_provenance(self) -> SourceProvenance | None:
+        return self.spec.source_provenance
+
+    @property
+    def content_digest(self) -> CatalogContentDigest:
+        return self.spec.content_digest
 
     def __init__(
         self,
@@ -938,6 +1035,7 @@ class Catalog:
         allow_mutations: bool = False,
         max_list_limit: int = 1000,
         max_mutation_rows: int = 1000,
+        source_provenance: SourceProvenance | None = None,
     ) -> None:
         self.compile_hooks = compile_hooks or []
         self.sql_rewrite_hooks = sql_rewrite_hooks or []
@@ -1038,6 +1136,7 @@ class Catalog:
             allow_mutations=allow_mutations,
             max_list_limit=max_list_limit,
             max_mutation_rows=max_mutation_rows,
+            source_provenance=source_provenance,
         )
         self.runtime = CatalogRuntime(
             policy=policy,
@@ -1430,4 +1529,9 @@ def _resolve_extends(cubes: list[Cube]) -> list[Cube]:
     return resolved
 
 
-__all__ = ["Catalog"]
+__all__ = [
+    "CATALOG_DIGEST_FORMAT_VERSION",
+    "Catalog",
+    "CatalogContentDigest",
+    "SourceProvenance",
+]

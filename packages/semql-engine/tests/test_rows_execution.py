@@ -22,7 +22,14 @@ from semql import (
     Measure,
 )
 from semql.model import Dialect
-from semql_engine import AdapterResult, DuckDBAdapter, InMemoryRowAdapter, execute_entity
+from semql_engine import (
+    AdapterResult,
+    DuckDBAdapter,
+    ExecutionContractError,
+    ExecutionLimits,
+    InMemoryRowAdapter,
+    execute_entity,
+)
 
 # Shared seed data — the same rows feed both the DuckDB table and the
 # in-memory adapter, keyed identically.
@@ -169,8 +176,9 @@ def test_scope_honored_on_both_paths(duck_con: duckdb.DuckDBPyConnection) -> Non
 def test_execute_entity_rejects_wrong_adapter_for_sql(duck_con: duckdb.DuckDBPyConnection) -> None:
     cat = Catalog([_cube()], entities=[_entity()])
     compiled = cat.fetch(EntityFetch(entity="order", key=1))  # has SQL
-    with pytest.raises(TypeError, match=r"(?i)row|execute"):
+    with pytest.raises(ExecutionContractError) as error:
         execute_entity(compiled, InMemoryRowAdapter({"orders": _ROWS}))
+    assert error.value.reason == "adapter_capability_missing"
 
 
 def test_execute_entity_rejects_sql_adapter_for_custom(
@@ -178,5 +186,84 @@ def test_execute_entity_rejects_sql_adapter_for_custom(
 ) -> None:
     cat = Catalog([_cube()], entities=[_entity(custom_backend=True)])
     compiled = cat.fetch(EntityFetch(entity="order", key=1))  # sql is None
-    with pytest.raises(TypeError, match=r"(?i)RowCapable|execute_rows"):
+    with pytest.raises(ExecutionContractError) as error:
         execute_entity(compiled, DuckDBAdapter(duck_con))
+    assert error.value.reason == "adapter_capability_missing"
+
+
+@pytest.mark.parametrize("custom_backend", [False, True], ids=["sql", "custom"])
+@pytest.mark.parametrize(
+    ("limits", "expected_reason"),
+    [
+        (ExecutionLimits(max_rows=1), None),
+        (ExecutionLimits(max_rows=0), "execution_row_limit_exceeded"),
+        (ExecutionLimits(max_value_bytes=9), None),
+        (ExecutionLimits(max_value_bytes=8), "execution_value_byte_limit_exceeded"),
+    ],
+    ids=["row-cap", "row-overflow", "byte-cap", "byte-overflow"],
+)
+def test_entity_execution_limits_are_exact_and_path_independent(
+    duck_con: duckdb.DuckDBPyConnection,
+    custom_backend: bool,
+    limits: ExecutionLimits,
+    expected_reason: str | None,
+) -> None:
+    catalog = Catalog([_cube()], entities=[_entity(custom_backend=custom_backend)])
+    compiled = catalog.fetch(EntityFetch(entity="order", key=2))
+    adapter = InMemoryRowAdapter({"orders": _ROWS}) if custom_backend else DuckDBAdapter(duck_con)
+
+    if expected_reason is not None:
+        with pytest.raises(ExecutionContractError) as error:
+            execute_entity(compiled, adapter, limits=limits)
+        assert error.value.reason == expected_reason
+    else:
+        result = execute_entity(compiled, adapter, limits=limits)
+        assert _records(result) == [{"id": 2, "region": "eu", "status": "closed"}]
+
+
+class _ClosableRows:
+    def __init__(self, rows: list[tuple[object, ...]]) -> None:
+        self.rows = iter(rows)
+        self.closed = False
+
+    def __iter__(self) -> _ClosableRows:
+        return self
+
+    def __next__(self) -> tuple[object, ...]:
+        return next(self.rows)
+
+    def close(self) -> None:
+        self.closed = True
+
+
+@pytest.mark.parametrize("custom_backend", [False, True], ids=["sql", "custom"])
+@pytest.mark.parametrize(
+    ("fault", "limits", "reason"),
+    [
+        ("row-cap", ExecutionLimits(max_rows=0), "execution_row_limit_exceeded"),
+        ("columns", ExecutionLimits(), "output_columns_mismatch"),
+    ],
+)
+def test_entity_closes_acquired_result_iterator_on_failure(
+    duck_con: duckdb.DuckDBPyConnection,
+    custom_backend: bool,
+    fault: str,
+    limits: ExecutionLimits,
+    reason: str,
+) -> None:
+    catalog = Catalog([_cube()], entities=[_entity(custom_backend=custom_backend)])
+    compiled = catalog.fetch(EntityFetch(entity="order", key=2))
+    columns = ["wrong"] if fault == "columns" else list(compiled.columns)
+    rows = _ClosableRows([(1,) if fault == "columns" else (2, "eu", "closed")])
+
+    class AdapterWithClosableRows:
+        def execute(self, sql: str, params: object) -> AdapterResult:
+            return AdapterResult(columns, rows)
+
+        def execute_rows(self, plan: object) -> AdapterResult:
+            return AdapterResult(columns, rows)
+
+    with pytest.raises(ExecutionContractError) as error:
+        execute_entity(compiled, AdapterWithClosableRows(), limits=limits)
+    assert error.value.reason == reason
+    assert rows.closed

@@ -9,6 +9,7 @@ or a caller-supplied :class:`SchemaProbe` for non-ANSI dialects.
 
 from __future__ import annotations
 
+import warnings
 from typing import Any
 
 from semql.model import Cube, Dialect
@@ -17,6 +18,9 @@ from semql_introspect._emit import emit_python
 from semql_introspect._introspect import (
     HeuristicAnnotation,
     IntrospectionResult,
+    MappingFact,
+    MappingStatus,
+    TableMappingReport,
     introspect,
 )
 from semql_introspect._probe import (
@@ -38,17 +42,31 @@ def introspect_catalog(
 ) -> list[Cube]:
     """Convenience wrapper that builds the ANSI probe + runs ``introspect``.
 
-    Returns the cube list only; for the parallel heuristic annotations
-    call :func:`introspect_to_result` instead. Pass a custom
+    Returns the cube list only and warns if source facts cannot be
+    represented faithfully; inspect :func:`introspect_to_result` for
+    per-table mapping reports and source provenance. Pass a custom
     :class:`SchemaProbe` plus :func:`introspect` directly for non-ANSI
     dialects (ClickHouse, BigQuery)."""
-    return introspect_to_result(
+    result = introspect_to_result(
         connection,
         dialect=dialect,
         schema=schema,
         include_tables=include_tables,
         exclude_tables=exclude_tables,
-    ).cubes
+    )
+    losses = [
+        report
+        for report in result.table_reports
+        if report.unsupported_primary_key_components or report.unsupported_foreign_keys
+    ]
+    if losses:
+        warnings.warn(
+            "introspect_catalog returns cubes only and would hide source-schema mapping losses; "
+            "use introspect_to_result() to inspect table_reports",
+            UserWarning,
+            stacklevel=2,
+        )
+    return result.cubes
 
 
 def introspect_to_result(
@@ -95,8 +113,11 @@ __all__ = [
     "HeuristicAnnotation",
     "InformationSchemaProbe",
     "IntrospectionResult",
+    "MappingFact",
+    "MappingStatus",
     "SchemaProbe",
     "TableInfo",
+    "TableMappingReport",
     "emit_python",
     "introspect",
     "introspect_catalog",

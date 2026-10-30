@@ -16,6 +16,8 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+from semql.catalog import SourceProvenance
+
 _SAFE_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]*$")
 
 
@@ -50,12 +52,13 @@ class ColumnInfo:
 
 @dataclass(frozen=True)
 class ForeignKeyInfo:
-    """One FK edge — ``from_table.from_column → to_table.to_column``."""
+    """One complete FK constraint, preserving its ordered column pairs."""
 
     from_table: str
-    from_column: str
     to_table: str
-    to_column: str
+    from_columns: tuple[str, ...]
+    to_columns: tuple[str, ...]
+    constraint_name: str
 
 
 @dataclass(frozen=True)
@@ -67,22 +70,14 @@ class TableInfo:
 
 
 class SchemaProbe(Protocol):
-    """Read-only dialect adapter for introspection.
-
-    Implementations should return tables / columns / foreign keys
-    scoped to whatever schema the caller asked about — the orchestrator
-    treats the result as authoritative and doesn't filter again."""
+    """Read-only dialect adapter for introspection."""
 
     def list_tables(self) -> list[TableInfo]: ...
 
     def list_foreign_keys(self) -> list[ForeignKeyInfo]: ...
 
-    def list_primary_keys(self) -> dict[str, str]:
-        """``{table_name: primary_key_column}``.
-
-        Probes that can't recover primary keys (some warehouses don't
-        ship constraints) should return ``{}`` — heuristics will fall
-        back to "first column named ``id``" detection."""
+    def list_primary_keys(self) -> dict[str, tuple[str, ...]]:
+        """Return complete ordered primary-key columns per table."""
         ...
 
 
@@ -110,26 +105,26 @@ class InformationSchemaProbe:
         self._include = set(include_tables) if include_tables else None
         self._exclude = set(exclude_tables or ())
 
+    @property
+    def source_provenance(self) -> SourceProvenance:
+        """Stable source-format label and schema scope for this probe."""
+        return SourceProvenance(source_format="information_schema", source_identity=self._schema)
+
     def list_tables(self) -> list[TableInfo]:
         cur = self._conn.cursor()
         try:
             cur.execute(
                 "SELECT table_name FROM information_schema.tables "
                 f"WHERE table_schema = '{self._schema}' "
-                "AND table_type = 'BASE TABLE' "
-                "ORDER BY table_name"
+                "AND table_type = 'BASE TABLE' ORDER BY table_name"
             )
-            table_names = [row[0] for row in cur.fetchall()]
+            names = [row[0] for row in cur.fetchall()]
         finally:
             cur.close()
         if self._include is not None:
-            table_names = [t for t in table_names if t in self._include]
-        table_names = [t for t in table_names if t not in self._exclude]
-
-        out: list[TableInfo] = []
-        for tbl in table_names:
-            out.append(TableInfo(name=tbl, columns=self._columns_for(tbl)))
-        return out
+            names = [name for name in names if name in self._include]
+        names = [name for name in names if name not in self._exclude]
+        return [TableInfo(name=name, columns=self._columns_for(name)) for name in names]
 
     def _columns_for(self, table: str) -> tuple[ColumnInfo, ...]:
         _assert_safe_identifier(table, "table")
@@ -155,67 +150,63 @@ class InformationSchemaProbe:
         )
 
     def list_foreign_keys(self) -> list[ForeignKeyInfo]:
-        # ``information_schema.constraint_column_usage`` differs per
-        # backend: Postgres returns the referenced (target) table for
-        # FK constraints, DuckDB returns the source table. The more
-        # portable shape is ``referential_constraints`` → the PK
-        # constraint on the referenced side, joined via ``key_column_usage``
-        # on both ends with matching ordinal positions for composite
-        # keys. Works on PG / DuckDB / Snowflake unchanged.
         cur = self._conn.cursor()
         try:
             cur.execute(
-                "SELECT kcu_from.table_name AS from_table, "
-                "       kcu_from.column_name AS from_column, "
-                "       kcu_to.table_name AS to_table, "
-                "       kcu_to.column_name AS to_column "
+                "SELECT kcu_from.table_name, kcu_from.column_name, "
+                "kcu_to.table_name, kcu_to.column_name, "
+                "kcu_from.constraint_name, kcu_from.ordinal_position "
                 "FROM information_schema.referential_constraints rc "
                 "JOIN information_schema.key_column_usage kcu_from "
-                "  ON rc.constraint_name = kcu_from.constraint_name "
-                " AND rc.constraint_schema = kcu_from.constraint_schema "
+                " ON rc.constraint_name = kcu_from.constraint_name "
+                "AND rc.constraint_schema = kcu_from.constraint_schema "
                 "JOIN information_schema.key_column_usage kcu_to "
-                "  ON rc.unique_constraint_name = kcu_to.constraint_name "
-                " AND rc.unique_constraint_schema = kcu_to.constraint_schema "
-                " AND kcu_from.ordinal_position = kcu_to.ordinal_position "
+                " ON rc.unique_constraint_name = kcu_to.constraint_name "
+                "AND rc.unique_constraint_schema = kcu_to.constraint_schema "
+                "AND kcu_from.position_in_unique_constraint = kcu_to.ordinal_position "
                 f"WHERE rc.constraint_schema = '{self._schema}' "
-                "ORDER BY kcu_from.table_name, kcu_from.ordinal_position"
+                "ORDER BY kcu_from.table_name, kcu_from.constraint_name, "
+                "kcu_from.ordinal_position"
             )
             rows = cur.fetchall()
         finally:
             cur.close()
+        grouped: dict[tuple[str, str, str], list[tuple[str, str]]] = {}
+        for from_table, from_column, to_table, to_column, name, _ordinal in rows:
+            grouped.setdefault((str(from_table), str(to_table), str(name)), []).append(
+                (str(from_column), str(to_column))
+            )
         return [
             ForeignKeyInfo(
-                from_table=row[0],
-                from_column=row[1],
-                to_table=row[2],
-                to_column=row[3],
+                from_table=source,
+                to_table=target,
+                from_columns=tuple(pair[0] for pair in pairs),
+                to_columns=tuple(pair[1] for pair in pairs),
+                constraint_name=name,
             )
-            for row in rows
+            for (source, target, name), pairs in sorted(grouped.items())
         ]
 
-    def list_primary_keys(self) -> dict[str, str]:
+    def list_primary_keys(self) -> dict[str, tuple[str, ...]]:
         cur = self._conn.cursor()
         try:
             cur.execute(
                 "SELECT kcu.table_name, kcu.column_name "
                 "FROM information_schema.table_constraints tc "
                 "JOIN information_schema.key_column_usage kcu "
-                "  ON tc.constraint_name = kcu.constraint_name "
-                " AND tc.table_schema = kcu.table_schema "
+                " ON tc.constraint_name = kcu.constraint_name "
+                "AND tc.table_schema = kcu.table_schema "
                 "WHERE tc.constraint_type = 'PRIMARY KEY' "
-                f"  AND tc.table_schema = '{self._schema}' "
+                f" AND tc.table_schema = '{self._schema}' "
                 "ORDER BY kcu.table_name, kcu.ordinal_position"
             )
             rows = cur.fetchall()
         finally:
             cur.close()
-        # If a PK is composite, the first column wins — the catalog
-        # model only supports a single ``primary_key`` per cube. A
-        # ``# TODO: review`` will surface composite-key tables anyway.
-        out: dict[str, str] = {}
-        for row in rows:
-            out.setdefault(str(row[0]), str(row[1]))
-        return out
+        out: dict[str, list[str]] = {}
+        for table, column in rows:
+            out.setdefault(str(table), []).append(str(column))
+        return {table: tuple(columns) for table, columns in sorted(out.items())}
 
 
 __all__ = [

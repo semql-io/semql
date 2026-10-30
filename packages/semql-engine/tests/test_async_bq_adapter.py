@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+import threading
 import time
 from collections.abc import Awaitable, Mapping
 from decimal import Decimal
@@ -446,3 +447,32 @@ def test_async_bq_adapter_default_translator_raises_without_google_cloud() -> No
     # not a dev dep, so the import will fail and the helper raises.
     with pytest.raises(RuntimeError, match="google-cloud-bigquery"):
         _run(adapter.execute("SELECT 1 AS a", {}))
+
+
+def test_async_bq_adapter_finishes_owned_worker_after_waiter_cancellation() -> None:
+    started = threading.Event()
+    release = threading.Event()
+    returned = threading.Event()
+
+    class _BlockingClient:
+        def query(self, _sql: str, job_config: Any = None) -> _FakeBQResult:
+            started.set()
+            release.wait()
+            returned.set()
+            return _FakeBQResult(rows=[(1,)], schema=["a"])
+
+    async def scenario() -> None:
+        adapter = AsyncBigQueryAdapter(_BlockingClient(), translator=_fake_translator)
+        task = asyncio.create_task(adapter.execute("SELECT 1 AS a", {}))
+        assert await asyncio.to_thread(started.wait, 2)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        release.set()
+        assert await asyncio.to_thread(returned.wait, 2)
+        await asyncio.sleep(0)
+
+    try:
+        _run(scenario())
+    finally:
+        release.set()

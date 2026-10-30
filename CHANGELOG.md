@@ -7,6 +7,29 @@ packages version in lockstep. Format loosely follows
 
 ## [Unreleased]
 
+### Added
+
+- Loss-aware introspection reports preserve complete source key structures,
+  distinguish mapped/inferred/report-only facts, and travel with generated Python.
+- Optional `SourceProvenance` and versioned `CatalogContentDigest` keep source
+  representation, host semantic revision, and content integrity distinct.
+- Opt-in `ExecutionLimits` add admission, monotonic deadlines, and incremental
+  fragment/output row and value-byte accounting without restricting defaults.
+- Shared adapter conformance assertions, fault-provoking fixtures, and required
+  actual-backend execution mode with a documented evidence matrix.
+
+### Fixed
+
+- Composite foreign keys remain one conjunction join; composite primary keys
+  no longer become false single-column identities. Alias collisions preserve
+  executable field and join references.
+- Async sync-driver work retains execution admission through late completion,
+  cleans up late result iterators, and consumes late exceptions after cancellation.
+- Missing adapters fail with typed diagnostics before fragment execution.
+  Version-2 semi-join plans retain the compiled outer template for early preflight.
+
+See [migration and resource-boundary details](docs/migrations/reliable-integration.md).
+
 ## [0.14.0] - 2026-10-23
 
 ### Added

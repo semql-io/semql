@@ -73,6 +73,30 @@ Internal exception/artifact dumps may include private information. Use
 plans with unsupported executable versions rather than changing their version
 number by hand.
 
+## Opt-in resource controls
+
+Pass `limits=ExecutionLimits(...)` to `Engine` or `AsyncEngine` to bound admission,
+execution elapsed time, each fragment's materialized rows/value bytes, and final
+rows/value bytes. Every limit defaults to `None`; programmer-controlled,
+unrestricted execution remains available. Cohort and semi-join stages share the
+engine's admission lease and deadline. Direct entity reads accept `limits=` too.
+
+Bounds are enforced while consuming rows, including cache returns and async
+streams. An overflow raises `ExecutionContractError`, not a silently truncated
+complete result. Streams may already have delivered earlier chunks when they
+raise; treat them as incomplete.
+
+Deadlines are cooperative for synchronous drivers. Sync-backed async adapters
+keep admission occupied until their already-started work actually finishes,
+even when the caller times out. Engine bounds do not cap driver buffering,
+database scans, process memory, or transport/request bytes.
+
+See the [migration guide](../../docs/migrations/reliable-integration.md) for
+configuration, byte-accounting semantics and typed reasons, and the
+[conformance matrix](../../docs/specs/adapter-conformance-matrix.md) for the
+actual-driver versus stand-in execution coverage.
+
+
 ## Adapters
 
 An `Adapter` is anything with `execute(sql, params) -> AdapterResult`.

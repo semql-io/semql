@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+import threading
 import time
 from collections.abc import Awaitable, Mapping
 from decimal import Decimal
@@ -283,3 +284,41 @@ def test_async_dbapi_physical_schema_executes_empty_and_null_numeric_results(
     result = _run(engine.run(plan))
 
     assert result.rows == expected
+
+
+def test_async_dbapi_adapter_finishes_owned_worker_after_waiter_cancellation() -> None:
+    started = threading.Event()
+    release = threading.Event()
+    cursor_closed = threading.Event()
+
+    class _BlockingCursor:
+        description: list[tuple[str, ...]] = []
+
+        def execute(self, _sql: str, _params: Any = None) -> None:
+            started.set()
+            release.wait()
+
+        def fetchall(self) -> list[tuple[Any, ...]]:
+            return [(1,)]
+
+        def close(self) -> None:
+            cursor_closed.set()
+
+    class _BlockingConnection:
+        def cursor(self) -> _BlockingCursor:
+            return _BlockingCursor()
+
+    async def scenario() -> None:
+        adapter = AsyncDBAPIAdapter(_BlockingConnection())
+        task = asyncio.create_task(adapter.execute("SELECT 1", {}))
+        assert await asyncio.to_thread(started.wait, 2)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        release.set()
+        assert await asyncio.to_thread(cursor_closed.wait, 2)
+
+    try:
+        _run(scenario())
+    finally:
+        release.set()
