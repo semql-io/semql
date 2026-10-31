@@ -215,3 +215,36 @@ def test_missing_or_contradictory_time_policy_cannot_prove_unbucketed_result() -
         assert not report.accepted
     monthly_contract = _contract("orders.amount", permitted_granularities=("month",))
     assert check_semantics(monthly, {monthly_contract.reference: monthly_contract}).accepted
+
+
+def test_confirmed_granularity_intent_requires_consistent_temporal_evidence() -> None:
+    monthly = _compiled(metric="amount", time=True)
+    assert monthly.result is not None and monthly.result.time_policy is not None
+    contract = _contract("orders.amount")
+    registry = {contract.reference: contract}
+    expected = SemanticExpectations(
+        granularity="day", origin="independently_confirmed", evidence_ref="request:daily-report"
+    )
+    wrong_policy = monthly.result.time_policy.model_copy(update={"granularity": "day"})
+    for policy in (wrong_policy, None):
+        incomplete = monthly.model_copy(
+            update={
+                "result": monthly.result.model_copy(update={"time_policy": policy}),
+            }
+        )
+        report = check_semantics(
+            incomplete,
+            registry,
+            expected,
+            require_confirmed_intent=True,
+        )
+        assert report.semantic_validity == ProofStatus.PROVED
+        assert _status(report, "intent_granularity") == ProofStatus.NOT_ESTABLISHED
+        assert report.confirmed_intent_alignment == ProofStatus.NOT_ESTABLISHED
+        assert not report.accepted
+    assert check_semantics(
+        monthly,
+        registry,
+        expected.model_copy(update={"granularity": "month"}),
+        require_confirmed_intent=True,
+    ).accepted

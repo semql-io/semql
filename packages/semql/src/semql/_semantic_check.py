@@ -563,7 +563,12 @@ def check_semantics(
             known=population is not None,
         )
         compare("intent_time_axis", expectations.time_axis, axis, known=axis_known)
-        compare("intent_granularity", expectations.granularity, granularity, known=available)
+        compare(
+            "intent_granularity",
+            expectations.granularity,
+            granularity,
+            known=result_granularity_known,
+        )
         if expectations.required_segments is not None:
             compare(
                 "intent_required_segments",
