@@ -28,7 +28,7 @@ from semql import (
     compile_federated_query,
 )
 from semql.federate import FederatedPlan
-from semql_engine import AdapterResult, DuckDBAdapter, Engine, EngineError
+from semql_engine import AdapterResult, DuckDBAdapter, DuckDBMergeEngine, Engine, EngineError
 from semql_engine.merge import render_merge_sql
 
 # ---------------------------------------------------------------------------
@@ -225,6 +225,39 @@ def test_engine_handles_avg_decomposition(
     rows = {r[0]: r[1] for r in result.rows}
     # EU: (100+200+300)/3 = 200; US: (50+25)/2 = 37.5
     assert rows == {"EU": 200.0, "US": 37.5}
+
+
+def test_mean_state_preserves_weighting_nulls_and_metric_filter(
+    pg_con: duckdb.DuckDBPyConnection,
+    bq_con: duckdb.DuckDBPyConnection,
+) -> None:
+    pg_con.execute("DELETE FROM orders")
+    pg_con.execute(
+        "INSERT INTO orders VALUES "
+        "(1,10,'paid',9),(2,10,'paid',NULL),(3,11,'paid',1),"
+        "(4,11,'paid',1),(5,11,'paid',1),(6,11,'pending',1000),"
+        "(7,12,'paid',NULL),(8,13,'paid',NULL)"
+    )
+    bq_con.execute("UPDATE customers SET region='EU' WHERE id=11")
+    bq_con.execute("INSERT INTO customers VALUES (13,'LATAM','basic')")
+    mean = Measure(
+        name="paid_mean",
+        sql="{o}.amount",
+        agg="avg",
+        filter="{o}.status = 'paid'",
+        unit="currency",
+    )
+    orders = _orders_cube().model_copy(update={"measures": [mean]})
+    plan = compile_federated_query(
+        SemanticQuery(measures=["orders.paid_mean"], dimensions=["customers.region"]),
+        _catalog(orders, _customers_cube()),
+    )
+    engine = Engine(merge_engine=DuckDBMergeEngine())
+    engine.register(Dialect.POSTGRES, _DialectTranslatingAdapter(pg_con))
+    engine.register(Dialect.BIGQUERY, _DialectTranslatingAdapter(bq_con))
+    rows = {row[0]: row[1] for row in engine.run(plan).rows}
+    # Independent oracle: (9 + 1 + 1 + 1) / 4, not mean(9, 1) = 5.
+    assert rows == {"EU": 3.0, "LATAM": None}
 
 
 def test_iter_rows_yields_dicts(

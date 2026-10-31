@@ -486,11 +486,24 @@ def _resolve_field_to_cube(ref: str, catalog: dict[str, Cube]) -> Cube:
 _AVG_DECOMP_SUM_SUFFIX = "__avg_sum"
 _AVG_DECOMP_COUNT_SUFFIX = "__avg_count"
 
+_MEAN_STATE_RECIPE = "sum_count_recomposition"
 
-def _decompose_avg_measure(m: Measure) -> tuple[Measure, Measure]:
-    """For ``agg='avg'`` measures, emit a ``sum`` and a ``count`` pair
-    the fragment can compute. The merge step recomposes the average as
-    ``SUM(sum) / NULLIF(SUM(count), 0)``."""
+
+@dataclass(frozen=True)
+class _MeanState:
+    """Sufficient state, not finalized averages or a new metric definition.
+
+    Both components retain the original input expression and filters. COUNT
+    observes only non-NULL inputs, so SUM/COUNT recomposes SQL AVG even when
+    fragment groups have unequal sizes or contain NULLs.
+    """
+
+    components: tuple[Measure, Measure]
+    merge_agg: Literal["avg_recomposed"] = "avg_recomposed"
+
+
+def _decompose_avg_measure(m: Measure) -> _MeanState:
+    """Lift an existing mean into the state consumed by fragment and merge lowering."""
     sum_m = m.model_copy(
         update={
             "name": m.name + _AVG_DECOMP_SUM_SUFFIX,
@@ -511,7 +524,7 @@ def _decompose_avg_measure(m: Measure) -> tuple[Measure, Measure]:
             "display_unit": None,
         }
     )
-    return sum_m, count_m
+    return _MeanState((sum_m, count_m))
 
 
 @dataclass
@@ -531,8 +544,8 @@ class _PartitionPlan:
     # Map from the original measure ref ("orders.revenue") to the
     # column name(s) in the fragment's output.
     measure_columns: dict[str, str]
-    # Original avg measures decomposed: ref → (sum_col, count_col).
-    avg_columns: dict[str, tuple[str, str]]
+    # Original avg measure ref → sufficient state consumed by both lowerings.
+    avg_columns: dict[str, _MeanState]
     # Map from the original dim ref ("customers.region") to the column
     # name in the fragment's output. Only dims this partition owns.
     dim_columns: dict[str, str]
@@ -573,7 +586,7 @@ def _build_partition_sub_query(
 
     sub_measures: list[str] = []
     measure_columns: dict[str, str] = {}
-    avg_columns: dict[str, tuple[str, str]] = {}
+    avg_columns: dict[str, _MeanState] = {}
     # Synthetic Measures we add to the cube for avg decomposition.
     synthetic_measures: dict[str, list[Measure]] = {}
 
@@ -598,11 +611,12 @@ def _build_partition_sub_query(
             sub_measures.append(ref)
             measure_columns[ref] = m_name
         elif m.agg == "avg":
-            sum_m, count_m = _decompose_avg_measure(m)
+            state = _decompose_avg_measure(m)
+            sum_m, count_m = state.components
             synthetic_measures.setdefault(owner.name, []).extend([sum_m, count_m])
             sub_measures.append(f"{owner.name}.{sum_m.name}")
             sub_measures.append(f"{owner.name}.{count_m.name}")
-            avg_columns[ref] = (sum_m.name, count_m.name)
+            avg_columns[ref] = state
         else:
             raise FederationError(
                 f"Measure {ref!r} uses agg={m.agg!r}, which is not "
@@ -949,13 +963,14 @@ def _build_distributive_spec(
             next(m for m in output_column_meta if m.name == output_name), output_name
         )
         if ref in plan.avg_columns:
-            sum_col, count_col = plan.avg_columns[ref]
+            state = plan.avg_columns[ref]
+            sum_m, count_m = state.components
             measure_outputs.append(
                 MeasureOutput(
                     output_name=output_name,
-                    merge_agg="avg_recomposed",
-                    sum_source=FragmentColumn(idx, sum_col),
-                    count_source=FragmentColumn(idx, count_col),
+                    merge_agg=state.merge_agg,
+                    sum_source=FragmentColumn(idx, sum_m.name),
+                    count_source=FragmentColumn(idx, count_m.name),
                     column_meta=meta,
                 )
             )
@@ -2297,7 +2312,7 @@ def compile_federated_query(
                 operation = logical_measure.agg if logical_measure is not None else "measure"
                 if output.merge_agg == "avg_recomposed":
                     operation = "avg"
-                    recipe = "sum_count_recomposition"
+                    recipe = _MEAN_STATE_RECIPE
                     refs = tuple(
                         f"{label}={coord}"
                         for label, source in (

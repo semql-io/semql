@@ -32,6 +32,10 @@ path = "semql._grounding"
 layer = "foundation"
 
 [[modules]]
+path = "semql._semantic_check"
+layer = "app"
+
+[[modules]]
 path = "semql._resolve"
 layer = "app"
 
@@ -74,6 +78,10 @@ layer = "app"
 [[modules]]
 path = "semql.compile"
 layer = "app"
+
+[[modules]]
+path = "semql.contracts"
+layer = "foundation"
 
 [[modules]]
 path = "semql.cost"
