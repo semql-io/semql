@@ -69,6 +69,11 @@ def _invalid(reason: str) -> ContractError:
     )
 
 
+def validate_analysis_references(analysis: SemanticAnalysis) -> None:
+    """Shared structural guard; unknown semantic vocabulary is checked separately."""
+    _Graph(analysis).validate_references()
+
+
 def _value(value: object) -> object:
     """Normalize typed descriptor values while ignoring optional annotations."""
     if isinstance(value, BaseModel):
@@ -195,7 +200,76 @@ class _Graph:
             fields.append((name, normalized))
         return tuple(fields)
 
+    def validate_references(self) -> None:
+        """Validate all local edges without recursively expanding descriptors."""
+        edges: dict[tuple[str, str], set[tuple[str, str]]] = {
+            ("node", ref): set() for ref in self.nodes
+        }
+        edges.update({("population", ref): set() for ref in self.populations})
+        for node in self.nodes.values():
+            dependencies = edges[("node", node.node_id)]
+            dependencies.update(("node", ref) for ref in node.operand_ids)
+            if node.population_ref is not None:
+                dependencies.add(("population", node.population_ref))
+            if any(ref not in self.bindings for ref in node.binding_refs):
+                raise _invalid("dangling_binding_reference")
+        for population in self.populations.values():
+            edges[("population", population.population_id)].update(
+                ("node", ref) for ref in population.predicate_ids
+            )
+        dependants: dict[tuple[str, str], list[tuple[str, str]]] = {key: [] for key in edges}
+        for key, dependencies in edges.items():
+            for dependency in dependencies:
+                if dependency not in edges:
+                    raise _invalid(f"dangling_{dependency[0]}_reference")
+                dependants[dependency].append(key)
+        remaining = {key: len(dependencies) for key, dependencies in edges.items()}
+        ready = [key for key, count in remaining.items() if not count]
+        visited = 0
+        while ready:
+            key = ready.pop()
+            visited += 1
+            for dependant in dependants[key]:
+                remaining[dependant] -= 1
+                if not remaining[dependant]:
+                    ready.append(dependant)
+        if visited != len(edges):
+            raise _invalid("cyclic_semantic_graph")
+
+        def require_nodes(refs: Sequence[str]) -> None:
+            if any(ref not in self.nodes for ref in refs):
+                raise _invalid("dangling_node_reference")
+
+        for annotation in self.analysis.check_annotations:
+            require_nodes(annotation.node_ids)
+        for derivation in self.analysis.derivations:
+            require_nodes(derivation.logical_node_ids)
+        result = self.analysis.result
+        if result is None:
+            return
+        require_nodes((*result.grain_node_ids, *result.predicate_ids))
+        require_nodes(tuple(item[0] for item in result.order))
+        if result.population_ref is not None and result.population_ref not in self.populations:
+            raise _invalid("dangling_population_reference")
+        if result.time_policy is not None and any(
+            ref is not None and ref not in self.bindings
+            for ref in (
+                result.time_policy.current_binding_ref,
+                result.time_policy.prior_binding_ref,
+            )
+        ):
+            raise _invalid("dangling_binding_reference")
+        if result.ranking is not None:
+            require_nodes(
+                (
+                    *result.ranking.partition_node_ids,
+                    *result.ranking.tie_breaker_node_ids,
+                    *(item[0] for item in result.ranking.order),
+                )
+            )
+
     def validate(self) -> None:
+        self.validate_references()
         # Validate the complete artifact, including hidden/unprojected nodes.
         for node_id in self.nodes:
             self.node(node_id)

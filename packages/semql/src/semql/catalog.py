@@ -42,7 +42,7 @@ from pydantic import BaseModel, ConfigDict, Discriminator, Field, Tag, model_val
 from semql._grounding import validate_relations
 from semql.analysis import CatalogContext
 from semql.compile import CompiledQuery, compile_query, explain_plan
-from semql.errors import FilterTypeError, SemQLError
+from semql.errors import FilterTypeError, ResolveError, SemQLError
 from semql.hooks import CompileHook, SqlRewriteHook
 from semql.introspect import META_CUBES, PolicyFn, ScopeFn
 from semql.model import (
@@ -66,8 +66,9 @@ from semql.spec import SavedQuery, SemanticQuery, SemanticQueryDefaults, _apply_
 if TYPE_CHECKING:
     from semql.mutate import CompiledMutation, SemanticMutation
     from semql.rows import CompiledEntityQuery, EntityFetch, EntityList
+from semql.contracts import MetricContract, ProofStatus, SemanticCheck, SemanticExpectations
 from semql.units import DEFAULT_REGISTRY, Registry
-from semql.validate import ValidationError, validate
+from semql.validate import ValidationError, check_semantics, validate
 
 
 def _entity_spec_tag(value: object) -> str | None:
@@ -610,6 +611,89 @@ def _emit_unit_diagnostics(cube: Cube, fld: BaseField, registry: Registry, emit:
         )
 
 
+def _metric_contract_errors(
+    cubes: Sequence[Cube], contracts: Mapping[str, MetricContract]
+) -> list[dict[str, Any]]:
+    """Validate metric contracts against canonical catalog field names and kinds."""
+    by_cube = {cube.name: cube for cube in cubes}
+    errors: list[dict[str, Any]] = []
+
+    def allowed_fields(cube: Cube, kinds: set[str]) -> set[str]:
+        fields: set[str] = set()
+        if "measure" in kinds:
+            fields.update(m.name for m in cube.measures)
+        if "dimension" in kinds:
+            fields.update(d.name for d in cube.dimensions)
+        if "time" in kinds:
+            fields.update(d.name for d in cube.time_dimensions)
+        if "segment" in kinds:
+            fields.update(s.name for s in cube.segments)
+        return fields
+
+    def check_ref(ref: str, kinds: set[str], code: str, label: str) -> None:
+        try:
+            parsed = parse_qualified_ref(ref)
+            cube_name, field_name = parsed.cube, parsed.field
+        except (ResolveError, TypeError, ValueError):
+            cube_name, field_name = "", ""
+        cube = by_cube.get(cube_name)
+        names: set[str] = set() if cube is None else allowed_fields(cube, kinds)
+        if cube is None or field_name not in names:
+            errors.append(
+                {
+                    "code": code,
+                    "message": (
+                        f"Metric contract {label} reference {ref!r} must name an actual "
+                        "catalog field of the required kind."
+                    ),
+                    "reference": ref,
+                }
+            )
+
+    for key, contract in contracts.items():
+        if key != contract.reference:
+            errors.append(
+                {
+                    "code": "metric_contract_key_mismatch",
+                    "message": (
+                        f"Metric contract registry key {key!r} must equal contract "
+                        f"reference {contract.reference!r}."
+                    ),
+                    "reference": key,
+                }
+            )
+        check_ref(contract.reference, {"measure"}, "unknown_metric_contract_measure", "measure")
+        if contract.source_grain is not None:
+            for ref in contract.source_grain.keys:
+                check_ref(ref, {"dimension", "time"}, "invalid_metric_contract_grain", "grain")
+            for dependency in contract.source_grain.dependencies:
+                for ref in (*dependency.determinant, *dependency.dependent):
+                    check_ref(
+                        ref,
+                        {"dimension", "time"},
+                        "invalid_metric_contract_dependency",
+                        "functional dependency",
+                    )
+        for ref in contract.permitted_time_axes or ():
+            check_ref(ref, {"time"}, "invalid_metric_contract_time_axis", "time axis")
+        for ref in (*contract.required_segments, *contract.forbidden_segments):
+            check_ref(ref, {"segment"}, "invalid_metric_contract_segment", "segment")
+        for ref in (*contract.required_dimensions, *contract.non_additive_dimensions):
+            check_ref(ref, {"dimension", "time"}, "invalid_metric_contract_dimension", "dimension")
+        for axis in (contract.snapshot_axis, contract.preferred_time_axis):
+            if axis is not None:
+                check_ref(axis, {"time"}, "invalid_metric_contract_time_axis", "time axis")
+    return errors
+
+
+def _validate_metric_contracts(
+    cubes: Sequence[Cube], contracts: Mapping[str, MetricContract]
+) -> None:
+    errors = _metric_contract_errors(cubes, contracts)
+    if errors:
+        raise ValueError(errors[0]["message"])
+
+
 class CatalogSpec(BaseModel):
     """The serialisable half of a Catalog.
 
@@ -655,8 +739,18 @@ class CatalogSpec(BaseModel):
     #: Upper bound the row-mode list compiler caps ``EntityList.limit`` to.
     max_list_limit: int = 1000
     #: Refuse a predicate-targeted mutation whose preview affects more than
-    #: this many rows (A.4.5). Enforced at confirm-time by the executor.
     max_mutation_rows: int = 1000
+    metric_contracts: tuple[MetricContract, ...] = ()
+
+    @model_validator(mode="after")
+    def _validate_metric_contract_registry(self) -> CatalogSpec:
+        if not self.construction_errors:
+            contracts = {contract.reference: contract for contract in self.metric_contracts}
+            if len(contracts) != len(self.metric_contracts):
+                raise ValueError("metric contract references must be distinct")
+            if contracts:
+                _validate_metric_contracts(_resolve_extends(list(self.cubes)), contracts)
+        return self
 
     #: Aggregated construction errors from :meth:`from_iterables`.
     #: ``()`` for a clean build; populated when collect-all surfaces
@@ -737,6 +831,7 @@ class CatalogSpec(BaseModel):
         allow_mutations: bool = False,
         max_list_limit: int = 1000,
         max_mutation_rows: int = 1000,
+        metric_contracts: Mapping[str, MetricContract] | None = None,
     ) -> tuple[CatalogSpec, list[dict[str, Any]]]:
         """Collect-all constructor for a spec.
 
@@ -801,6 +896,9 @@ class CatalogSpec(BaseModel):
             emit=_collect,
             entities=list(entities or []),
         )
+        if metric_contracts:
+            contract_cubes = _resolve_extends(cube_list, emit=_collect)
+            errors.extend(_metric_contract_errors(contract_cubes, metric_contracts))
         spec = cls(
             cubes=tuple(cube_list),
             views=tuple(views or []),
@@ -814,6 +912,7 @@ class CatalogSpec(BaseModel):
             allow_mutations=allow_mutations,
             max_list_limit=max_list_limit,
             max_mutation_rows=max_mutation_rows,
+            metric_contracts=tuple((metric_contracts or {}).values()),
             construction_errors=tuple(errors),
         )
         return spec, errors
@@ -916,6 +1015,7 @@ class Catalog:
             allow_mutations=spec.allow_mutations,
             max_list_limit=spec.max_list_limit,
             max_mutation_rows=spec.max_mutation_rows,
+            metric_contracts={contract.reference: contract for contract in spec.metric_contracts},
         )
 
     def __init__(
@@ -938,6 +1038,7 @@ class Catalog:
         allow_mutations: bool = False,
         max_list_limit: int = 1000,
         max_mutation_rows: int = 1000,
+        metric_contracts: Mapping[str, MetricContract] | None = None,
     ) -> None:
         self.compile_hooks = compile_hooks or []
         self.sql_rewrite_hooks = sql_rewrite_hooks or []
@@ -982,6 +1083,7 @@ class Catalog:
             emit=_raise,
             entities=entity_list,
         )
+        _validate_metric_contracts(merged, metric_contracts or {})
 
         self._cubes: list[Cube] = merged
         self._by_name: dict[str, Cube] = {c.name: c for c in merged}
@@ -1038,6 +1140,7 @@ class Catalog:
             allow_mutations=allow_mutations,
             max_list_limit=max_list_limit,
             max_mutation_rows=max_mutation_rows,
+            metric_contracts=tuple((metric_contracts or {}).values()),
         )
         self.runtime = CatalogRuntime(
             policy=policy,
@@ -1054,6 +1157,39 @@ class Catalog:
         construction time. ``None`` means cube visibility is governed
         purely by ``Cube.required_roles``."""
         return self._policy
+
+    @property
+    def metric_contracts(self) -> dict[str, MetricContract]:
+        """Return a detached copy of the catalog's immutable contract registry."""
+        return {contract.reference: contract for contract in self.spec.metric_contracts}
+
+    def check_semantics(
+        self,
+        compiled: CompiledQuery,
+        expectations: SemanticExpectations | None = None,
+        *,
+        require_confirmed_intent: bool = False,
+    ) -> SemanticCheck:
+        """Check a compiled artifact against this catalog's declared metrics.
+
+        The caller is responsible for supplying a trusted CompiledQuery produced
+        from this same catalog; Catalog does not establish artifact provenance.
+        This method never compiles or rewrites queries and does not alter
+        authorization. A successfully compiled artifact establishes lowering
+        support only, not runtime execution success.
+        """
+        report = check_semantics(
+            compiled.analysis,
+            self.metric_contracts,
+            expectations,
+            require_confirmed_intent=require_confirmed_intent,
+        )
+        return report.model_copy(
+            update={
+                "execution_support": ProofStatus.PROVED,
+                "execution_explanation": "CompiledQuery artifact was successfully lowered.",
+            }
+        )
 
     @property
     def scope_fns(self) -> dict[str, ScopeFn]:
@@ -1380,29 +1516,40 @@ class Catalog:
         return isinstance(name, str) and name in self._by_name
 
 
-def _resolve_extends(cubes: list[Cube]) -> list[Cube]:
-    """Flatten ``Cube.extends`` chains into self-contained cubes.
-
-    Each child cube inherits the parent's measures / dimensions /
-    time_dimensions / segments by name. Child overrides win;
-    new items append. Other settings stay on the child.
-
-    Detects cycles and unknown parents."""
+def _resolve_extends(cubes: list[Cube], emit: _DiagEmit | None = None) -> list[Cube]:
+    """Flatten ``Cube.extends`` chains, optionally collecting hierarchy errors."""
     by_name = {c.name: c for c in cubes}
+    failed: set[str] = set()
+
+    def hierarchy_error(code: str, message: str, *, cube: str, parent: str | None = None) -> None:
+        if emit is None:
+            raise ValueError(message)
+        failed.add(cube)
+        emit(code, message, cube=cube, **({"parent": parent} if parent is not None else {}))
 
     def _flatten(name: str, stack: tuple[str, ...]) -> Cube:
         cube = by_name[name]
-        if cube.extends is None:
+        if cube.extends is None or name in failed:
             return cube
         if cube.extends == name or cube.extends in stack:
             chain = " -> ".join((*stack, name, cube.extends))
-            raise ValueError(f"Cube {name!r}: extends cycle detected ({chain}).")
-        if cube.extends not in by_name:
-            raise ValueError(
-                f"Cube {name!r}: extends={cube.extends!r} names a cube "
-                f"not in the catalog. Known cubes: {sorted(by_name)}."
+            hierarchy_error(
+                "extends_cycle", f"Cube {name!r}: extends cycle detected ({chain}).", cube=name
             )
+            return cube
+        if cube.extends not in by_name:
+            hierarchy_error(
+                "unknown_extends_parent",
+                f"Cube {name!r}: extends={cube.extends!r} names a cube "
+                f"not in the catalog. Known cubes: {sorted(by_name)}.",
+                cube=name,
+                parent=cube.extends,
+            )
+            return cube
         parent = _flatten(cube.extends, (*stack, name))
+        if name in failed or cube.extends in failed:
+            failed.add(name)
+            return cube
 
         def _merge_by_name[T: BaseField](
             parent_list: Sequence[T], child_list: Sequence[T]

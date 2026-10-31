@@ -7,6 +7,21 @@ packages version in lockstep. Format loosely follows
 
 ## [Unreleased]
 
+### Added
+
+- Optional versioned metric-contract registries round-trip with catalogs and
+  validate canonical field references without changing ordinary compilation.
+- Pure `check_semantics` and `Catalog.check_semantics` distinguish structural
+  validity, declared constraints, partial intent alignment and lowering support.
+  Mandatory unproved obligations fail closed; independently confirmed intent
+  remains host-owned, and construction advice never rewrites queries.
+- Composite source grain/FD declarations support conditional finite-closure
+  proofs. Serializable check annotations reference existing analysis node IDs;
+  catalog assumptions remain separate from unverified runtime data quality.
+- Existing federation mean lowering carries sufficient SUM/non-NULL COUNT state
+  through fragment and merge construction, retaining filters and NULL semantics.
+- An executable metric-contract demo covers six analytical counterexamples.
+
 ## [0.14.0] - 2026-10-23
 
 ### Added

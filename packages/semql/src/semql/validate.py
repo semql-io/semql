@@ -22,12 +22,15 @@ references, cross-backend refusals).
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from dataclasses import field as _dc_field
 from typing import TYPE_CHECKING, Any, Literal
 
 from semql._resolve import ResolutionDiagnostic, walk_query_fields
+from semql.analysis import SemanticAnalysis
 from semql.capabilities import check_query_capabilities
+from semql.contracts import MetricContract, SemanticCheck, SemanticExpectations
 from semql.errors import Diagnostic, QueryLocation, closest_match
 from semql.introspect import PolicyFn, viewer_sees
 from semql.model import AuthContext, Cube
@@ -385,4 +388,28 @@ def validate(
     return errors
 
 
-__all__ = ["MAX_UNGROUPED_ROWS", "ValidationError", "ValidationWarning", "validate"]
+def check_semantics(
+    analysis: SemanticAnalysis,
+    contracts: Mapping[str, MetricContract],
+    expectations: SemanticExpectations | None = None,
+    *,
+    require_confirmed_intent: bool = False,
+) -> SemanticCheck:
+    """Check optional metric contracts against an existing analysis artifact."""
+    from semql._semantic_check import check_semantics as check
+
+    return check(
+        analysis,
+        contracts,
+        expectations,
+        require_confirmed_intent=require_confirmed_intent,
+    )
+
+
+__all__ = [
+    "MAX_UNGROUPED_ROWS",
+    "ValidationError",
+    "ValidationWarning",
+    "validate",
+    "check_semantics",
+]

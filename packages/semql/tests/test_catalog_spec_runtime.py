@@ -66,6 +66,226 @@ def test_catalog_spec_round_trips_through_model_dump() -> None:
     assert restored.schema_version == spec.schema_version
 
 
+def test_catalog_metric_contract_registry_round_trips_and_is_detached() -> None:
+    from semql.catalog import CatalogSpec
+    from semql.contracts import MetricContract, SourceGrain
+
+    contract = MetricContract(
+        reference="orders.count",
+        revision="1",
+        source_grain=SourceGrain(keys=("orders.region",)),
+    )
+    supplied = {"orders.count": contract}
+    cat = Catalog([_orders()], metric_contracts=supplied)
+    supplied.clear()
+    assert cat.metric_contracts == {"orders.count": contract}
+    exposed = cat.metric_contracts
+    exposed.clear()
+    assert cat.metric_contracts == {"orders.count": contract}
+
+    spec = CatalogSpec.from_dict(json.loads(cat.spec.model_dump_json()))
+    restored = Catalog.from_spec(spec)
+    assert restored.metric_contracts == {"orders.count": contract}
+    assert Catalog.from_spec(spec.model_copy()).metric_contracts == {"orders.count": contract}
+
+
+def test_catalog_rejects_metric_contract_wrong_kind_and_bad_reference() -> None:
+    from semql.contracts import MetricContract, SourceGrain
+
+    contract = MetricContract(
+        reference="orders.region",
+        revision="1",
+        source_grain=SourceGrain(keys=("orders.missing",)),
+        permitted_time_axes=("orders.region",),
+    )
+    with pytest.raises(ValueError, match="must name an actual catalog field"):
+        Catalog([_orders()], metric_contracts={"orders.region": contract})
+
+
+def _inherited_amount_cubes() -> tuple[Cube, Cube]:
+    parent = Cube(
+        name="parent",
+        dialect=Dialect.POSTGRES,
+        table="orders",
+        alias="p",
+        measures=[Measure(name="amount", sql="{p}.amount", agg="sum", unit="count")],
+    )
+    child = Cube(
+        name="child",
+        dialect=Dialect.POSTGRES,
+        table="orders",
+        alias="p",
+        extends="parent",
+    )
+    return parent, child
+
+
+def test_spec_paths_accept_inherited_contract_and_compile_after_round_trip() -> None:
+    from semql.catalog import CatalogSpec
+    from semql.contracts import MetricContract
+    from semql.spec import SemanticQuery
+
+    cubes = _inherited_amount_cubes()
+    contract = MetricContract(
+        reference="child.amount",
+        revision="1",
+        calendar_ref="business-calendar:fiscal-2026",
+    )
+    direct = CatalogSpec(cubes=cubes, metric_contracts=(contract,))
+    spec, errors = CatalogSpec.from_iterables(
+        cubes=cubes, metric_contracts={"child.amount": contract}
+    )
+    assert errors == []
+    assert direct.metric_contracts == (contract,)
+    assert spec.metric_contracts == (contract,)
+    restored_spec = CatalogSpec.from_dict(json.loads(spec.model_dump_json()))
+    assert restored_spec.metric_contracts == (contract,)
+    assert restored_spec.metric_contracts[0].calendar_ref == "business-calendar:fiscal-2026"
+    direct_catalog = Catalog.from_spec(direct)
+    assert direct_catalog.metric_contracts == {"child.amount": contract}
+    assert direct_catalog.compile(SemanticQuery(measures=["child.amount"])).columns == ["amount"]
+    catalog = Catalog.from_spec(restored_spec)
+    assert catalog.metric_contracts == {"child.amount": contract}
+    assert catalog.compile(SemanticQuery(measures=["child.amount"])).columns == ["amount"]
+
+
+def test_spec_contract_validation_uses_child_override_kind_and_references() -> None:
+    from semql.catalog import CatalogSpec
+    from semql.contracts import MetricContract
+    from semql.model import Segment
+
+    parent, child = _inherited_amount_cubes()
+    overridden = child.model_copy(
+        update={
+            "segments": [Segment(name="active", sql="{p}.active = true")],
+        }
+    )
+    bad = MetricContract(
+        reference="child.amount",
+        revision="1",
+        required_segments=("child.unknown",),
+        permitted_time_axes=("child.active",),
+    )
+    cubes = (parent, overridden)
+    with pytest.raises(ValueError, match="actual catalog field"):
+        CatalogSpec(cubes=cubes, metric_contracts=(bad,))
+    spec, errors = CatalogSpec.from_iterables(cubes=cubes, metric_contracts={"child.amount": bad})
+    assert spec.construction_errors == tuple(errors)
+    assert {error["code"] for error in errors} >= {
+        "invalid_metric_contract_time_axis",
+        "invalid_metric_contract_segment",
+    }
+
+
+@pytest.mark.parametrize(
+    ("cubes", "hierarchy_code"),
+    [
+        ((_inherited_amount_cubes()[1],), "unknown_extends_parent"),
+        (
+            (
+                Cube(name="a", dialect=Dialect.POSTGRES, table="a", alias="a", extends="b"),
+                Cube(name="b", dialect=Dialect.POSTGRES, table="b", alias="b", extends="a"),
+            ),
+            "extends_cycle",
+        ),
+    ],
+)
+def test_from_iterables_collects_hierarchy_errors_without_fabricating_contract_fields(
+    cubes: tuple[Cube, ...], hierarchy_code: str
+) -> None:
+    from semql.catalog import CatalogSpec
+    from semql.contracts import MetricContract
+
+    spec, errors = CatalogSpec.from_iterables(
+        cubes=cubes,
+        metric_contracts={
+            "child.amount": MetricContract(reference="child.amount", revision="1"),
+            "missing.metric": MetricContract(reference="missing.metric", revision="1"),
+        },
+    )
+    codes = {error["code"] for error in errors}
+    assert hierarchy_code in codes
+    assert "unknown_metric_contract_measure" in codes
+    assert spec.construction_errors == tuple(errors)
+
+
+def test_catalog_check_semantics_uses_compiled_analysis_and_reports_lowering() -> None:
+    from semql.contracts import MetricContract, ProofStatus
+    from semql.spec import SemanticQuery
+
+    catalog = Catalog(
+        [_orders()],
+        metric_contracts={"orders.count": MetricContract(reference="orders.count", revision="1")},
+    )
+    compiled = catalog.compile(SemanticQuery(measures=["orders.count"]))
+    report = catalog.check_semantics(compiled)
+    assert report.execution_support is ProofStatus.PROVED
+    assert report.accepted
+
+
+def test_catalog_spec_collects_metric_contract_reference_errors() -> None:
+    from semql.catalog import CatalogSpec
+    from semql.contracts import MetricContract, SourceGrain
+
+    spec, errors = CatalogSpec.from_iterables(
+        cubes=[_orders()],
+        metric_contracts={
+            "orders.count": MetricContract(
+                reference="orders.count",
+                revision="1",
+                source_grain=SourceGrain(keys=("orders.absent",)),
+                required_segments=("orders.no_such_segment",),
+            )
+        },
+    )
+    assert spec.construction_errors == tuple(errors)
+    assert {error["code"] for error in errors} >= {
+        "invalid_metric_contract_grain",
+        "invalid_metric_contract_segment",
+    }
+
+
+def test_empty_metric_contract_registry_does_not_change_compilation() -> None:
+    from semql.spec import SemanticQuery
+
+    query = SemanticQuery(measures=["orders.count"], dimensions=["orders.region"])
+    legacy = Catalog([_orders()]).compile(query)
+    explicit_empty = Catalog([_orders()], metric_contracts={}).compile(query)
+    assert (explicit_empty.sql, explicit_empty.params, explicit_empty.columns) == (
+        legacy.sql,
+        legacy.params,
+        legacy.columns,
+    )
+
+
+def test_legacy_catalog_spec_payload_still_compiles_after_round_trip() -> None:
+    from semql.catalog import CatalogSpec
+    from semql.spec import SemanticQuery
+
+    legacy = CatalogSpec.from_dict(
+        {"schema_version": 2, "cubes": [_orders().model_dump(mode="json")]}
+    )
+    restored = Catalog.from_spec(legacy)
+    compiled = restored.compile(SemanticQuery(measures=["orders.count"]))
+    assert compiled.columns == ["count"]
+    assert restored.check_semantics(compiled).semantic_validity.value == "not_established"
+
+
+def test_calendar_reference_is_opaque_and_fails_closed_without_calendar_evidence() -> None:
+    from semql.catalog import CatalogSpec
+    from semql.contracts import MetricContract, ProofStatus
+    from semql.spec import SemanticQuery
+
+    contract = MetricContract(
+        reference="orders.count", revision="1", calendar_ref="business-calendar:fiscal-2026"
+    )
+    catalog = Catalog([_orders()], metric_contracts={"orders.count": contract})
+    restored = Catalog.from_spec(CatalogSpec.from_dict(json.loads(catalog.spec.model_dump_json())))
+    report = restored.check_semantics(restored.compile(SemanticQuery(measures=["orders.count"])))
+    assert report.semantic_validity is ProofStatus.NOT_ESTABLISHED
+    assert not report.accepted
+
+
 def test_catalog_spec_schema_version_is_set() -> None:
     """A spec without a version can't be safely deserialised after
     a breaking change. ``schema_version`` is required, and the

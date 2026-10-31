@@ -20,6 +20,7 @@ from semql.analysis import (
     SemanticAnalysis,
     SemanticAssumption,
     SemanticBinding,
+    SemanticCheckAnnotation,
     SemanticDerivation,
     SemanticJoin,
     SemanticNode,
@@ -28,6 +29,7 @@ from semql.analysis import (
     SemanticRanking,
     SemanticResult,
     SemanticTimePolicy,
+    attach_semantic_check,
     compare_analysis,
 )
 from semql.autoplan import AutoPlan, CrossSourceDecision, autoplan
@@ -45,6 +47,16 @@ from semql.cohort import (
     compile_cohort_query,
 )
 from semql.compile import MAX_UNGROUPED_ROWS, ColumnMeta, CompiledQuery, compile_query
+from semql.contracts import (
+    Advice,
+    FunctionalDependency,
+    MetricContract,
+    Obligation,
+    ProofStatus,
+    SemanticCheck,
+    SemanticExpectations,
+    SourceGrain,
+)
 from semql.cost import BudgetExceededError, CostEstimate, QueryBudget, estimate_cost
 from semql.diff import CatalogDiff, Change, ChangeKind, diff_catalogs
 from semql.docs import render_catalog_markdown
@@ -245,7 +257,7 @@ from semql.units import (
     UnknownUnit,
 )
 from semql.unparse import UnparseError, query_to_sql
-from semql.validate import ValidationError, ValidationWarning, validate
+from semql.validate import ValidationError, ValidationWarning, check_semantics, validate
 from semql.visualize import (
     Confidence,
     DecisionReason,
@@ -261,6 +273,17 @@ from semql.visualize import (
 )
 
 __all__ = [
+    "Advice",
+    "SemanticCheckAnnotation",
+    "attach_semantic_check",
+    "FunctionalDependency",
+    "MetricContract",
+    "Obligation",
+    "ProofStatus",
+    "SemanticCheck",
+    "SemanticExpectations",
+    "SourceGrain",
+    "check_semantics",
     "BindingRequirement",
     "CatalogContext",
     "Comparison",

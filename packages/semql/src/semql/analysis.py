@@ -14,6 +14,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from semql._resolve import _ResolvedFields
+from semql.contracts import SemanticCheck
 from semql.logical import LogicalPlan
 from semql.model import BaseField, Cube, Dimension, Measure, TimeDimension
 from semql.spec import BoolExpr, Filter, SemanticQuery
@@ -144,8 +145,16 @@ class Coverage(_FrozenModel):
     not_established: tuple[str, ...] = ()
 
 
+class SemanticCheckAnnotation(_FrozenModel):
+    """An explicit check's full evidence, linked to artifact-local metric nodes."""
+
+    node_ids: tuple[str, ...] = ()
+    report: SemanticCheck
+
+
 class SemanticAnalysis(_FrozenModel):
     schema_version: int = 1
+    check_annotations: tuple[SemanticCheckAnnotation, ...] = ()
     nodes: tuple[SemanticNode, ...] = ()
     outputs: tuple[SemanticOutput, ...] = ()
     populations: tuple[SemanticPopulation, ...] = ()
@@ -164,6 +173,21 @@ class SemanticAnalysis(_FrozenModel):
         return cls(
             coverage=Coverage(status="unavailable", not_established=("analysis_unavailable",))
         )
+
+
+def attach_semantic_check(analysis: SemanticAnalysis, report: SemanticCheck) -> SemanticAnalysis:
+    """Return a copy retaining an explicit report and its artifact-local metric references."""
+
+    refs = tuple(
+        item.split("@", 1)[0].removeprefix("contract:") for item in report.applied_contracts
+    )
+    annotation = SemanticCheckAnnotation(
+        node_ids=tuple(sorted(node.node_id for node in analysis.nodes if node.catalog_ref in refs)),
+        report=report,
+    )
+    return analysis.model_copy(
+        update={"check_annotations": (*analysis.check_annotations, annotation)}
+    )
 
 
 class ComparisonResult(StrEnum):
@@ -955,6 +979,8 @@ __all__ = [
     "SemanticResult",
     "Coverage",
     "SemanticAnalysis",
+    "SemanticCheckAnnotation",
+    "attach_semantic_check",
     "SemanticJoin",
     "SemanticAssumption",
     "SemanticDerivation",

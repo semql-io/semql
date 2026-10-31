@@ -26,6 +26,9 @@ engines Redshift, Trino, and Databricks.
 - **MCP server** — auto-generated `query_<cube>()` tools per cube.
 - **Drift check** — `semql-validate-db` probes a live database
   against a catalog before deploy.
+- **Opt-in metric contracts**—typed metric constraints and partial intent checks
+  over compiler analysis, with fail-closed obligations and nonbinding advice.
+  See the [metric contracts guide](docs/migrations/metric-contracts.md).
 
 ## Install
 
