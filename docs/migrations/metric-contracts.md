@@ -73,6 +73,8 @@ for obligation in report.obligations:
 
 Contract checks include hidden metric operands, not just projected outputs. A ratio cannot evade a component's time/population requirements. Metric identity follows comparison projections without treating every hidden numerator as a requested output metric. Masked values and incomplete/unknown semantic evidence cannot supply numeric proofs.
 
+Mask checks follow the contributing operand DAG even when an operand has no separate contract. Named segment obligations apply to every metric occurrence's own population; result-level intent checks use result-population evidence separately. Missing descriptors do not prove the absence of a forbidden population. Time-bucket and snapshot proofs require consistent policy/time-node evidence: missing policy does not turn a retained monthly bucket into an unbucketed result. Shared graph validation covers ordering, ranking and population/predicate edges as well as operands.
+
 ## Trust and evidence
 
 The host—not an LLM—must control contract registration, expectation origin and independent evidence references. `independently_confirmed` is a host attestation, not cryptographic authentication. Do not expose that choice as an untrusted model-controlled confirmation mechanism. If one request mixes confirmed and inferred clauses, check separate expectations objects rather than upgrading all clauses to confirmed.
@@ -81,7 +83,7 @@ Only check authentic analysis with the registry for its catalog snapshot. The lo
 
 Business-calendar execution and full fixed-cohort comparison alignment are deliberately not inferred from labels. When requested but not established by available analysis, they return mandatory unknown obligations. Existing `CohortQuery` remains the fixed-membership construction; checking only its selection-stage analysis does not certify the semantics of the full cohort result.
 
-Check annotations can be attached explicitly and immutably through `semql.analysis.attach_semantic_check`. They retain contract revisions and existing node references, not a second provenance graph. Ordinary compilation does not run checks or attach reports. Treat serialized annotations as retained evidence, not authorization or a waiver of fresh checking after changing query/catalog/intent.
+Check annotations can be attached explicitly and immutably through `semql.analysis.attach_semantic_check`. Each annotation retains the full `report`—including obligations, assumptions, advice, alignment and host intent evidence reference—and existing metric `node_ids`, not a second provenance graph. Ordinary compilation does not run checks or attach reports. Treat serialized annotations as retained evidence, not authorization or a waiver of fresh checking after changing query/catalog/intent.
 
 ## Sufficient states, without a new algebra
 

@@ -66,63 +66,13 @@ _KNOWN_KINDS = {"aggregate", "comparison", "dimension", "time", "arithmetic", "p
 
 
 def _structure(analysis: SemanticAnalysis) -> ProofStatus:
-    nodes = {node.node_id: node for node in analysis.nodes}
-    populations = {item.population_id: item for item in analysis.populations}
-    bindings = {item.slot for item in analysis.binding_dependencies}
-    if (
-        len(nodes) != len(analysis.nodes)
-        or len(populations) != len(analysis.populations)
-        or len(bindings) != len(analysis.binding_dependencies)
-        or len({item.output_id for item in analysis.outputs}) != len(analysis.outputs)
-        or any(item.node_id not in nodes for item in analysis.outputs)
-    ):
+    from semql._compare import validate_analysis_references
+    from semql.errors import ContractError
+
+    try:
+        validate_analysis_references(analysis)
+    except ContractError:
         return ProofStatus.DISPROVED
-    edges: dict[str, tuple[str, ...]] = {}
-    for node in analysis.nodes:
-        if (
-            any(ref not in nodes for ref in node.operand_ids)
-            or any(ref not in bindings for ref in node.binding_refs)
-            or (node.population_ref is not None and node.population_ref not in populations)
-        ):
-            return ProofStatus.DISPROVED
-        edges[node.node_id] = node.operand_ids
-    if any(
-        ref not in nodes for annotation in analysis.check_annotations for ref in annotation.node_ids
-    ):
-        return ProofStatus.DISPROVED
-    if any(ref not in nodes for p in analysis.populations for ref in p.predicate_ids):
-        return ProofStatus.DISPROVED
-    output_ids = {item.output_id for item in analysis.outputs}
-    if any(item.output_id not in output_ids for item in analysis.enrichments):
-        return ProofStatus.DISPROVED
-    if any(ref not in nodes for d in analysis.derivations for ref in d.logical_node_ids):
-        return ProofStatus.DISPROVED
-    result = analysis.result
-    if result is not None:
-        result_refs = (*result.grain_node_ids, *result.predicate_ids)
-        if any(ref not in nodes for ref in result_refs):
-            return ProofStatus.DISPROVED
-        if result.population_ref is not None and result.population_ref not in populations:
-            return ProofStatus.DISPROVED
-        if result.time_policy is not None and any(
-            ref is not None and ref not in bindings
-            for ref in (
-                result.time_policy.current_binding_ref,
-                result.time_policy.prior_binding_ref,
-            )
-        ):
-            return ProofStatus.DISPROVED
-        if result.ranking is not None and any(
-            ref not in nodes
-            for ref in (*result.ranking.partition_node_ids, *result.ranking.tie_breaker_node_ids)
-        ):
-            return ProofStatus.DISPROVED
-    remaining = set(nodes)
-    while remaining:
-        ready = {ref for ref in remaining if not (set(edges[ref]) & remaining)}
-        if not ready:
-            return ProofStatus.DISPROVED
-        remaining.difference_update(ready)
     return ProofStatus.PROVED
 
 
@@ -245,19 +195,104 @@ def check_semantics(
         for output in analysis.outputs
         if nodes[output.node_id].kind == "time" and nodes[output.node_id].catalog_ref is not None
     )
-    time_refs = range_refs | selected_time_refs
-    axis = next(iter(time_refs)) if len(time_refs) == 1 else None
-    axis_known = available and len(time_refs) <= 1
-    axis_absent = axis_known and not time_refs
-    granularity = result.time_policy.granularity if result and result.time_policy else None
-    segment_refs = {
+    result_time_refs = range_refs | selected_time_refs
+    result_axis = next(iter(result_time_refs)) if len(result_time_refs) == 1 else None
+    result_axis_known = (
+        available
+        and len(result_time_refs) <= 1
+        and (bool(result_time_refs) or result_population is not None)
+    )
+    result_granularity = result.time_policy.granularity if result and result.time_policy else None
+    observed_time_nodes = [
+        nodes[node_id]
+        for node_id in dict.fromkeys(
+            (
+                *(result.grain_node_ids if result else ()),
+                *(output.node_id for output in analysis.outputs),
+            )
+        )
+        if nodes[node_id].kind == "time"
+    ]
+    result_granularity_known = (
+        available
+        and result is not None
+        and (
+            (
+                result.time_policy is None
+                and (
+                    (not result_time_refs and result_population is not None)
+                    or (
+                        bool(observed_time_nodes)
+                        and all(node.time_granularity is None for node in observed_time_nodes)
+                    )
+                )
+            )
+            or (
+                result.time_policy is not None
+                and all(
+                    node.time_granularity == result.time_policy.granularity
+                    for node in observed_time_nodes
+                )
+            )
+        )
+    )
+    result_segment_refs = {
         nodes[ref].catalog_ref
         for ref in predicate_ids
         if nodes[ref].kind == "predicate"
         and nodes[ref].aggregate == "segment"
         and nodes[ref].catalog_ref is not None
     }
+    axis = result_axis
+    axis_known = result_axis_known
+    granularity = result_granularity
+    segment_refs = result_segment_refs
     population = result_population
+
+    def population_segments(population_ref: str | None) -> tuple[set[str], bool]:
+        matched = next(
+            (p for p in analysis.populations if p.population_id == population_ref),
+            None,
+        )
+        if matched is None:
+            return set(), False
+        return (
+            {
+                catalog_ref
+                for ref in matched.predicate_ids
+                if nodes[ref].kind == "predicate"
+                and nodes[ref].aggregate == "segment"
+                and (catalog_ref := nodes[ref].catalog_ref) is not None
+            },
+            True,
+        )
+
+    def occurrence_axis(metric: SemanticNode) -> tuple[str | None, bool]:
+        matched = next(
+            (p for p in analysis.populations if p.population_id == metric.population_ref),
+            None,
+        )
+        if matched is None:
+            return None, False
+        refs = {
+            nodes[ref].catalog_ref
+            for ref in matched.predicate_ids
+            if nodes[ref].kind == "predicate"
+            and nodes[ref].aggregate == "half_open_range"
+            and nodes[ref].catalog_ref is not None
+        }
+        refs.update(
+            nodes[ref].catalog_ref
+            for ref in (result.grain_node_ids if result else ())
+            if nodes[ref].kind == "time" and nodes[ref].catalog_ref is not None
+        )
+        refs.update(
+            nodes[output.node_id].catalog_ref
+            for output in analysis.outputs
+            if nodes[output.node_id].kind == "time"
+            and nodes[output.node_id].catalog_ref is not None
+        )
+        return (next(iter(refs)) if len(refs) == 1 else None), available and len(refs) <= 1
 
     def check(
         code: str,
@@ -293,12 +328,20 @@ def check_semantics(
             "Checks trusted declarations; does not verify their physical truth.",
             assumptions,
         )
-        if any(item.masked for item in matching_nodes):
+        pending = [item.node_id for item in matching_nodes]
+        contributing: set[str] = set()
+        while pending:
+            node_id = pending.pop()
+            if node_id in contributing:
+                continue
+            contributing.add(node_id)
+            pending.extend(nodes[node_id].operand_ids)
+        if any(nodes[node_id].masked for node_id in contributing):
             add(
                 "masked_value",
                 ProofStatus.NOT_ESTABLISHED,
                 ref,
-                "Masked metric values do not establish numeric semantics.",
+                "Masked metric values or contributing operands do not establish numeric semantics.",
                 assumptions,
             )
         node = matching_nodes[0]
@@ -319,53 +362,50 @@ def check_semantics(
                 mandatory=False,
             )
         if contract.required_time_axis:
-            status = (
-                ProofStatus.PROVED
-                if axis is not None
-                else ProofStatus.DISPROVED
-                if axis_absent
-                else ProofStatus.NOT_ESTABLISHED
-            )
+            statuses: list[ProofStatus] = []
+            for item in matching_nodes:
+                occurrence_axis_ref, known = occurrence_axis(item)
+                statuses.append(
+                    ProofStatus.PROVED
+                    if occurrence_axis_ref is not None
+                    else ProofStatus.DISPROVED
+                    if known
+                    else ProofStatus.NOT_ESTABLISHED
+                )
             add(
                 "time_axis_required",
-                status,
+                conjunction(tuple(statuses)),
                 ref,
-                "Metric requires one explicit time axis.",
+                "Metric requires one explicit time axis in each occurrence population.",
                 assumptions,
             )
         if contract.permitted_time_axes is not None:
-            if axis is not None:
-                check(
-                    "time_axis",
-                    axis in contract.permitted_time_axes,
-                    ref,
-                    f"Observed time axis {axis!r}.",
-                    assumptions,
+            occurrence_axes = [occurrence_axis(item) for item in matching_nodes]
+            status = (
+                ProofStatus.NOT_ESTABLISHED
+                if any(not known for _axis, known in occurrence_axes)
+                else ProofStatus.DISPROVED
+                if any(
+                    axis_ref is not None and axis_ref not in contract.permitted_time_axes
+                    for axis_ref, _ in occurrence_axes
                 )
-            elif not axis_known:
-                add(
-                    "time_axis",
-                    ProofStatus.NOT_ESTABLISHED,
-                    ref,
-                    "Time-axis evidence is ambiguous or incomplete.",
-                    assumptions,
-                )
-            elif not contract.permitted_time_axes:
-                add(
-                    "time_axis",
-                    ProofStatus.PROVED,
-                    ref,
-                    "No time axis is present and the contract permits none.",
-                    assumptions,
-                )
+                else ProofStatus.PROVED
+            )
+            add(
+                "time_axis",
+                status,
+                ref,
+                "Every occurrence uses a permitted time axis.",
+                assumptions,
+            )
         if contract.permitted_granularities is not None:
             check(
                 "time_granularity",
-                granularity in contract.permitted_granularities,
+                result_granularity in contract.permitted_granularities,
                 ref,
-                f"Observed bucket granularity {granularity!r}.",
+                f"Observed bucket granularity {result_granularity!r}.",
                 assumptions,
-                known=result is not None,
+                known=result_granularity_known,
             )
         if contract.calendar_ref is not None:
             add(
@@ -376,19 +416,40 @@ def check_semantics(
                 assumptions,
             )
         if contract.required_segments:
-            check(
+            statuses = []
+            for item in matching_nodes:
+                segments, known = population_segments(item.population_ref)
+                statuses.append(
+                    ProofStatus.NOT_ESTABLISHED
+                    if not available or not known
+                    else ProofStatus.PROVED
+                    if set(contract.required_segments) <= segments
+                    else ProofStatus.DISPROVED
+                )
+            add(
                 "required_population",
-                set(contract.required_segments) <= segment_refs,
+                conjunction(tuple(statuses)),
                 ref,
-                "Required named segment predicates must be applied.",
+                "Required named segment predicates must be applied to each occurrence population.",
                 assumptions,
             )
         if contract.forbidden_segments:
-            check(
+            statuses = []
+            for item in matching_nodes:
+                segments, known = population_segments(item.population_ref)
+                statuses.append(
+                    ProofStatus.NOT_ESTABLISHED
+                    if not available or not known
+                    else ProofStatus.DISPROVED
+                    if set(contract.forbidden_segments) & segments
+                    else ProofStatus.PROVED
+                )
+            add(
                 "forbidden_population",
-                not (set(contract.forbidden_segments) & segment_refs),
+                conjunction(tuple(statuses)),
                 ref,
-                "Forbidden named segment predicates must not be applied.",
+                "Forbidden named segment predicates must be absent from each "
+                "occurrence population.",
                 assumptions,
             )
         if contract.required_dimensions:
@@ -408,7 +469,11 @@ def check_semantics(
                 ref,
                 "Snapshot axis must remain unbucketed; analysis has no as-of selector evidence.",
                 assumptions,
-                known=node.aggregate in {"sum", "count"} and grain is not None,
+                known=(
+                    node.aggregate in {"sum", "count"}
+                    and grain is not None
+                    and result_granularity_known
+                ),
             )
             advice.append(
                 Advice(
@@ -504,12 +569,14 @@ def check_semantics(
                 "intent_required_segments",
                 True,
                 set(expectations.required_segments) <= segment_refs,
+                known=result_population is not None,
             )
         if expectations.forbidden_segments is not None:
             compare(
                 "intent_forbidden_segments",
                 True,
                 not (set(expectations.forbidden_segments) & segment_refs),
+                known=result_population is not None,
             )
         compare("intent_calendar", expectations.calendar_ref, None, known=False)
         compare("comparison_basis", expectations.comparison_basis, None, known=False)

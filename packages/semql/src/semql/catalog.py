@@ -748,7 +748,8 @@ class CatalogSpec(BaseModel):
             contracts = {contract.reference: contract for contract in self.metric_contracts}
             if len(contracts) != len(self.metric_contracts):
                 raise ValueError("metric contract references must be distinct")
-            _validate_metric_contracts(self.cubes, contracts)
+            if contracts:
+                _validate_metric_contracts(_resolve_extends(list(self.cubes)), contracts)
         return self
 
     #: Aggregated construction errors from :meth:`from_iterables`.
@@ -895,7 +896,9 @@ class CatalogSpec(BaseModel):
             emit=_collect,
             entities=list(entities or []),
         )
-        errors.extend(_metric_contract_errors(cube_list, metric_contracts or {}))
+        if metric_contracts:
+            contract_cubes = _resolve_extends(cube_list, emit=_collect)
+            errors.extend(_metric_contract_errors(contract_cubes, metric_contracts))
         spec = cls(
             cubes=tuple(cube_list),
             views=tuple(views or []),
@@ -1513,29 +1516,40 @@ class Catalog:
         return isinstance(name, str) and name in self._by_name
 
 
-def _resolve_extends(cubes: list[Cube]) -> list[Cube]:
-    """Flatten ``Cube.extends`` chains into self-contained cubes.
-
-    Each child cube inherits the parent's measures / dimensions /
-    time_dimensions / segments by name. Child overrides win;
-    new items append. Other settings stay on the child.
-
-    Detects cycles and unknown parents."""
+def _resolve_extends(cubes: list[Cube], emit: _DiagEmit | None = None) -> list[Cube]:
+    """Flatten ``Cube.extends`` chains, optionally collecting hierarchy errors."""
     by_name = {c.name: c for c in cubes}
+    failed: set[str] = set()
+
+    def hierarchy_error(code: str, message: str, *, cube: str, parent: str | None = None) -> None:
+        if emit is None:
+            raise ValueError(message)
+        failed.add(cube)
+        emit(code, message, cube=cube, **({"parent": parent} if parent is not None else {}))
 
     def _flatten(name: str, stack: tuple[str, ...]) -> Cube:
         cube = by_name[name]
-        if cube.extends is None:
+        if cube.extends is None or name in failed:
             return cube
         if cube.extends == name or cube.extends in stack:
             chain = " -> ".join((*stack, name, cube.extends))
-            raise ValueError(f"Cube {name!r}: extends cycle detected ({chain}).")
-        if cube.extends not in by_name:
-            raise ValueError(
-                f"Cube {name!r}: extends={cube.extends!r} names a cube "
-                f"not in the catalog. Known cubes: {sorted(by_name)}."
+            hierarchy_error(
+                "extends_cycle", f"Cube {name!r}: extends cycle detected ({chain}).", cube=name
             )
+            return cube
+        if cube.extends not in by_name:
+            hierarchy_error(
+                "unknown_extends_parent",
+                f"Cube {name!r}: extends={cube.extends!r} names a cube "
+                f"not in the catalog. Known cubes: {sorted(by_name)}.",
+                cube=name,
+                parent=cube.extends,
+            )
+            return cube
         parent = _flatten(cube.extends, (*stack, name))
+        if name in failed or cube.extends in failed:
+            failed.add(name)
+            return cube
 
         def _merge_by_name[T: BaseField](
             parent_list: Sequence[T], child_list: Sequence[T]

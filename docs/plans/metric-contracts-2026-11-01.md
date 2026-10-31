@@ -36,14 +36,27 @@ The host controls declarations, expectation origin and independent evidence refe
 
 Run in the feature worktree with Python 3.12 and frozen dependencies:
 
-- `SEMQL_CONFORMANCE_TESTCONTAINERS=1 UV_PYTHON=3.12 just check`: **3641 passed, 8 skipped, 1 xfailed; 78 snapshots passed**. Ruff, mypy (291 files), Pyright, Tach, core-package and frozen-model boundaries passed. Disposable PostgreSQL/ClickHouse conformance was enabled. Core branch-inclusive coverage was 91% (rounded).
-- Focused checker/catalog/analysis/engine integration run: **105 passed** before the final full-report annotation refinement, which is covered by the full run above.
+- `SEMQL_CONFORMANCE_TESTCONTAINERS=1 UV_PYTHON=3.12 just check`: **3654 passed, 8 skipped, 1 xfailed; 78 snapshots passed** after review fixes. Ruff, mypy (293 files), Pyright, Tach, core-package and frozen-model boundaries passed. Disposable PostgreSQL/ClickHouse conformance was enabled. Core branch-inclusive coverage was 92% (rounded).
+- Focused checker/catalog/analysis regression run after the five review fixes: **87 passed**. The initial pre-PR full run passed 3641 tests.
 - `uv run --frozen --python 3.12 scripts/check_api_break.py --base origin/main`: no breaking changes in the three checked public packages.
 - `uv build --package semql`: wheel and sdist built at the unchanged 0.14.0 version; not published.
 - The public guide example compiled and executed actual DuckDB SQL, excluded the half-open end boundary, and round-tripped its registry. Semantic check annotations round-trip in the behavioral regression, retaining an unproved calendar gate and confirmed intent evidence.
 - The executable demo matched independent oracles: ratio 2.5 vs mean 2; distinct subtotals 4 vs union 3; snapshots 220 vs latest 120; fanout 100 vs 200; time-axis monthly values (10,20) vs (20,10); fixed current cohort 20 vs independently selected 119, with changes 3 vs 102. Fixed members remain `a,b`, missing `b` remains NULL, and full cohort comparison alignment stays unknown.
 
 Existing deprecation/security-fixture warnings were not suppressed. There is no empirical LLM benchmark or claim of universal backend conformance.
+
+## Post-PR review
+
+PR #23 was raised before invoking the reviewer agent. Its first pass identified five introduced defects, all addressed with behavioral regressions:
+
+1. Masked uncontracted dependencies could supply numeric proof for a contracted ratio. Mask checks now traverse the contributing operand DAG.
+2. Missing population data could prove negative segment obligations, and one result population could incorrectly certify another metric occurrence. Contract requirements now use each occurrence's population; result-level intent stays separately scoped and unknown when evidence is absent.
+3. Missing time policy could certify an unbucketed result despite retained monthly time-node evidence. Temporal checks now require consistent evidence while retaining valid untimed and explicitly unbucketed controls.
+4. Ordering/ranking references and population/predicate cycles escaped structural checks. Semantic checking and comparison now share a non-recursive, linear local-reference guard, including hidden graph nodes and all modeled local edge types.
+5. Spec constructors rejected valid inherited metric references accepted by Catalog. Contract validation now resolves inheritance in both spec paths; collect-all hierarchy errors remain typed and do not escape the collector.
+
+The initial PR CI passed every applicable job, including all eight coverage and build jobs, static checks, fast tests, API comparison and workflow lint. Full-tier/nightly CI jobs are intentionally conditional; the native full test run above supplies the local full-suite evidence.
+
 
 ## Incremental adoption and excluded exploration
 
